@@ -26,7 +26,7 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
 ENV OLLAMA_BASE_URL=http://localhost:11434
-ENV MODEL=qwen3.5:0.8b
+ENV MODEL=qwen3.5:2b-q4_K_M
 ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 ENV STREAMLIT_SERVER_PORT=8501
 ENV STREAMLIT_SERVER_HEADLESS=true

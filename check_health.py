@@ -145,8 +145,11 @@ def main():
             r = requests.post(f"{A.OLLAMA_BASE_URL}/api/chat", json=payload, timeout=args.timeout)
             elapsed = time.time() - t0
             data = r.json()
-            reply = (data.get("message", {}) or {}).get("content", "") if isinstance(data, dict) else ""
-            ok(f"应答成功 耗时 {elapsed:.1f}s: {reply[:60]!r}")
+            if isinstance(data, dict) and data.get("error"):
+                fail += bad(f"模型应答返回错误: {data['error']}")
+            else:
+                reply = (data.get("message", {}) or {}).get("content", "") if isinstance(data, dict) else ""
+                ok(f"应答成功 耗时 {elapsed:.1f}s: {reply[:60]!r}")
         except Exception as e:
             fail += bad(f"模型应答失败/超时({args.timeout}s): {e}")
 

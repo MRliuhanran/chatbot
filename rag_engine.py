@@ -212,11 +212,11 @@ def build_chunks():
 # ============================================================================
 # 模型加载与 embedding
 # ============================================================================
-def load_embedding_model():
+def load_embedding_model(device=None):
     import torch
     from transformers import AutoTokenizer, AutoModel
 
-    device = get_device()
+    device = device or get_device()
     # bge-small 仅 ~92MB，用 fp32：避免 MPS 上半精度转换 + 逐批同步的开销（实测 fp16 批量编码反而更慢）
     tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
     model = AutoModel.from_pretrained(EMBED_MODEL_PATH).to(device)
@@ -276,7 +276,13 @@ def build_index():
 
     print(f"加载分块数据: {len(all_chunks)} 条")
 
-    tokenizer, model, device = load_embedding_model()
+    # 索引构建用 CPU：MPS 持续满负荷会触发 GPU 降频（实测 67 条/秒 → 9 条/秒），
+    # 且 GPU 与系统 GUI(WindowServer/Chrome) 共享；CPU 8 线程稳定 ~35 条/秒。
+    # 查询阶段（单条/小批）仍走 MPS 突发推理，不受影响。
+    import torch as _torch
+    if get_device() == "mps":
+        _torch.set_num_threads(8)
+    tokenizer, model, device = load_embedding_model(device="cpu")
     print(f"Embedding 设备: {device}")
 
     batch_size = 128
@@ -284,10 +290,9 @@ def build_index():
     all_embeddings = []
     t0 = time.time()
 
-    # 间歇冷却：MPS 持续满负荷会触发 GPU 降频（实测从 67 条/秒 降至 9 条/秒），
-    # 每批后短暂让出 GPU，维持高平均吞吐。
-    COOL_DOWN_SLEEP = 0.5
-    print(f"批量生成 Embedding (batch_size={batch_size}, 间歇冷却 {COOL_DOWN_SLEEP}s/批)...")
+    # CPU 构建无需间歇冷却（冷却仅针对 MPS 降频场景保留配置，CPU 上 sleep 极短）
+    COOL_DOWN_SLEEP = 0.05
+    print(f"批量生成 Embedding (batch_size={batch_size}, CPU 8线程)...")
     for i in range(0, total, batch_size):
         batch = all_chunks[i:i + batch_size]
         texts = [c["contextual_text"] for c in batch]
