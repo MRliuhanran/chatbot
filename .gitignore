@@ -1,0 +1,36 @@
+# ---- 虚拟环境 ----
+venv/
+.venv/
+.python3.9/
+.python3.10/
+
+# ---- 模型（体积大，从 HuggingFace 重新下载）----
+models/
+
+# ---- 索引与缓存（可重建：process + index）----
+chroma_db_v2/
+cache_v2/
+*.pkl
+
+# ---- 运行时产物 ----
+streamlit.pid
+*.log
+debug_*.png
+test_*_report.json
+.pytest_cache/
+
+# ---- 密钥 ----
+.env
+
+# ---- IDE ----
+.idea/
+.vscode/
+.claude/
+
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- macOS ----
+.DS_Store

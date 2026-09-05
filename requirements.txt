@@ -1,0 +1,21 @@
+# RAG 知识库依赖（锁定到当前机器验证通过的版本，保证可复现）
+# Apple Silicon (MPS) 上的 torch 安装：pip install torch 即可自动识别 arm64 wheel
+streamlit==1.62.0
+python-dotenv==1.1.1
+requests==2.32.4
+chromadb==1.5.9
+rank-bm25==0.2.2
+jieba==0.42.1
+torch==2.7.1
+transformers==4.53.2
+numpy==1.26.4
+
+# 开发依赖
+pytest>=7.0
+pytest-cov>=4.0
+pytest-mock>=3.10
+pytest-asyncio>=0.21
+ruff>=0.1.0
+black>=23.0
+mypy>=1.0
+pre-commit>=3.0

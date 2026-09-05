@@ -1,0 +1,15 @@
+.venv/
+venv/
+.git/
+.idea/
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.streamlit/secrets.toml
+*.log
+*.pid
+debug_*.png
+tests/
+.pytest_cache/
