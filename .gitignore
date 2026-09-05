@@ -12,6 +12,9 @@ chroma_db_v2/
 cache_v2/
 *.pkl
 
+# ---- 源文本（体积大，可重新获取）----
+books/
+
 # ---- 运行时产物 ----
 streamlit.pid
 *.log

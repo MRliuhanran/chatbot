@@ -89,3 +89,11 @@ python test_retrieval_quality.py
 
 - Python 3.10（系统安装路径 `/Library/Frameworks/Python.framework/Versions/3.10/bin/python3`）
 - 依赖包：torch, chromadb, transformers, rank_bm25, jieba, streamlit, numpy（均已装在系统 Python site-packages）
+
+## GitHub 配置
+
+- 用户名：MRliuhanran
+- 仓库：chatbot（私有）
+- Token 已配置在 `~/.zshrc`（环境变量 `GITHUB_TOKEN`）
+- API 操作：`curl -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/...`
+- 推送代码：`git push -u origin main`
