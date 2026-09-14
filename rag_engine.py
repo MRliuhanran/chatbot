@@ -28,6 +28,11 @@ warnings.filterwarnings(
     message="Token indices sequence length is longer than the specified maximum",
 )
 
+# sentencex 是**硬依赖**（requirements.txt 已固定 sentencex>=1.0.30；MIT、零依赖、Wikimedia 维护）。
+# 刻意不做 try/except 降级：内置的字符扫描分句会把闭合引号切给下一句（实测全库 24%~36%
+# 的句子以 ” 开头），而且一声不响 —— 静默劣化比启动时报错难排查得多。缺库就让 import 失败。
+from sentencex import segment
+
 # ============================================================================
 # 配置
 # ============================================================================
@@ -145,8 +150,8 @@ def _float16_ok(device):
 # 句末终止符。含 ．(U+FF0E 全角句点)：红楼梦以 ． 为主要句读（10043 次，而 。 仅 4550 次）。
 # 含半角 ?!. 与省略号 …：三国 931 个半角 ?，四书合计 100+ 处 …。
 SENTENCE_TERMINATORS = "。！？．…!?"
-# 切分点之后要继续吞掉的闭合符号：闭合引号必须留在上一句，否则产生大量以 ” 开头的句子。
-CLOSING_CHARS = "”’」』）】》〉"
+# 注：原先还有一个 CLOSING_CHARS（切分点后要吞掉的闭合引号集），随字符扫描分句器
+# _split_sentences_rule 一起删除 —— sentencex 把引语当原子，不需要这层手工吞并。
 
 # 引号归一开关。红楼梦原文混用开引号 “ (5802) 与直引号 " (2426)，
 # 弯引号 ” 只有 4202 个 —— 引号深度算错会让"引语不可切分"的分句器把大段对话
@@ -176,47 +181,6 @@ def _split_keep(text, terminators):
     return [p for p in parts if p.strip()]
 
 
-def _split_sentences_rule(s):
-    """无 sentencex 时的兜底分句：字符扫描 + 吞闭合符号。
-
-    比旧实现多了两点：切分点后吞掉连续的闭合引号；终止符含半角 ?!. 与 …。
-    仍不认段落边界与引语原子性，故只是降级方案。
-    """
-    sentences, cur, i = [], "", 0
-    while i < len(s):
-        ch = s[i]
-        cur += ch
-        i += 1
-        if ch in SENTENCE_TERMINATORS:
-            while i < len(s) and s[i] in CLOSING_CHARS:
-                cur += s[i]
-                i += 1
-            if cur.strip():
-                sentences.append(cur.strip())
-            cur = ""
-    if cur.strip():
-        sentences.append(cur.strip())
-    return sentences
-
-
-_SENTENCEX_SEGMENT = None
-_SENTENCEX_MISSING = False
-
-
-def _get_sentencex():
-    """惰性加载 sentencex 的分句函数；缺库时降级并只提示一次。"""
-    global _SENTENCEX_SEGMENT, _SENTENCEX_MISSING
-    if _SENTENCEX_SEGMENT is None and not _SENTENCEX_MISSING:
-        try:
-            from sentencex import segment
-        except ImportError:
-            _SENTENCEX_MISSING = True
-            print("    ⚠️  未安装 sentencex，降级为内置标点分句（pip install sentencex）")
-        else:
-            _SENTENCEX_SEGMENT = segment
-    return _SENTENCEX_SEGMENT
-
-
 def _split_sentences(s, tokenizer=None, max_tokens=None):
     """分句：段落硬边界 → 库分句 → （可选）token 上限兜底。
 
@@ -227,17 +191,14 @@ def _split_sentences(s, tokenizer=None, max_tokens=None):
     tokenizer/max_tokens 给出时，逐句保证不超过 max_tokens —— 语料里有
     整段无标点的文言（西游记"故曰混沌"一段，单句最长 672 字、红楼 964 字），
     纯分句器对它们无能为力，不兜底就会撑破 CHILD_MAX_TOKENS。
+    segment 由模块顶部的 sentencex 硬依赖提供（缺库即 import 失败，不降级）。
     """
-    segment = _get_sentencex()
     sentences = []
     for para in re.split(r"\n[ \t]*\n", s):
         para = para.strip()
         if not para:
             continue
-        if segment is not None:
-            parts = [p.strip() for p in segment("zh", para) if p.strip()]
-        else:
-            parts = _split_sentences_rule(para)
+        parts = [p.strip() for p in segment("zh", para) if p.strip()]
         if tokenizer is not None and max_tokens:
             limited = []
             for p in parts:
