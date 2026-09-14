@@ -106,14 +106,6 @@ BM25_MODEL_NAME = "qdrant/bm25"
 # jieba 分词后需要丢弃的纯标点 token（word 分词器不认这些，留着只会污染）
 _PUNCT_ONLY = set("，。！？、；：\u201c\u201d\u2018\u2019《》…—（）()[]{}<>!?,.;:'\"-·　 \n\t")
 
-# 人物名词表（外置于此，便于扩展；识别到的名字会进入上下文前缀）
-NAME_PATTERNS = [
-    "刘备", "关羽", "张飞", "诸葛亮", "赵云", "曹操", "孙权", "周瑜",
-    "林黛玉", "贾宝玉", "薛宝钗", "王熙凤",
-    "孙悟空", "唐僧", "猪八戒", "沙僧",
-    "宋江", "武松", "林冲", "鲁智深", "李逵",
-]
-
 
 def get_device():
     import torch
@@ -473,7 +465,6 @@ def build_chunks():
     实测页码 0 处、HTML 0 处、控制字符几无；而曾接入的清洗会删掉
     全部换行、5.7 万个中文引号和所有阿拉伯数字，属纯损失。
     """
-    import re
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
@@ -500,25 +491,21 @@ def build_chunks():
             if len(child_text) <= 5:
                 continue
 
-            chapter_match = re.search(r"第[一二三四五六七八九十百千\d]+[回章节]", child_text)
-            chapter = chapter_match.group(0) if chapter_match else ""
-
-            names = [n for n in NAME_PATTERNS if n in child_text]
-
-            prefix_parts = [f"《{book_name}》"]
-            if chapter:
-                prefix_parts.append(chapter)
-            if names:
-                prefix_parts.append(f"涉及: {', '.join(names[:3])}")
-            contextual_prefix = " > ".join(prefix_parts) + "\n\n"
-
             all_chunks.append({
                 "child_text": child_text,
                 "parent_text": parent_text,
                 "book": book_name,
                 "chunk_index": chunk_idx,
                 "total_chunks": len(chunks),
-                "contextual_text": contextual_prefix + child_text,
+                # contextual_text == child_text：不再拼接上下文前缀。
+                # 旧前缀形如 "《水浒传》 > 第五回 > 涉及: 武松\n\n<正文>"，实测价值极低：
+                #   77.6% (16410/21159) 的块除《书名》外没有任何信息，而《书名》对
+                #   同书所有块是同一个常量；回目正则整体只命中 1.4%（仅回目 178 条 +
+                #   回目&人名 136 条）；人名来源是 21 个硬编码人名表。
+                # 字段本身**保留**：稠密索引(build_index)与 rerank 都读它，
+                # check_health 也校验 payload 里必须存在该字段。让两者相等等价于
+                # "关闭前缀"，行为退化清晰、便于 A/B 对照，不需要动消费链。
+                "contextual_text": child_text,
                 "id": f"{book_name}_{chunk_idx}",
             })
 
