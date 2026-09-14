@@ -39,9 +39,11 @@ from sentencex import segment
 BOOKS_DIR = "books"
 
 TOP_K = 5                # 最终返回给 LLM 的结果数
-RERANK_TOP_K = 30        # 初筛候选数 / 重排序输入数
+RERANK_TOP_K = 20        # 初筛候选数 / 重排序输入数（8GB 机器：30 → 20 砍掉 1/3 峰值）
 RERANK_BATCH = 16        # reranker 单批条数（降低峰值显存）
-RERANK_MAX_LENGTH = 256  # reranker 最大序列长度
+# 384 而非 256：父块 PARENT_MAX_TOKENS=512，256 会把父块砍掉一半，
+# 等于抵消"父子分块"的意义。XLM-R 上限 514，384 是安全且不丢上下文的值。
+RERANK_MAX_LENGTH = 384  # reranker 最大序列长度
 # 融合由 Qdrant 服务端 FusionQuery(RRF) 完成，其 k 值不可在此配置，
 # 故不再保留 RRF_K 这类从未生效的常量（旧代码里它一直是死配置）。
 
@@ -68,8 +70,11 @@ SEMANTIC_EMBED_DEVICE = os.getenv("SEMANTIC_EMBED_DEVICE", "cpu")
 # Qdrant Docker配置
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-COLLECTION_NAME = "books_v2"
-EMBED_MODEL_PATH = "./models/bge-small-zh-v1.5"
+COLLECTION_NAME = "books_v3"
+# 换 bge-small(512维) → bge-base(768维)：
+#   C-MTEB Retrieval 61.77 → 69.49 (+7.72)，而 large 只再 +0.97 却要 3.2 倍参数。
+#   维度变了，旧集合 books_v2 无法增量迁移，故新建 books_v3，回滚零成本。
+EMBED_MODEL_PATH = "./models/bge-base-zh-v1.5"
 RERANK_MODEL_PATH = "./models/bge-reranker-base"
 
 CHUNKS_JSON = "./cache_v2/chunks.json"
@@ -656,7 +661,9 @@ def build_index():
     else:
         # CPU 模式：多线程 + 适中 batch
         tokenizer, model, device = load_embedding_model(device="cpu")
-        torch.set_num_threads(8)
+        # 6 而非 8：M2 是 4P+4E，吃满 8 线程会让前台明显卡顿（8GB 机器上更甚），
+        # 留 2 个线程给系统，吞吐损失很小。
+        torch.set_num_threads(6)
         batch_size = 128
         COOL_DOWN_SLEEP = 0.05
         print(f"Embedding 设备: cpu (8线程, batch_size={batch_size})")
