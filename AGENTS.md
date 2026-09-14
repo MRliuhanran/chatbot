@@ -35,7 +35,7 @@ python app.py
 │   └── config.yaml     # Qdrant配置文件
 ├── books/              # 源文本文件（四大名著 .txt）
 ├── models/             # 预训练模型
-│   ├── bge-small-zh-v1.5/  # 向量化模型
+│   ├── bge-base-zh-v1.5/   # 向量化模型（768维）
 │   └── bge-reranker-base/  # 重排序模型
 ├── qdrant_storage/     # Qdrant Docker数据存储
 ├── cache_v2/           # 分块缓存
@@ -49,7 +49,7 @@ python app.py
 # Qdrant Docker配置
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
-COLLECTION_NAME = "books_v2"
+COLLECTION_NAME = "books_v3"
 
 # 分块参数
 child_max_tokens = 128    # 子块：精确匹配
@@ -65,13 +65,19 @@ NORMALIZE_QUOTES = "1"    # 直引号 " 归一为弯引号（红楼梦专治）�
 
 # 检索参数
 top_k = 5                 # 最终返回给LLM的结果数
-rerank_top_k = 30         # Rerank候选数
+rerank_top_k = 20         # Rerank候选数（每通道召回数；8GB 机器下调以削峰）
 rerank_batch = 16         # reranker 单批条数
-rerank_max_length = 256   # reranker 最大序列长度
+rerank_max_length = 384   # reranker 最大序列长度（父块 512 token，256 会砍掉一半）
 
 # 模型
-embed_model_path = "./models/bge-small-zh-v1.5"
+embed_model_path = "./models/bge-base-zh-v1.5"
 rerank_model_path = "./models/bge-reranker-base"
+
+# 设备
+SEMANTIC_EMBED_DEVICE = "cpu"   # 分块阶段句子编码（默认 cpu，MPS 会因 GPU 争用阻塞）
+INDEX_DEVICE = ""               # 建索引阶段，空=自动优先 MPS；设 cpu 可强制 CPU
+                                #   （8GB 机器上 MPS 常因统一内存被挤压而初始化失败，
+                                #    build_index 已内置回退 CPU，见其注释）
 ```
 
 ## 常用操作
@@ -96,7 +102,7 @@ python check_health.py
 - **向量数据库**: Qdrant (Docker部署)
 - **搜索方式**: 稠密向量 + BM25稀疏向量 → RRF融合
 - **分句**: sentencex 单层分句（引语不可切，且自身把 `\n\n` 当句边界）+ 超长句 token 兜底
-- **嵌入模型**: BGE-small-zh-v1.5
+- **嵌入模型**: BGE-base-zh-v1.5 (768维)
 - **重排序模型**: BGE-reranker-base
 - **UI**: Streamlit
-- **生成模型**: Ollama (qwen3.5:2b)
+- **生成模型**: Ollama（取自 `.env` 的 `MODEL`，当前 qwen3.5:4b-q4_K_M）

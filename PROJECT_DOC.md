@@ -18,7 +18,7 @@
                        ▼
 ┌─────────────────────────────────────────────────────┐
 │  RAG Engine (rag_engine.py)                         │
-│  - Embedding: bge-small-zh-v1.5 (fp32)             │
+│  - Embedding: bge-base-zh-v1.5 (768维)             │
 │  - 检索: Qdrant稠密+稀疏混合 → RRF融合              │
 │  - Rerank: bge-reranker-base (fp16)                │
 └──────────────────────┬──────────────────────────────┘
@@ -59,17 +59,19 @@
 - **分句**: `sentencex` 单层分句（引语内部不切分，引号错位 24%~36% → 0%）。它自身把 `\n\n` 与 `\r\n\r\n` 都当句边界且从不跨段，因此**不再预切段落**——实测四本书 66079 句，"先按段落预切再逐段分句"与"整本书一次分句"输出序列逐元素完全相同
 - **sentencex 是硬依赖**: 缺库直接 `ImportError`，刻意不降级（内置字符扫描分句会静默把闭合引号切给下一句）
 - **超长句兜底**: 无标点文言段最长 673 token，不兜底会撑破 CHILD_MAX_TOKENS 并被 tokenizer 静默截断。全库 779 句超 128 token（1.18%），19 句超 512 token
-- **语义定界**: bge-small 逐句编码 + 相邻句余弦相似度阈值 0.6 且当前块 ≥500 字才切分（详见 `_semantic_split` 注释）
+- **语义定界**: 用 `EMBED_MODEL_PATH`（当前 bge-base-zh-v1.5）逐句编码 + 相邻句余弦相似度阈值 0.6 且当前块 ≥500 字才切分（详见 `_semantic_split` 注释）。
+  ⚠️ 注意：当前 `chunks.json` 的语义定界实际由 **bge-small** 完成（切换模型前的产物）；换模型后重跑 `process` 边界可能漂移，须同时重跑 `index`
 - **contextual_text**: 当前恒等于 `child_text`（不再拼接上下文前缀）。旧前缀形如 `《书名》 > 第五回 > 涉及: 武松\n\n<正文>`，实测 77.6% 的块除《书名》外无任何信息、回目正则整体只命中 1.4%，故已移除生成逻辑；字段本身保留（稠密索引与 rerank 消费它，`check_health.py` 校验其存在）
 - **改动分块后请用 `compare_chunks.py` 做 A/B**：`python app.py process` 后执行 `python compare_chunks.py`，验证是否零影响/仅影响指定字段
 
 ### 4.2 向量索引（build_index）
 
 ```
-chunks.json → Embedding (bge-small) → Qdrant (COSINE)
+chunks.json → Embedding (bge-base, 768维) → Qdrant (COSINE)
 ```
 
-- **模型**: BGE-small-zh-v1.5 (fp32, 512 维)
+- **模型**: BGE-base-zh-v1.5 (768 维)；集合名 `books_v3`（换模型换集合，旧 `books_v2` 为 512 维遗留）
+- **设备**: `INDEX_DEVICE` 空=自动优先 MPS；MPS 初始化失败（8GB 机器上常见 `invalid low watermark ratio`）会自动回退 CPU 而非崩溃
 - **设备**: 支持 MPS (Apple Silicon GPU) / CPU
 - **批处理**: batch_size=128
 
@@ -81,8 +83,8 @@ Query → Embedding(query 侧加 instruction)
       → Reranker top-5 → 返回结果
 ```
 
-- **检索**: 稠密（bge-small）+ 稀疏（jieba 分词 + Qdrant 内置 BM25，`Modifier.IDF`），每通道取 `RERANK_TOP_K=30`，由 Qdrant 服务端 `FusionQuery(RRF)` 融合
-- **重排**: bge-reranker-base, rerank_batch=16, 输入 30 条 → 输出 top_k=5
+- **检索**: 稠密（bge-base, 768维）+ 稀疏（jieba 分词 + Qdrant 内置 BM25，`Modifier.IDF`），每通道取 `RERANK_TOP_K=20`，由 Qdrant 服务端 `FusionQuery(RRF)` 融合
+- **重排**: bge-reranker-base, rerank_batch=16, max_length=384, 输入 20 条 → 输出 top_k=5
 
 > `search_limit` 是旧版 `chatbot.py` 的参数（已归档到 `bak/`），现行代码中不存在。
 > RRF 的 k 值也不可配置——融合在 Qdrant 服务端完成。
@@ -102,9 +104,9 @@ Query → Embedding(query 侧加 instruction)
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `top_k` | 5 | 最终返回结果数 |
-| `rerank_top_k` | 30 | 每通道召回数 / Reranker 候选数 |
+| `rerank_top_k` | 20 | 每通道召回数 / Reranker 候选数（8GB 机器下调以削峰） |
 | `rerank_batch` | 16 | Reranker 批处理大小 |
-| `rerank_max_length` | 256 | Reranker 最大序列长度 |
+| `rerank_max_length` | 384 | Reranker 最大序列长度（父块 512 token） |
 
 > 以上均为 `rag_engine.py` 中的常量，当前没有环境变量覆盖（改需改代码）。
 > `search_limit` 属于旧版实现，已不存在。
@@ -113,7 +115,7 @@ Query → Embedding(query 侧加 instruction)
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `embed_model_path` | `./models/bge-small-zh-v1.5` | Embedding 模型 |
+| `embed_model_path` | `./models/bge-base-zh-v1.5` | Embedding 模型（768 维） |
 | `rerank_model_path` | `./models/bge-reranker-base` | Reranker 模型 |
 
 ## 6. 使用方法
@@ -172,7 +174,7 @@ python test_rag.py
 | 书名匹配准确率 | **100%** (8/8) |
 | 关键词命中率 | **87.5%** (7/8) |
 | 平均检索时间 | **1.09s** |
-| 索引总量 | 19023 条 |
+| 索引总量 | 21159 条（`books_v3`） |
 
 ### 7.3 跨书检索验证
 
@@ -227,7 +229,8 @@ chatbot/
 │   ├── 红楼梦.txt
 │   └── 西游记.txt
 ├── models/             # 预训练模型
-│   ├── bge-small-zh-v1.5/
+│   ├── bge-base-zh-v1.5/   # 当前使用（768维）
+│   ├── bge-small-zh-v1.5/  # 遗留（512维）
 │   └── bge-reranker-base/
 ├── cache_v2/           # 分块产物
 │   ├── chunks.json                    # 当前使用的分块（21159 条）

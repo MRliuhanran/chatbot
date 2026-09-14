@@ -66,6 +66,10 @@ EMBED_BATCH_SIZE = 64
 # 分块阶段句子编码所用设备，可用环境变量覆盖（"mps"/"cpu"）。
 # 默认 cpu：MPS 在本机与 CPU 同速，且会因 GPU 争用阻塞（详见 _get_embed_model）。
 SEMANTIC_EMBED_DEVICE = os.getenv("SEMANTIC_EMBED_DEVICE", "cpu")
+# 建索引阶段（build_index）编码所用设备。空 = 自动（有 MPS 就优先 MPS）。
+# 设 INDEX_DEVICE=cpu 可强制 CPU：8GB 机器上 MPS 常因统一内存被挤压而初始化失败
+# （见 build_index 里对 "invalid low watermark ratio" 的回退），显式指定可免去试探。
+INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
 
 # Qdrant Docker配置
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
@@ -647,15 +651,29 @@ def build_index():
     print(f"索引建造标识: {build_id}")
 
     # ---- GPU 优化策略 ----
-    device = get_device()
+    device = INDEX_DEVICE or get_device()
     use_gpu = device == "mps"
+    tokenizer = model = None
 
     if use_gpu:
-        # GPU 模式：降低batch避免MPS内存溢出
-        tokenizer, model, _ = load_embedding_model(device="mps")
-        # 使用 fp16 推理加速（bge-small 模型小，fp16 精度足够）
-        model = model.half()
-        batch_size = 128  # 降低batch避免内存不足
+        try:
+            # GPU 模式：降低batch避免MPS内存溢出
+            tokenizer, model, _ = load_embedding_model(device="mps")
+            # 使用 fp16 推理加速（bge 系列模型小，fp16 精度足够）
+            model = model.half()
+        except Exception as exc:
+            # MPS 初始化会因统一内存被挤压而失败，实测报错：
+            #   RuntimeError: invalid low watermark ratio 1.4
+            # （torch.mps.recommended_max_memory() 被压到阈值以下时水位比越界；
+            #  8GB 机器上 Ollama 等进程占用 GPU 统一内存时必现，且时机随机）
+            # 这是环境问题而非代码缺陷，但原先会让整个建索引流程直接崩掉 ——
+            # 退到 CPU 只是慢一些，向量结果等价，不该失败。
+            print(f"    ⚠️  MPS 初始化失败，回退 CPU 建索引（更慢，结果等价）: "
+                  f"{type(exc).__name__}: {exc}")
+            tokenizer, model, use_gpu = None, None, False
+
+    if use_gpu:
+        batch_size = 128
         COOL_DOWN_SLEEP = 0.1  # 增加冷却间隔
         print(f"Embedding 设备: mps (fp16, batch_size={batch_size})")
     else:
@@ -666,7 +684,7 @@ def build_index():
         torch.set_num_threads(6)
         batch_size = 128
         COOL_DOWN_SLEEP = 0.05
-        print(f"Embedding 设备: cpu (8线程, batch_size={batch_size})")
+        print(f"Embedding 设备: cpu (6线程, batch_size={batch_size})")
 
     total = len(all_chunks)
     all_embeddings = []
@@ -781,8 +799,16 @@ def build_index():
     
     info = client.get_collection(collection_name=COLLECTION_NAME)
     print(f"  Qdrant 写入完成: {client.count(collection_name=COLLECTION_NAME).count} 条")
+    # 打印集合**实际**的稠密维度，而不是本地 embeddings.shape[1]。
+    # 旧写法两者混用（键名取自集合配置、size 取自局部变量），维度一旦不一致
+    # 日志会显示出一个并不存在的集合配置，排查建索引问题时会直接把人带偏。
+    coll_dense_size = next(iter(info.config.params.vectors.values())).size
+    assert coll_dense_size == embeddings.shape[1], (
+        f"集合稠密维度 {coll_dense_size} 与本次编码维度 {embeddings.shape[1]} 不一致"
+        f"（集合名 {COLLECTION_NAME}）"
+    )
     print(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} "
-          f"(size={embeddings.shape[1]}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")
+          f"(size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")
     print(f"  索引构建完成: 稠密向量 + 稀疏向量（jieba 分词 + Qdrant 内置 BM25 打分）")
     print(f"  索引建造标识: {build_id}（检索端据此自动丢弃进程内的旧分块缓存）")
     print(f"总耗时: {time.time() - t0:.1f} 秒")
