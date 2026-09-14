@@ -6,7 +6,7 @@ RAG 检索引擎 —— 与 UI 框架解耦的纯函数模块。
 仓库里 `bak/chatbot.py` 是旧版 ChromaDB 单体实现，已归档、无人引用，不要参考。
 
 设计要点：
-  - 分块：引号归一 → 段落硬边界 → sentencex 分句 → 超长句 token 兜底 → 父子分层
+  - 分块：引号归一 → sentencex 分句（单层，不预切段落）→ 超长句 token 兜底 → 父子分层
   - 语义分块用 bge-small 编码句子相似度（分块阶段设备默认 CPU，可用
     SEMANTIC_EMBED_DEVICE 覆盖；实测本机 MPS 吞吐更高，但 GPU 被其它进程
     占用时会阻塞，故默认选确定性）
@@ -182,30 +182,33 @@ def _split_keep(text, terminators):
 
 
 def _split_sentences(s, tokenizer=None, max_tokens=None):
-    """分句：段落硬边界 → 库分句 → （可选）token 上限兜底。
+    """分句：sentencex 单层分句 → （可选）token 上限兜底。
 
-    \n\n 段落边界优先于任何标点：段落才是原文的真结构，
-    而 text 里的单换行只是排版硬折行（四本书每 ~100 字一个 \n）。
-    先按段落切开，段落边界就天然是句子边界，不会再出现"跨段句子"。
+    **不再预切 \n\n 段落**：sentencex 自身把 \n\n 与 \r\n\r\n 都当句边界，且从不跨段。
+    实测四本书（66079 句）"先按段落预切再逐段分句"与"整本书一次分句"的输出序列
+    逐元素完全相同，跨段句（含 \n 的句子）恒为 0 —— 那一层是纯冗余，故删除。
+    "句子不跨段"这条性质改由下面的断言守护：它现在是 sentencex 的实现保证，
+    而不是本函数的代码保证，所以必须能被测试发现回归。
 
     tokenizer/max_tokens 给出时，逐句保证不超过 max_tokens —— 语料里有
-    整段无标点的文言（西游记"故曰混沌"一段，单句最长 672 字、红楼 964 字），
+    整段无标点的文言（西游记"故曰混沌"一段，单句最长 673 字、红楼 705 字），
     纯分句器对它们无能为力，不兜底就会撑破 CHILD_MAX_TOKENS。
-    segment 由模块顶部的 sentencex 硬依赖提供（缺库即 import 失败，不降级）。
     """
-    sentences = []
-    for para in re.split(r"\n[ \t]*\n", s):
-        para = para.strip()
-        if not para:
-            continue
-        parts = [p.strip() for p in segment("zh", para) if p.strip()]
-        if tokenizer is not None and max_tokens:
-            limited = []
-            for p in parts:
-                limited.extend(_enforce_token_limit(p, tokenizer, max_tokens))
-            parts = limited
-        sentences.extend(parts)
-    return sentences
+    parts = [p.strip() for p in segment("zh", s) if p.strip()]
+    # 段落硬边界的守护断言。sentencex 保证引语不可切分、不跨段；一旦这里失败，
+    # 说明分句器行为变了（换版本/换库），必须重新评估分块，不能静默继续。
+    # 注意只在 token 兜底之前断言：兜底会按 "\n" 等终止符切开长句，可能产生带换行的碎片。
+    bad = next((p for p in parts if "\n" in p or "\r" in p), None)
+    if bad is not None:
+        raise ValueError(
+            f"分句器跨段了，段落硬边界保证已失效（sentencex 行为可能已变）：{bad[:60]!r}"
+        )
+    if tokenizer is not None and max_tokens:
+        limited = []
+        for p in parts:
+            limited.extend(_enforce_token_limit(p, tokenizer, max_tokens))
+        parts = limited
+    return parts
 
 
 def _hard_split_by_tokens(text, tokenizer, max_tokens):
@@ -439,8 +442,10 @@ def read_book_text(filepath):
     导致损坏位置和内容都无从追查。这里改为显式暴露：
     坏字节被替换成 U+FFFD（可检测、可回溯），而不是无声消失。
 
-    另：按字节读取会绕过文本模式的通用换行转换，故显式把 CRLF/CR 归一为 LF，
-    与原先 open(..., "r") 的行为保持一致（水浒传含 8436 个 CR）。
+    另：原先这里把 CRLF/CR 显式归一为 LF（水浒传含 8436 个 CR），理由是按字节读取
+    绕过了文本模式的通用换行转换。现已删除 —— 实测 sentencex 自身就把 \r\n\r\n 当句
+    边界，且输出不含 \r，四本书的句子序列与归一前逐元素完全相同（配合已删除的
+    \n\n 段落预切，见 _split_sentences）。保留它只会让人以为 CRLF 需要特殊对待。
 
     最后做引号归一（NORMALIZE_QUOTES）：红楼梦原文开引号用 “、闭引号却混用 ” 与 "，
     直接分句会把大段对话吞进同一句。这一步会改写原文里的直引号，
@@ -456,7 +461,6 @@ def read_book_text(filepath):
             f"偏移 {e.start}-{e.end}，字节 {raw[e.start:e.end]!r}（已替换为 U+FFFD）"
         )
         text = raw.decode("utf-8", errors="replace")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
     if NORMALIZE_QUOTES:
         text = fix_quotes(text)
     return text
