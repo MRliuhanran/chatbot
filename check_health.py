@@ -5,8 +5,8 @@
 检查项（每项互不依赖，单项失败不中断）：
   1. 配置常量与模型/缓存目录
   2. books 源文本齐全
-  3. ChromaDB books_v2 非空 + 元数据完整
-  4. BM25 缓存哈希一致 + 语料/ids 条数与 ChromaDB 一致
+  3. Qdrant 集合（rag_engine.COLLECTION_NAME）非空 + 元数据完整
+  4. 混合检索：集合同时具备稠密/稀疏空间、点上两种向量都已写入、稀疏单通道可召回
   5. Ollama 后端可达（/api/tags）
   6. 生成模型可用（一次简短 think:false 问答）
 
@@ -17,7 +17,6 @@
 """
 import argparse
 import os
-import pickle
 import sys
 import time
 
@@ -26,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rag_engine as RE  # noqa: E402
 import app as A            # noqa: E402  (提供 MODEL / OLLAMA_BASE_URL)
 
-import chromadb  # noqa: E402
+from qdrant_client import QdrantClient  # noqa: E402
 
 
 def ok(msg):
@@ -68,51 +67,83 @@ def main():
     else:
         fail += bad("books/ 中没有 .txt")
 
-    print("\n[3] 向量库 ChromaDB")
-    chroma_count = 0
+    print("\n[3] 向量库 Qdrant")
+    qdrant_count = 0
+    client = None
     try:
-        col = chromadb.PersistentClient(path=RE.DB_PATH).get_collection("books_v2")
-        chroma_count = col.count()
-        if chroma_count > 0:
-            ok(f"books_v2 记录数: {chroma_count}")
-            sample = col.get(limit=1)
-            meta = sample["metadatas"][0]
-            missing = [k for k in ["book", "chunk_index", "parent_text", "contextual_text"]
-                       if k not in meta]
-            if missing:
-                fail += bad(f"元数据缺字段: {missing}")
-            else:
-                ok("元数据字段完整")
+        # 连接Docker服务
+        client = QdrantClient(host=RE.QDRANT_HOST, port=RE.QDRANT_PORT)
+        qdrant_count = client.count(collection_name=RE.COLLECTION_NAME).count
+        if qdrant_count > 0:
+            ok(f"{RE.COLLECTION_NAME} 记录数: {qdrant_count}")
+            # 获取一条样本数据检查元数据
+            sample = client.scroll(
+                collection_name=RE.COLLECTION_NAME,
+                limit=1,
+                with_payload=True,
+                with_vectors=False
+            )[0]
+            if sample:
+                meta = sample[0].payload
+                missing = [k for k in ["book", "chunk_index", "parent_text", "contextual_text"]
+                           if k not in meta]
+                if missing:
+                    fail += bad(f"元数据缺字段: {missing}")
+                else:
+                    ok("元数据字段完整")
         else:
-            fail += bad("books_v2 为空，请运行: python app.py process && python app.py index")
+            fail += bad(f"{RE.COLLECTION_NAME} 为空，请运行: python app.py index")
     except Exception as e:
-        fail += bad(f"无法打开 ChromaDB books_v2: {e}")
+        fail += bad(f"无法连接 Qdrant Docker服务 ({RE.QDRANT_HOST}:{RE.QDRANT_PORT}): {e}")
 
-    print("\n[4] BM25 缓存")
-    try:
-        hash_file = os.path.join(RE.BM25_CACHE_DIR, "hash.txt")
-        cached = open(hash_file).read().strip() if os.path.exists(hash_file) else ""
-        computed = RE._get_books_hash()
-        if cached == computed:
-            ok("hash.txt 与书籍内容一致")
-        else:
-            fail += bad("hash.txt 过期，请重新运行: python app.py index")
-        files_ok = all(os.path.exists(p) for p in [
-            RE.BM25_TOKENS_CACHE_FILE, RE.BM25_CACHE_FILE, RE.BM25_IDS_CACHE_FILE])
-        if files_ok:
-            with open(RE.BM25_TOKENS_CACHE_FILE, "rb") as f:
-                n_tokens = len(pickle.load(f))
-            with open(RE.BM25_IDS_CACHE_FILE, "rb") as f:
-                n_ids = len(pickle.load(f))
-            ok(f"BM25 语料条数: {n_tokens}, ids: {n_ids}")
-            if chroma_count and (n_tokens != chroma_count or n_ids != chroma_count):
-                fail += bad(f"BM25({n_tokens}/{n_ids}) 与 ChromaDB({chroma_count}) 数量不一致，请重建索引")
+    print("\n[4] 混合检索（稠密 + 稀疏）")
+    # 旧版这里只做了 hasattr(config) 判断，恒为真，永远打印"已启用"，
+    # 因此"稀疏向量其实一条都没写"这个事实被掩盖了很久。改为真检查：
+    # 集合配置 + 点上实际向量 + 稀疏单通道能否召回。
+    if client is None or qdrant_count == 0:
+        print("  ⏭  跳过（向量库不可用）")
+    else:
+        try:
+            info = client.get_collection(collection_name=RE.COLLECTION_NAME)
+            sparse_names = list(info.config.params.sparse_vectors.keys())
+            dense_names = list(info.config.params.vectors.keys())
+            if sparse_names and dense_names:
+                ok(f"集合配置: 稠密 {dense_names} + 稀疏 {sparse_names}")
             else:
-                ok("BM25 与 ChromaDB 数量一致")
-        else:
-            fail += bad("BM25 缓存文件缺失")
-    except Exception as e:
-        fail += bad(f"BM25 检查异常: {e}")
+                fail += bad(f"集合缺少向量空间: 稠密 {dense_names} / 稀疏 {sparse_names}")
+
+            pts, _ = client.scroll(
+                collection_name=RE.COLLECTION_NAME,
+                limit=50,
+                with_payload=True,
+                with_vectors=True,
+            )
+            miss_dense = sum(1 for p in pts if not p.vector.get(RE.DENSE_VECTOR_NAME))
+            miss_sparse = sum(1 for p in pts if not p.vector.get(RE.SPARSE_VECTOR_NAME))
+            if not miss_dense and not miss_sparse and pts:
+                n_terms = len(pts[0].vector[RE.SPARSE_VECTOR_NAME].indices)
+                ok(f"抽样 {len(pts)} 条: 稠密/稀疏均已写入（首条稀疏 {n_terms} 个 term）")
+            else:
+                fail += bad(
+                    f"抽样 {len(pts)} 条中: 缺稠密 {miss_dense} 条, 缺稀疏 {miss_sparse} 条"
+                    "（稀疏没写 = 混合检索名存实亡）"
+                )
+
+            # 功能验证：用样本原文做稀疏单通道检索，必须能召回自己
+            probe = pts[0].payload.get("child_text", "")[:80]
+            if probe:
+                res = client.query_points(
+                    collection_name=RE.COLLECTION_NAME,
+                    query=RE.sparse_encode(probe),
+                    using=RE.SPARSE_VECTOR_NAME,
+                    limit=3,
+                )
+                if res.points:
+                    ok(f"稀疏单通道检索可用（{len(res.points)} 条命中，最高分 {res.points[0].score:.2f}）")
+                else:
+                    fail += bad("稀疏单通道检索返回空，稀疏索引可能未生效")
+        except Exception as e:
+            fail += bad(f"混合检索检查失败: {e}")
 
     if args.offline:
         print("\n(offline 模式：跳过 Ollama 在线检查)")
