@@ -707,9 +707,15 @@ def build_index():
             cls = outputs.last_hidden_state[:, 0].float()
             cls = torch.nn.functional.normalize(cls, p=2, dim=1)
             all_embeddings.append(cls.cpu().numpy())
-            # 清理MPS缓存避免内存积累
-            if torch.backends.mps.is_available():
+            # 清理MPS缓存避免内存积累。
+            # 与收尾那处同理：empty_cache 失败只是缓存没清，不该中断建索引 ——
+            # 这里在中途，崩掉的代价更大（已算完的批次全部作废）。
+            # 此处已在 if use_gpu 分支内，故无需再判断设备（原写法的
+            # mps.is_available() 守卫在本机恒为 True，属于冗余判断）。
+            try:
                 torch.mps.empty_cache()
+            except Exception as exc:
+                print(f"    ⚠️  mps.empty_cache() 失败（忽略，不影响结果）: {type(exc).__name__}: {exc}")
         else:
             # CPU: 标准推理
             all_embeddings.append(embed(texts, tokenizer, model, device, is_query=False))
