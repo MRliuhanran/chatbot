@@ -725,8 +725,15 @@ def build_index():
 
     # 释放 embedding 模型内存
     del model, tokenizer
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    # 守卫必须是 use_gpu 而不是 mps.is_available()：后者在本机恒为 True，
+    # 于是**纯 CPU 建索引**也会去碰 MPS，任何 MPS 侧问题（如水位比非法）都会
+    # 让跑完 100% 嵌入的流程崩在写入 Qdrant 之前，整个索引白建。
+    # 即便真在 GPU 模式，empty_cache 失败也只是缓存没清，不该中断建索引。
+    if use_gpu and torch.backends.mps.is_available():
+        try:
+            torch.mps.empty_cache()
+        except Exception as exc:
+            print(f"    ⚠️  mps.empty_cache() 失败（忽略，不影响结果）: {type(exc).__name__}: {exc}")
 
     # ---- 阶段 2: 写入 Qdrant (稠密+稀疏) ----
     print("写入 Qdrant (稠密+稀疏混合)...")
