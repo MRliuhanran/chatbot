@@ -30,6 +30,7 @@ python app.py
 ├── rag_engine.py       # RAG 核心引擎：分块/嵌入/索引/检索
 ├── check_health.py     # 系统健康检查
 ├── compare_chunks.py   # 分块 A/B 比较器（验证分块改动是否零影响）
+├── compare_ab.py       # 检索级 A/B（完整链路对比两个集合，决定集合能否删除）
 ├── docker-compose.yml  # Docker编排文件
 ├── qdrant/
 │   └── config.yaml     # Qdrant配置文件
