@@ -15,10 +15,12 @@
   反而掩盖了真正的问题。按位置比对能直接暴露边界漂移。
 
 用法:
-  python compare_chunks.py                       # 默认: chunks_before_simplify.json vs chunks.json
-  python compare_chunks.py A.json B.json
+  python compare_chunks.py A.json B.json          # 逐条比对两份分块产物
   python compare_chunks.py A.json B.json --allow contextual_text
       # --allow F: 只允许字段 F 不同（其余字段必须逐字节相同），适合"只改前缀"这类改动
+
+  A 通常是改动前用 `python app.py process` 存档的副本，B 是改动后的
+  cache_v2/chunks.json。本工具不生成基线：请自行在改动前复制存档。
 退出码: 0=通过（相同，或差异全部落在 --allow 字段内）  1=不通过
 """
 
@@ -28,10 +30,16 @@ import os
 import sys
 from collections import Counter
 
-DEFAULT_A = "./cache_v2/chunks_before_simplify.json"
 DEFAULT_B = "./cache_v2/chunks.json"
 
 # 逐条记录里所有参与比对的字段（顺序即输出顺序）
+#
+# ⚠️ 这张表必须覆盖分块产物的**全部**字段。比较器只遍历这里列出的字段，
+# 未登记的字段会被**静默忽略**，于是"改动只影响 parent_id / chapter_*"时会
+# 打印"✅ 比较通过：差异全部落在允许范围内" —— 假绿。而 parent_id 是检索侧
+# 按父块去重的依据、chapter_* 是引用溯源的依据，都不是可以忽略的东西。
+# 为防止再次漏登记，run() 开头有一道"模式漂移自检"：产物出现未登记字段时
+# 直接报错退出，而不是装作没看见。
 FIELDS = [
     "child_text",
     "parent_text",
@@ -40,13 +48,18 @@ FIELDS = [
     "total_chunks",
     "contextual_text",
     "id",
+    "parent_id",
+    "parent_chunk_count",
+    "chapter_index",
+    "chapter_label",
+    "chapter_title",
 ]
 
 
 def load(path):
     if not os.path.exists(path):
         sys.exit(f"❌ 找不到文件: {path}")
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
         sys.exit(f"❌ {path} 不是 JSON 列表（chunks.json 应为记录数组）")
@@ -59,12 +72,35 @@ def show(text, limit=90):
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def compare(a, b, allow):
+def check_schema(a, b, path_a, path_b):
+    """模式漂移自检：产物里出现未登记字段就**直接失败**，不给假绿。
+
+    为什么要硬失败而不是"自动把新字段也纳入比较"：本工具的语义是
+    allow-list（"哪些差异是允许的"），自动纳入会让它变成"任何新字段都报错"，
+    逼人用 --allow 逐个放行 —— 比现在更糟。缺的只是"发现字段表过期"这一步：
+    默认拒绝 + 明确报错，才是这张表本来的设计意图。
+    """
+    seen = set()
+    for rows in (a, b):
+        for r in rows[:50]:          # 抽样足够：同一个产物里字段集是齐的
+            if isinstance(r, dict):
+                seen |= set(r)
+    unknown = sorted(seen - set(FIELDS))
+    if unknown:
+        sys.exit(
+            f"❌ 分块产物出现未登记字段 {unknown}（来自 {path_a} / {path_b}）。\n"
+            f"   比较器只遍历 FIELDS，未登记字段会被**静默忽略** —— 那正是假绿的来源。\n"
+            f"   请先把它们登记进 compare_chunks.FIELDS（并想清楚该不该允许不同）。"
+        )
+
+
+def compare(a, b, allow, path_a, path_b):
+    check_schema(a, b, path_a, path_b)
     print("=" * 78)
     print("分块结果比较")
     print("=" * 78)
-    print(f"  A: {ARGS.a}")
-    print(f"  B: {ARGS.b}")
+    print(f"  A: {path_a}")
+    print(f"  B: {path_b}")
     print(f"  允许不同的字段: {sorted(allow) if allow else '（无，要求逐字节相同）'}")
     print()
 
@@ -131,19 +167,19 @@ def compare(a, b, allow):
 
 def main():
     ap = argparse.ArgumentParser(description="分块结果 A/B 比较")
-    ap.add_argument("a", nargs="?", default=DEFAULT_A, help=f"基线文件（默认 {DEFAULT_A}）")
-    ap.add_argument("b", nargs="?", default=DEFAULT_B, help=f"对照文件（默认 {DEFAULT_B}）")
+    ap.add_argument("a", help="基线文件（改动前存档的分块产物）")
+    ap.add_argument("b", nargs="?", default=DEFAULT_B,
+                    help=f"对照文件（默认 {DEFAULT_B}）")
     ap.add_argument("--allow", action="append", default=[],
                     help="允许不同的字段名，可重复指定，例如 --allow contextual_text")
-    global ARGS
-    ARGS = ap.parse_args()
+    args = ap.parse_args()
 
-    unknown = [f for f in ARGS.allow if f not in FIELDS]
+    unknown = [f for f in args.allow if f not in FIELDS]
     if unknown:
         sys.exit(f"❌ --allow 出现未知字段: {unknown}（可用: {FIELDS}）")
 
-    a, b = load(ARGS.a), load(ARGS.b)
-    sys.exit(compare(a, b, set(ARGS.allow)))
+    a, b = load(args.a), load(args.b)
+    sys.exit(compare(a, b, set(args.allow), args.a, args.b))
 
 
 if __name__ == "__main__":

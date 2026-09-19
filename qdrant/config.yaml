@@ -1,0 +1,27 @@
+# Qdrant 配置文件
+# 文档: https://qdrant.tech/documentation/operations/configuration/
+
+log_level: INFO
+
+storage:
+  storage_path: /qdrant/storage
+  # 优化配置
+  optimizations:
+    memmap_threshold_kb: 20000
+    indexing_threshold_kb: 20000
+
+service:
+  grpc_port: 6334
+  http_port: 6333
+  host: 0.0.0.0
+
+# 嵌入式模式配置（开发环境）
+# storage:
+#   type: local
+#   local:
+#     path: /qdrant/storage
+
+# 集群配置（生产环境可选）
+# cluster:
+#   enabled: false
+#   consensus_port: 6335

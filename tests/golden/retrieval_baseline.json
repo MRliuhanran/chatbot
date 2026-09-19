@@ -1,0 +1,1633 @@
+{
+  "collection": "books_v3",
+  "resolved_collection": "books_current",
+  "chunks": 21971,
+  "embed_model": "./models/bge-base-zh-v1.5",
+  "rerank_model": "./models/bge-reranker-base",
+  "top_k": 5,
+  "rerank_top_k": 20,
+  "rerank_max_length": 384,
+  "rerank_on": "child",
+  "rrf_k": 60,
+  "rrf_dense_weight": 1.0,
+  "rrf_sparse_weight": 1.0,
+  "dedup_by_parent": true,
+  "recall_limit": 20,
+  "aliases_enabled": true,
+  "stopwords_enabled": true,
+  "rewrite_enabled": true,
+  "concat_enabled": true,
+  "multiturn_degrade_state": "llm",
+  "multiturn_fusion_state": "True:primary",
+  "aggregate": {
+    "n": 24,
+    "book@1": 0.9583333333333334,
+    "book@k": 1.0,
+    "kw@k": 0.8333333333333334
+  },
+  "aggregate_short": {
+    "n": 12,
+    "book@1": 0.9166666666666666,
+    "book@k": 1.0,
+    "kw@k": 1.0
+  },
+  "aggregate_all": {
+    "positive": {
+      "n": 24,
+      "book@1": 0.9583333333333334,
+      "book@k": 1.0,
+      "kw@k": 0.8333333333333334
+    },
+    "negative": {
+      "n": 10,
+      "refuse_rate": 0.6,
+      "answer_rate": 0.4,
+      "empty_rate": 0.0,
+      "mean_rel_gap": 0.6840551344027994,
+      "mean_n_books": 2.5
+    },
+    "multiturn": {
+      "n": 30,
+      "book@1": 1.0,
+      "book@k": 1.0,
+      "kw@k": 0.8,
+      "topic@k": 0.9666666666666667
+    },
+    "n_total": 64
+  },
+  "per_probe": {
+    "武松打虎": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 4.41796875,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.41796875,
+        4.1640625,
+        3.677734375,
+        3.63671875,
+        3.58984375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "黛玉葬花": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 3.388671875,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.388671875,
+        3.177734375,
+        2.82421875,
+        1.7421875,
+        1.6865234375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "桃园结义": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 4.9453125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.9453125,
+        4.5546875,
+        4.4921875,
+        4.16015625,
+        4.09765625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "火烧赤壁": {
+      "books": [
+        "西游记",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 2.248046875,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        2.248046875,
+        1.314453125,
+        1.3076171875,
+        1.1689453125,
+        1.1455078125
+      ],
+      "book@1": false,
+      "book@k": true,
+      "kw@k": true
+    },
+    "倒拔垂杨柳": {
+      "books": [
+        "水浒传",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 3.375,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        3.375,
+        2.71875,
+        1.77734375,
+        1.33203125,
+        0.79736328125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "大闹天宫": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 3.724609375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.724609375,
+        3.09375,
+        2.921875,
+        2.78515625,
+        2.330078125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "刘姥姥进大观园": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 5.4140625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.4140625,
+        3.408203125,
+        2.697265625,
+        2.646484375,
+        2.36328125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "空城计": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 0.27001953125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        0.27001953125,
+        0.2626953125,
+        0.06439208984375,
+        -0.229736328125,
+        -0.68896484375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "三打白骨精": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 0.355224609375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        0.355224609375,
+        -0.0018224716186523438,
+        -0.11383056640625,
+        -0.445068359375,
+        -0.56982421875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "鲁智深拳打镇关西": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 4.15234375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.15234375,
+        3.69140625,
+        2.966796875,
+        1.8095703125,
+        1.2041015625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "草船借箭": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "水浒传"
+      ],
+      "top1_score": 2.931640625,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        2.931640625,
+        1.4287109375,
+        0.5205078125,
+        0.2464599609375,
+        -1.029296875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "宝玉挨打": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 3.298828125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.298828125,
+        2.990234375,
+        2.822265625,
+        2.7421875,
+        2.568359375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "为什么宝玉不喜欢读书": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 4.8515625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.8515625,
+        3.56640625,
+        3.4765625,
+        3.26953125,
+        3.111328125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false
+    },
+    "林黛玉的性格有什么特点": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 4.140625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.140625,
+        4.02734375,
+        3.7578125,
+        3.19140625,
+        1.826171875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false
+    },
+    "贾府最终为什么会衰败": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 2.19140625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.19140625,
+        0.994140625,
+        0.81494140625,
+        0.150146484375,
+        -0.043701171875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false
+    },
+    "林冲为什么会被逼上梁山": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 4.0390625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.0390625,
+        3.78125,
+        3.466796875,
+        3.3203125,
+        2.875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false
+    },
+    "吴用是怎么智取生辰纲的": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 5.66796875,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.66796875,
+        4.9609375,
+        4.03515625,
+        3.0625,
+        2.6640625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "鲁智深为什么大闹五台山": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 4.78515625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.78515625,
+        4.63671875,
+        4.26171875,
+        3.509765625,
+        3.412109375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "诸葛亮为什么要七擒孟获": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 3.724609375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.724609375,
+        3.677734375,
+        3.5234375,
+        3.412109375,
+        3.220703125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "刘备为什么要三顾茅庐请诸葛亮": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 2.443359375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.443359375,
+        2.3046875,
+        1.52734375,
+        0.99609375,
+        0.55712890625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "曹操为什么要杀杨修": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 5.0234375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.0234375,
+        4.42578125,
+        3.46484375,
+        1.3681640625,
+        0.63916015625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "关羽为什么在华容道放走曹操": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 5.87890625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.87890625,
+        4.01953125,
+        3.83984375,
+        3.681640625,
+        1.6484375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "孙悟空为什么被压在五行山下": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 7.03125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        7.03125,
+        5.10546875,
+        4.64453125,
+        3.548828125,
+        3.3046875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    },
+    "紧箍咒是谁教给唐僧的": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 5.3515625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.3515625,
+        4.8984375,
+        4.5,
+        3.873046875,
+        3.8203125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true
+    }
+  },
+  "per_probe_negative": {
+    "今天北京的天气怎么样": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "西游记",
+        "西游记",
+        "红楼梦"
+      ],
+      "top1_score": 0.7109375,
+      "n_results": 5,
+      "n_books": 3,
+      "score_profile": [
+        0.7109375,
+        0.2073974609375,
+        -0.630859375,
+        -0.88037109375,
+        -1.20703125
+      ],
+      "refuse": true,
+      "rel_gap": 0.6979537932790224,
+      "head": 0.7109375,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": true,
+      "engine_reason": "命中跨 3 本书且整体相关度偏低（平均分 -0.36 < 0.5）——问题可能不属于任何单一作品",
+      "engine_mean": -0.3599853515625,
+      "engine_n_books": 3
+    },
+    "怎么做红烧肉": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "水浒传",
+        "西游记",
+        "红楼梦"
+      ],
+      "top1_score": -0.184326171875,
+      "n_results": 5,
+      "n_books": 3,
+      "score_profile": [
+        -0.184326171875,
+        -0.8427734375,
+        -1.2412109375,
+        -1.3544921875,
+        -1.8994140625
+      ],
+      "refuse": true,
+      "rel_gap": 0.6706049822064057,
+      "head": -0.184326171875,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": true,
+      "engine_reason": "命中跨 3 本书且整体相关度偏低（平均分 -1.10 < 0.5）——问题可能不属于任何单一作品",
+      "engine_mean": -1.104443359375,
+      "engine_n_books": 3
+    },
+    "帮我写一段Python排序代码": {
+      "books": [
+        "三国演义",
+        "红楼梦",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": -2.583984375,
+      "n_results": 5,
+      "n_books": 3,
+      "score_profile": [
+        -2.583984375,
+        -2.890625,
+        -4.0078125,
+        -4.02734375,
+        -4.9140625
+      ],
+      "refuse": true,
+      "rel_gap": 0.5905280804694049,
+      "head": -2.583984375,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": true,
+      "engine_reason": "整体相关度过低（平均分 -3.68 < -1.5）",
+      "engine_mean": -3.684765625,
+      "engine_n_books": 3
+    },
+    "最近流感疫苗在哪里可以打": {
+      "books": [
+        "西游记",
+        "红楼梦",
+        "水浒传",
+        "红楼梦",
+        "三国演义"
+      ],
+      "top1_score": -1.916015625,
+      "n_results": 5,
+      "n_books": 4,
+      "score_profile": [
+        -1.916015625,
+        -3.1796875,
+        -4.6328125,
+        -6.10546875,
+        -6.63671875
+      ],
+      "refuse": true,
+      "rel_gap": 0.6826644600744725,
+      "head": -1.916015625,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": true,
+      "engine_reason": "整体相关度过低（平均分 -4.49 < -1.5）",
+      "engine_mean": -4.494140625,
+      "engine_n_books": 4
+    },
+    "宋江最后接受招安了吗": {
+      "books": [
+        "水浒传",
+        "西游记",
+        "水浒传",
+        "西游记",
+        "三国演义"
+      ],
+      "top1_score": 2.28515625,
+      "n_results": 5,
+      "n_books": 3,
+      "score_profile": [
+        2.28515625,
+        1.8017578125,
+        1.6748046875,
+        0.8173828125,
+        0.134765625
+      ],
+      "refuse": false,
+      "rel_gap": 0.5477974568574023,
+      "head": 2.28515625,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": false,
+      "engine_reason": "",
+      "engine_mean": 1.3427734375,
+      "engine_n_books": 3
+    },
+    "潘金莲最后是什么结局": {
+      "books": [
+        "水浒传",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 2.376953125,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        2.376953125,
+        0.71875,
+        -0.07183837890625,
+        -0.1839599609375,
+        -0.525390625
+      ],
+      "refuse": true,
+      "rel_gap": 0.8243554424629879,
+      "head": 2.376953125,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": true,
+      "engine_reason": "命中跨 2 本书且整体相关度偏低（平均分 0.46 < 0.5）——问题可能不属于任何单一作品",
+      "engine_mean": 0.46290283203125,
+      "engine_n_books": 2
+    },
+    "贾府最后被抄家了吗": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 1.4287109375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        1.4287109375,
+        0.9736328125,
+        -0.197509765625,
+        -0.20556640625,
+        -0.591796875
+      ],
+      "refuse": false,
+      "rel_gap": 0.7097329627839536,
+      "head": 1.4287109375,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": false,
+      "engine_reason": "",
+      "engine_mean": 0.281494140625,
+      "engine_n_books": 1
+    },
+    "武松和林黛玉是什么关系": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "水浒传",
+        "红楼梦",
+        "水浒传"
+      ],
+      "top1_score": 2.91015625,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        2.91015625,
+        1.0986328125,
+        0.68310546875,
+        -0.12445068359375,
+        -0.5419921875
+      ],
+      "refuse": false,
+      "rel_gap": 0.7622303748231966,
+      "head": 2.91015625,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": false,
+      "engine_reason": "",
+      "engine_mean": 0.80509033203125,
+      "engine_n_books": 2
+    },
+    "孙悟空和关羽谁更厉害": {
+      "books": [
+        "西游记",
+        "三国演义",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 0.9443359375,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        0.9443359375,
+        -0.63134765625,
+        -0.79638671875,
+        -1.1923828125,
+        -1.4501953125
+      ],
+      "refuse": true,
+      "rel_gap": 0.8193311582381729,
+      "head": 0.9443359375,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": true,
+      "engine_reason": "命中跨 2 本书且整体相关度偏低（平均分 -0.63 < 0.5）——问题可能不属于任何单一作品",
+      "engine_mean": -0.6251953125,
+      "engine_n_books": 2
+    },
+    "诸葛亮和孙悟空谁的法术更高强": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "三国演义",
+        "西游记"
+      ],
+      "top1_score": 1.54296875,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        1.54296875,
+        1.427734375,
+        1.0126953125,
+        -0.150634765625,
+        -0.50634765625
+      ],
+      "refuse": false,
+      "rel_gap": 0.535352632832976,
+      "head": 1.54296875,
+      "n": 5,
+      "empty": false,
+      "rel_gap_refuse": false,
+      "engine_refuse": false,
+      "engine_reason": "",
+      "engine_mean": 0.665283203125,
+      "engine_n_books": 2
+    }
+  },
+  "per_probe_multiturn": {
+    "他最后结局如何": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 2.330078125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.330078125,
+        2.03515625,
+        2.009765625,
+        1.68359375,
+        1.6630859375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "pronoun"
+    },
+    "她为什么总是爱哭": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 5.17578125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.17578125,
+        3.982421875,
+        3.744140625,
+        2.796875,
+        2.794921875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "pronoun"
+    },
+    "他最后死在哪里": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 2.220703125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.220703125,
+        0.91015625,
+        -0.375732421875,
+        -0.52099609375,
+        -0.5986328125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "assistant_only"
+    },
+    "他后来为什么被发配到沧州": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 6.57421875,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        6.57421875,
+        5.85546875,
+        5.41796875,
+        5.08203125,
+        4.296875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "pronoun"
+    },
+    "他因此做了什么官": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 3.173828125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.173828125,
+        2.7421875,
+        1.6484375,
+        1.517578125,
+        1.435546875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "pronoun"
+    },
+    "他头上的箍儿是谁给他戴上的": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 5.00390625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.00390625,
+        4.16796875,
+        4.11328125,
+        4.0546875,
+        3.5
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "assistant_only"
+    },
+    "她是在谁家长大的": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 0.322998046875,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        0.322998046875,
+        -0.7041015625,
+        -1.8486328125,
+        -2.34765625,
+        -2.380859375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "assistant_only"
+    },
+    "他给后主写的那篇表叫什么": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 2.759765625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.759765625,
+        1.7666015625,
+        1.2646484375,
+        1.041015625,
+        0.84716796875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "assistant_only"
+    },
+    "他哥哥的绰号是什么": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 2.884765625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.884765625,
+        2.84765625,
+        2.68359375,
+        1.697265625,
+        1.537109375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "assistant_only"
+    },
+    "他的父母是谁": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 5.05078125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        5.05078125,
+        4.28125,
+        4.19140625,
+        1.8349609375,
+        1.734375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 4,
+      "kind": "entity_switch"
+    },
+    "她哥哥叫什么名字": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 1.82421875,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        1.82421875,
+        1.6474609375,
+        0.93798828125,
+        0.8076171875,
+        0.79345703125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false,
+      "topic@k": true,
+      "history_turns": 4,
+      "kind": "entity_switch"
+    },
+    "他最后是被谁杀的": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 2.166015625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.166015625,
+        2.025390625,
+        1.7578125,
+        0.82373046875,
+        0.53125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false,
+      "topic@k": false,
+      "history_turns": 4,
+      "kind": "entity_switch"
+    },
+    "他打死的那个卖肉的叫什么": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 3.06640625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.06640625,
+        2.771484375,
+        2.392578125,
+        1.171875,
+        0.74365234375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 4,
+      "kind": "entity_switch"
+    },
+    "后来是怎么把树救活的": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 3.083984375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.083984375,
+        2.27734375,
+        2.107421875,
+        2.056640625,
+        1.986328125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "ellipsis"
+    },
+    "为什么后来给她那么多银子": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 3.44140625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.44140625,
+        2.888671875,
+        2.7734375,
+        2.6328125,
+        2.6328125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "ellipsis"
+    },
+    "后来是怎么处置的": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 1.9384765625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        1.9384765625,
+        1.578125,
+        1.4736328125,
+        1.28515625,
+        1.0400390625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "ellipsis"
+    },
+    "后来那把扇子还回去了吗": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 4.0234375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.0234375,
+        2.6328125,
+        2.50390625,
+        2.41015625,
+        2.408203125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "temporal"
+    },
+    "后来他是从哪里逃走的": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 3.787109375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.787109375,
+        2.435546875,
+        2.373046875,
+        2.005859375,
+        1.931640625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "temporal"
+    },
+    "后来那园子给谁住了": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 4.484375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.484375,
+        3.544921875,
+        3.16796875,
+        3.099609375,
+        2.875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "temporal"
+    },
+    "你刚说的那个官名，是管什么的": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "西游记",
+        "水浒传"
+      ],
+      "top1_score": 2.361328125,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        2.361328125,
+        1.986328125,
+        1.71484375,
+        1.556640625,
+        0.6455078125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "recall_detail"
+    },
+    "你刚说的那根棒子上刻着什么字": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 3.30859375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.30859375,
+        2.5234375,
+        2.236328125,
+        1.5634765625,
+        1.37890625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "recall_detail"
+    },
+    "他取经之后被封为什么": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 1.447265625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        1.447265625,
+        1.2939453125,
+        0.92041015625,
+        0.72021484375,
+        0.6376953125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "pronoun"
+    },
+    "她哥哥是个什么样的人": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "水浒传"
+      ],
+      "top1_score": 3.58984375,
+      "n_results": 5,
+      "n_books": 2,
+      "score_profile": [
+        3.58984375,
+        2.568359375,
+        2.44140625,
+        2.296875,
+        1.0908203125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 4,
+      "kind": "entity_switch"
+    },
+    "后来这件事是怎么了结的": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 3.791015625,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.791015625,
+        2.783203125,
+        2.376953125,
+        2.099609375,
+        1.2490234375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "ellipsis"
+    },
+    "后来是怎么过去的": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 3.361328125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.361328125,
+        3.24609375,
+        2.748046875,
+        2.4609375,
+        2.15234375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "ellipsis"
+    },
+    "后来他去哪里落草了": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 2.251953125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        2.251953125,
+        1.53125,
+        1.5146484375,
+        1.384765625,
+        1.1259765625
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "temporal"
+    },
+    "后来她还做过哪些贪财的事": {
+      "books": [
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦",
+        "红楼梦"
+      ],
+      "top1_score": 1.5537109375,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        1.5537109375,
+        -0.447998046875,
+        -1.3740234375,
+        -2.07421875,
+        -2.26171875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "temporal"
+    },
+    "你刚说的那种吃食是怎么做的": {
+      "books": [
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传",
+        "水浒传"
+      ],
+      "top1_score": 3.736328125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.736328125,
+        3.349609375,
+        3.212890625,
+        2.94140625,
+        2.296875
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "recall_detail"
+    },
+    "你刚说的那个地方还住了谁": {
+      "books": [
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记",
+        "西游记"
+      ],
+      "top1_score": 3.470703125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        3.470703125,
+        1.9619140625,
+        1.30078125,
+        1.123046875,
+        0.9130859375
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": false,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "recall_detail"
+    },
+    "你刚说的那种计策是谁想出来的": {
+      "books": [
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义",
+        "三国演义"
+      ],
+      "top1_score": 4.1953125,
+      "n_results": 5,
+      "n_books": 1,
+      "score_profile": [
+        4.1953125,
+        3.68359375,
+        3.28125,
+        3.064453125,
+        3.048828125
+      ],
+      "book@1": true,
+      "book@k": true,
+      "kw@k": true,
+      "topic@k": true,
+      "history_turns": 2,
+      "kind": "recall_detail"
+    }
+  },
+  "recorded_at": "2026-09-19 09:52:04"
+}
