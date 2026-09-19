@@ -11,9 +11,9 @@ import os
 
 import pytest
 
-import rag as QR
-import rag as BO
-import rag as RE
+import chatbot as QR
+import chatbot as BO
+import chatbot as RE
 
 pytestmark = pytest.mark.unit
 
@@ -409,7 +409,7 @@ class TestContextAssembly:
 # ============================================================================
 class TestQueryRewrite:
     #: 考"改写本身行为"的用例一律显式开开关。
-    #: 理由：rag 在 **import 时**就把 RAG_QUERY_REWRITE 读成模块常量，
+    #: 理由：chatbot 在 **import 时**就把 RAG_QUERY_REWRITE 读成模块常量，
     #: 而 .env 现在把它是 0（有意关闭，见 .env 注释）。不显式传参的话，这些用例
     #: 会静静地走"已关闭"分支全部通过 —— 考的东西一点没考到，而且同一个套件
     #: 在不同机器上结论不同。已有前车之鉴：test_successful_rewrite_is_used
@@ -1328,7 +1328,7 @@ class TestEmbedCache:
     def test_roundtrip(self, tmp_path):
         import numpy as np
 
-        import rag as RE
+        import chatbot as RE
 
         path = str(tmp_path / "cache.npz")
         keys = [RE._embed_cache_key(f"文本{i}") for i in range(4)]
@@ -1343,7 +1343,7 @@ class TestEmbedCache:
         assert next(iter(cache.values())).shape == (768,)
 
     def test_missing_file_is_empty_cache(self, tmp_path):
-        import rag as RE
+        import chatbot as RE
 
         assert RE._load_embed_cache(str(tmp_path / "nonexistent.npz")) == {}
 
@@ -1351,7 +1351,7 @@ class TestEmbedCache:
         """维度不符的缓存必须被丢弃，而不是留到 vstack 才炸（那时已算了几十分钟）。"""
         import numpy as np
 
-        import rag as RE
+        import chatbot as RE
 
         path = str(tmp_path / "bad.npz")
         np.savez(path, keys=np.array(["a", "b"], dtype="U64"),
@@ -1365,7 +1365,7 @@ class TestEmbedCache:
     def test_row_count_mismatch_is_rejected(self, tmp_path):
         import numpy as np
 
-        import rag as RE
+        import chatbot as RE
 
         path = str(tmp_path / "bad2.npz")
         np.savez(path, keys=np.array(["a"], dtype="U64"),
@@ -1373,7 +1373,7 @@ class TestEmbedCache:
         assert RE._load_embed_cache(path) == {}
 
     def test_corrupt_file_is_rejected(self, tmp_path):
-        import rag as RE
+        import chatbot as RE
 
         path = str(tmp_path / "corrupt.npz")
         with open(path, "wb") as f:
@@ -1381,7 +1381,7 @@ class TestEmbedCache:
         assert RE._load_embed_cache(path) == {}
 
     def test_key_is_content_hash(self):
-        import rag as RE
+        import chatbot as RE
 
         assert RE._embed_cache_key("同一段文本") == RE._embed_cache_key("同一段文本")
         assert RE._embed_cache_key("A") != RE._embed_cache_key("B")

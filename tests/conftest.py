@@ -5,7 +5,7 @@
   - L1/L2/L3 各自声明所需资源，缺失时 skip 而不是 fail，
     这样"本机没起 Docker"不会被误读成"代码坏了"。
 
-为什么 L0 能成立：rag 把 torch / transformers / jieba 全部放在函数内部
+为什么 L0 能成立：chatbot 把 torch / transformers / jieba 全部放在函数内部
 惰性导入，模块顶层只依赖 sentencex。因此纯函数测试无需加载任何模型。
 本文件里的 FakeTokenizer 就是利用这一点，用字符数顶替真实 tokenizer。
 """
@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-import rag as RE
+import chatbot as RE
 
 
 # ============================================================================
@@ -23,7 +23,7 @@ import rag as RE
 class FakeTokenizer:
     """字符级 tokenizer 替身：id 即字符码点，故 encode/decode 可逆。
 
-    rag 的分块路径只以两种方式接触 tokenizer：
+    chatbot 的分块路径只以两种方式接触 tokenizer：
         len(tokenizer.encode(text, add_special_tokens=False))   # 计数
         tokenizer.decode(ids, skip_special_tokens=True)         # 硬切后还原
     故这里只需实现这两个方法。
@@ -79,9 +79,9 @@ def fake_tok():
 # ============================================================================
 @pytest.fixture(scope="session")
 def chunks():
-    """加载 cache_v2/chunks.json；缺失则跳过（提示先跑 python rag.py process）。"""
+    """加载 cache_v2/chunks.json；缺失则跳过（提示先跑 python chatbot.py process）。"""
     if not os.path.exists(RE.CHUNKS_JSON):
-        pytest.skip(f"缺少 {RE.CHUNKS_JSON}，请先运行: python rag.py process")
+        pytest.skip(f"缺少 {RE.CHUNKS_JSON}，请先运行: python chatbot.py process")
     import json
 
     with open(RE.CHUNKS_JSON, encoding="utf-8") as f:
@@ -137,7 +137,7 @@ def collection_name(qdrant_client):
     """
     name = RE.default_collection_name(qdrant_client)
     if not qdrant_client.collection_exists(name):
-        pytest.skip(f"集合 {name} 不存在，请先运行: python rag.py index")
+        pytest.skip(f"集合 {name} 不存在，请先运行: python chatbot.py index")
     return name
 
 
@@ -157,5 +157,5 @@ def engine(qdrant_client):
     if eng.count() == 0:
         # count() 内部已做了别名解析；这里回报它实际用的集合名，
         # 免得"集合 books_v3 为空"这种提示把你引向一个已经不存在的名字
-        pytest.skip(f"集合 {eng.collection_name} 为空，请先运行: python rag.py index")
+        pytest.skip(f"集合 {eng.collection_name} 为空，请先运行: python chatbot.py index")
     return eng

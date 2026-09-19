@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """四大名著 RAG 知识库 —— 单文件实现。
 
-    python rag.py process          # 分块（读 books/ → cache_v2/chunks.json）
-    python rag.py index            # 向量化入库（写新集合 + 原子切别名）
-    python rag.py serve            # Streamlit UI（:8501）
-    python rag.py api              # HTTP API（:8000，NDJSON 流）
-    python rag.py health           # 系统健康检查
-    python rag.py verify-qdrant    # 稠密/稀疏通道校验
-    python rag.py reindex-sparse   # 只重建稀疏向量（换词表时用）
-    python rag.py compare-chunks A B
-    python rag.py compare-ab A B
-    python rag.py lexicon          # 别名表 / 停用词表校验
-    python rag.py ab-retrieval --label x
-    python rag.py ab-multiturn --label x
-    python rag.py after-rebuild
+    python chatbot.py process          # 分块（读 books/ → cache_v2/chunks.json）
+    python chatbot.py index            # 向量化入库（写新集合 + 原子切别名）
+    python chatbot.py serve            # Streamlit UI（:8501）
+    python chatbot.py api              # HTTP API（:8000，NDJSON 流）
+    python chatbot.py health           # 系统健康检查
+    python chatbot.py verify-qdrant    # 稠密/稀疏通道校验
+    python chatbot.py reindex-sparse   # 只重建稀疏向量（换词表时用）
+    python chatbot.py compare-chunks A B
+    python chatbot.py compare-ab A B
+    python chatbot.py lexicon          # 别名表 / 停用词表校验
+    python chatbot.py ab-retrieval --label x
+    python chatbot.py ab-multiturn --label x
+    python chatbot.py after-rebuild
 
-    streamlit run rag.py           # UI；RAG_UI=chat 或 RAG_UI=bot 切到另两个界面
+    streamlit run chatbot.py           # UI；RAG_UI=chat 或 RAG_UI=bot 切到另两个界面
 
 ## 文件结构（按依赖顺序，从上到下）
 
@@ -66,7 +66,7 @@ import requests
 #: 仓库根目录（各工具脚本原来各自按 __file__ 算一遍，合并后只算一次）
 ROOT = os.path.dirname(os.path.abspath(__file__))
 #: 探针集与评测执行器来自 tests/ —— 它们只被工具子命令用到，故在函数内 import，
-#: 这样 `python rag.py process` 不依赖 tests/ 目录。
+#: 这样 `python chatbot.py process` 不依赖 tests/ 目录。
 
 
 # ============================================================================
@@ -720,7 +720,7 @@ REWRITE_NUM_CTX = int(os.getenv("RAG_QUERY_REWRITE_NUM_CTX")
 #:   "他最后是被谁杀的"           → "请问这两位英雄分别是死于谁的刀下？"（把两个实体合并）
 #:   "她哥哥叫什么名字"           → "她的哥哥叫什么名字？"（原句照抄，未消解）
 #:
-#: 复现脚本与完整四态表见 MULTITURN_PLAN.md §0.1。
+#: 复现脚本与完整四态表见 AGENTS.md「设计存档 B」。
 #: 想再做"置空 vs 恢复"的 A/B：赋空串即可，但**置空与 RAG_QUERY_REWRITE=1
 #: 不可同时成立** —— 那是四态里最差的一档（topic@k 66.7%）。
 _SYSTEM_PROMPT = (
@@ -1190,10 +1190,9 @@ def rewrite_query(query, history, call=None, enabled=None):
 # `.env` 必须在**本模块任何常量求值之前**加载（见 bootstrap 的说明）。
 #
 # 检索侧配置（TOP_K / RRF_K / ABSTAIN_* / 分块参数…）全部在 import 时求值成模块
-# 常量，而 check_health.py、compare_ab.py、verify_qdrant.py、reindex_sparse.py、
-# tools/*.py、tests/conftest.py 都是**先 import rag_engine**。靠调用方先
-# load_dotenv 是一条隐式契约：断了不会报错，只会让 .env 里的 RAG_* 静默失效
-# （D9/D12 的成因）。故本模块自己加载，不依赖任何人的顺序。
+# 常量，而 tools/tests 的入口都是**先 import 本模块**。靠调用方先 load_dotenv 是
+# 一条隐式契约：断了不会报错，只会让 .env 里的 RAG_* 静默失效（D9/D12 的成因）。
+# 故本模块自己加载，不依赖任何人的顺序 —— 合并成单文件后这条仍然成立。
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -1232,7 +1231,7 @@ def log(message):
     """模块内统一的输出入口（等价于 logger.info）。
 
     保留"信息打到 stdout"这一既有观感：进度、统计、警告都是给人看的，
-    换成 stderr 会让 `python rag.py index` 的输出顺序在管道里乱掉。
+    换成 stderr 会让 `python chatbot.py index` 的输出顺序在管道里乱掉。
     """
     logger.info(message)
 
@@ -1351,7 +1350,7 @@ RERANK_MODEL_PATH = os.getenv("RAG_RERANK_MODEL_PATH", "./models/bge-reranker-ba
 # 目录"的调用方（测试、A/B 脚本）把向量缓存与元信息写回真实 cache_v2/ ——
 # 实测发生过（见 _chunks_meta_path 的说明）。派生之后不存在"只重定向了一半"。
 #
-# 这也是 ARCHITECTURE.md §4.1 列的头号前置改造（多数据集配置化），且是**纯搬家**：
+# 这也是 AGENTS.md「设计存档 A」列的头号前置改造（多数据集配置化），且是**纯搬家**：
 # 不设 RAG_ARTIFACTS_DIR 时三个路径与从前逐字节相同。
 _ARTIFACTS_DIR = os.getenv("RAG_ARTIFACTS_DIR", "./cache_v2")
 
@@ -1493,7 +1492,7 @@ DEDUP_BY_PARENT = env_bool("RAG_DEDUP_BY_PARENT", True)
 #
 # 只在 LLM 档真的改写成功时才多出第二路；LLM 超时/失败时退化为 concat 单路，
 # 即"没有这个开关"的行为 —— 因此开启它**不新增失败面**。
-# 见 MULTITURN_PLAN.md §1。
+# 见 AGENTS.md「设计存档 B → 方案主轴」。
 QUERY_FUSION = env_bool("RAG_QUERY_FUSION", False)
 
 # 多路召回时 reranker 拿哪一句打分（只在真有多路时有意义；单路三种取值等价）。
@@ -1529,7 +1528,7 @@ RERANK_QUERY_MODE = env_choice("RAG_RERANK_QUERY", "primary",
 # 已知失效模式（必须交代）：判据 B 把"跨越两本书"当可疑信号，因此
 # **合法的跨书对比问题**（如"比较林冲与武松"）会被误判。这就是它被定为
 # "宁可漏拒"的原因，也是 RAG_ABSTAIN 可以直接关掉的原因。
-# 换索引/换模型/换分块后这些阈值必须重新校准，PROJECT_DOC.md 记了复现方法。
+# 换索引/换模型/换分块后这些阈值必须重新校准，AGENTS.md §4.6 记了复现方法。
 # ---------------------------------------------------------------------------
 ABSTAIN_ENABLED = env_bool("RAG_ABSTAIN", True)
 ABSTAIN_MEAN_LOW = env_float("RAG_ABSTAIN_MEAN_LOW", 0.5)
@@ -1757,7 +1756,7 @@ def _split_sentences(s, tokenizer=None, max_tokens=None):
     # 判据必须是**空行**（\\n\\n），不能是"含任意 \\n"。旧写法后者恒真于一类
     # 完全合法的输入：按 40/76 列硬折行的 txt（网上 txt 最常见的排版）里，
     # 句内保留单个 \\n 是正常现象，而旧断言会把它判成"分句器跨段"并直接抛
-    # ValueError，于是新增这类书会让 `python rag.py process` 整个崩掉，
+    # ValueError，于是新增这类书会让 `python chatbot.py process` 整个崩掉，
     # 报错还把原因误指成"sentencex 行为可能已变"。现有四本书恰好没有句内换行
     # （实测句内残留换行 = 0），所以这个缺陷一直被掩盖着。
     # 注意只在 token 兜底之前断言：兜底会按 "\n" 等终止符切开长句，可能产生带换行的碎片。
@@ -2481,11 +2480,11 @@ def verify_chunks_freshness():
     宁可开工前花 1 秒失败，也不要在 70 分钟后拿到一份不可信的索引。
     """
     if not os.path.exists(CHUNKS_JSON):
-        raise FileNotFoundError(f"找不到 {CHUNKS_JSON}，请先运行: python rag.py process")
+        raise FileNotFoundError(f"找不到 {CHUNKS_JSON}，请先运行: python chatbot.py process")
     if not os.path.exists(_chunks_meta_path()):
         raise FileNotFoundError(
             f"找不到 {_chunks_meta_path()} —— 分块产物是加元信息之前的版本，"
-            f"无法确认它与当前配置一致，请重跑: python rag.py process"
+            f"无法确认它与当前配置一致，请重跑: python chatbot.py process"
         )
 
     with open(_chunks_meta_path(), encoding="utf-8") as f:
@@ -2506,7 +2505,7 @@ def verify_chunks_freshness():
         }
         raise RuntimeError(
             f"分块产物的配置指纹 {meta.get('fingerprint')} 与当前配置 {fingerprint} 不一致，"
-            f"差异（旧→新）: {diff}。请重跑: python rag.py process\n"
+            f"差异（旧→新）: {diff}。请重跑: python chatbot.py process\n"
             f"（这是刻意的硬失败：用旧分块建索引不会报错，只会让检索悄悄变差）"
         )
 
@@ -2517,7 +2516,7 @@ def verify_chunks_freshness():
             set(meta.get("books", {})) ^ set(books_now)
         ) or [k for k in books_now if meta.get("books", {}).get(k) != books_now[k]]
         raise RuntimeError(
-            f"books/ 的内容在分块之后发生了变化: {changed}。请重跑: python rag.py process"
+            f"books/ 的内容在分块之后发生了变化: {changed}。请重跑: python chatbot.py process"
         )
     return meta
 
@@ -3904,12 +3903,12 @@ def _cut_to_tokens(text, max_tokens, count_tokens=None, mark=_TRUNCATION_MARK):
 def plan_generation(results, history, query, num_ctx, num_predict,
                     use_context=True, low_evidence=False, count_tokens=None,
                     context_role=None):
-    """三个入口（app.py / api.py / chat.py）共用的生成侧装配（纯函数）。
+    """四个入口共用的生成侧装配（纯函数）。
 
     存在的理由只有一条：**"共用纯函数"挡不住"调用方式各写一遍"**。
     `build_system_prompt` / `build_context_message` / `build_generation_messages`
     三个纯函数早就是共用的，但"要不要传 use_context""判不判硬拒答""low_evidence
-    从哪来"仍然靠每个入口自己记得 —— 而 chat.py 就漏了 use_context，导致
+    从哪来"仍然靠每个入口自己记得 —— 而极简 UI 那一份就漏了 use_context，导致
     `RAG_USE_CONTEXT=0` 在它那里静默失效（第 N 次同类漂移）。把装配本身收进
     一个函数之后，入口只剩"取结果 + 渲染"。
 
@@ -4154,7 +4153,7 @@ class RAGEngine:
         logger.error(
             "词表与索引不一致：索引是 %s，当前词表是 %s。稀疏通道的词空间已错配，"
             "别名归一后的查询将匹配不到按旧词表建的稀疏向量（召回会下降且无异常）。"
-            "请运行 `python rag.py reindex-sparse` 重建稀疏向量（几秒到几分钟，"
+            "请运行 `python chatbot.py reindex-sparse` 重建稀疏向量（几秒到几分钟，"
             "不需要重新算 embedding）。",
             index_lexicon_id, current,
         )
@@ -4205,13 +4204,13 @@ class RAGEngine:
             raise RuntimeError(
                 f"分块表加载不完整: 拉回 {len(chunks)} 条，集合 {self._collection_name} "
                 f"实际 {expected} 条。检索会静默漏召回，故直接失败。"
-                f"请确认索引是否正在重建（可重跑: python rag.py index）。"
+                f"请确认索引是否正在重建（可重跑: python chatbot.py index）。"
             )
 
         self._chunks = chunks
         self._chunks_build_id = current_id
         if not chunks:
-            log(f"警告: 集合 {self._collection_name} 为空，请先运行: python rag.py index")
+            log(f"警告: 集合 {self._collection_name} 为空，请先运行: python chatbot.py index")
         return self._chunks
 
     # ---- 检索主链路 ----
@@ -4712,9 +4711,9 @@ def run_turn(engine, query, history, *, top_k=None, book=None,
 # 四大名著知识库 - 统一入口（处理 / 索引 / 服务）
 #
 # 用法:
-#   python rag.py process   处理数据(读取+分块)
-#   python rag.py index     向量化入库
-#   python rag.py serve           启动查询服务
+#   python chatbot.py process   处理数据(读取+分块)
+#   python chatbot.py index     向量化入库
+#   python chatbot.py serve           启动查询服务
 #
 # 检索引擎实现在 rag_engine.py，本文件只负责 CLI 编排与 Streamlit 展示。
 
@@ -4778,7 +4777,7 @@ def _streamlit_pids():
     import subprocess
 
     try:
-        out = subprocess.run(["pgrep", "-f", r"streamlit run .*rag\.py"],
+        out = subprocess.run(["pgrep", "-f", r"streamlit run .*chatbot\.py"],
                              capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return []
@@ -4812,8 +4811,8 @@ def cmd_serve():
     if count == 0:
         print("错误: 向量数据库为空")
         print("请先运行:")
-        print("  python rag.py process")
-        print("  python rag.py index")
+        print("  python chatbot.py process")
+        print("  python chatbot.py index")
         sys.exit(1)
 
     print(f"向量数据库: {coll} {count} 条记录")
@@ -4829,13 +4828,13 @@ def cmd_serve():
             sys.exit(1)
         print("Streamlit 服务已在运行: http://localhost:8501")
         # 旧提示写的是 pkill -f 'streamlit run app.py'，**匹配不到任何进程**：
-        # 真实命令行里 app.py 是绝对路径（-m streamlit run /Users/…/app.py）。
+        # 真实命令行里脚本是绝对路径（-m streamlit run /Users/…/chatbot.py）。
         # 照做的人会以为已经重启，实际旧进程还活着、继续跑启动时导入的旧模块 ——
         # 表现为改完代码后报 "unexpected keyword argument" 这类错：界面（主脚本，
         # 会被文件监听重跑）已经是新的，rag_engine 还是进程启动那天的那份。
         # 所以这里给的是真能匹配的模式，并把 PID 一并报出来。
         print("改过代码务必重启：进程里跑的是启动时导入的旧模块。")
-        print(r"  重启: pkill -f 'streamlit run .*rag\.py' && python rag.py serve")
+        print(r"  重启: pkill -f 'streamlit run .*chatbot\.py' && python chatbot.py serve")
         print(f"  当前 PID: {', '.join(map(str, pids))}")
         sys.exit(0)
 
@@ -5002,7 +5001,7 @@ def run_streamlit():
 
     # ---- 索引检查 ----
     if engine.count() == 0:
-        st.error("向量库为空，先跑：python rag.py process && python rag.py index")
+        st.error("向量库为空，先跑：python chatbot.py process && python chatbot.py index")
         st.stop()
 
     # ---- 会话历史 ----
@@ -5614,7 +5613,7 @@ def cmd_api():
         print("  请先确认服务已启动: docker compose up -d")
         sys.exit(1)
     if count == 0:
-        print("错误: 向量数据库为空，请先运行: python rag.py process && python rag.py index")
+        print("错误: 向量数据库为空，请先运行: python chatbot.py process && python chatbot.py index")
         sys.exit(1)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
@@ -5635,14 +5634,14 @@ def cmd_api():
 # ============================================================================
 # 最简对话机器人：只有一问一答，没有任何诊断界面。
 #
-#     RAG_UI=chat streamlit run rag.py
+#     RAG_UI=chat streamlit run chatbot.py
 #
 # 一轮 RAG 的序列（检索 → 装配 → 拒答 → 流式生成）由 rag_turn.run_turn 定义，
 # 与 app.py / api.py 是同一份；本页只把 delta 画出来，其余事件一概丢弃。
-# 要看推理链、思维链、token 统计，用 `python rag.py serve`。
+# 要看推理链、思维链、token 统计，用 `python chatbot.py serve`。
 
 def run_chat_ui():
-    """chat.py 的界面（Streamlit 脚本体）。"""
+    """极简 UI（合并前是独立文件 chat.py）。"""
     import streamlit as st
 
 
@@ -5661,7 +5660,7 @@ def run_chat_ui():
     engine = get_ui_engine()
 
     if engine.count() == 0:
-        st.error("向量库为空，先跑：python rag.py process && python rag.py index")
+        st.error("向量库为空，先跑：python chatbot.py process && python chatbot.py index")
         st.stop()
 
     if "messages" not in st.session_state:
@@ -5718,13 +5717,13 @@ def run_chat_ui():
 # ============================================================================
 # 通用聊天机器人 —— 界面上只有三样东西：输入、输出、过程。
 #
-#     RAG_UI=bot streamlit run rag.py
+#     RAG_UI=bot streamlit run chatbot.py
 #
 # 刻意不做的事：没有标题、没有设置面板、没有会话管理、没有引用出处、
 # 没有 token 统计、不挂任何知识库。想换模型/人设改 .env 即可。
 
 def run_bot_ui():
-    """bot.py 的界面（Streamlit 脚本体）。"""
+    """通用聊天机器人 UI（合并前是独立文件 bot.py）。"""
     import streamlit as st
 
 
@@ -5847,8 +5846,8 @@ def run_bot_ui():
 #   6. 生成模型可用（一次简短 think:false 问答）
 #
 # 用法:
-#   python rag.py health            # 全部检查
-#   python rag.py health --offline  # 跳过 Ollama/模型在线检查（快速）
+#   python chatbot.py health            # 全部检查
+#   python chatbot.py health --offline  # 跳过 Ollama/模型在线检查（快速）
 # 退出码: 0=全部通过 1=存在失败
 
 
@@ -5989,7 +5988,7 @@ def cmd_health():
         # "Docker 挂了"，排查方向完全错误。这里与 RAGEngine.count() 保持一致。
         if not client.collection_exists(coll):
             fail += bad(
-                f"集合 {coll} 不存在（索引未构建），请运行: python rag.py index"
+                f"集合 {coll} 不存在（索引未构建），请运行: python chatbot.py index"
             )
         else:
             qdrant_count = client.count(collection_name=coll, exact=True).count
@@ -6011,7 +6010,7 @@ def cmd_health():
                     except Exception as exc:
                         fail += bad(
                             f"分块产物 {CHUNKS_JSON} 读取失败（与 Qdrant 无关）: "
-                            f"{type(exc).__name__}: {exc} —— 请重跑: python rag.py process"
+                            f"{type(exc).__name__}: {exc} —— 请重跑: python chatbot.py process"
                         )
                     else:
                         if n_chunks == qdrant_count:
@@ -6019,7 +6018,7 @@ def cmd_health():
                         else:
                             fail += bad(
                                 f"数量不一致: chunks.json {n_chunks} 条 != 集合 {qdrant_count} 条"
-                                f"（索引与分块源脱节，请重跑: python rag.py index）"
+                                f"（索引与分块源脱节，请重跑: python chatbot.py index）"
                             )
                 else:
                     print(f"  ⏭  跳过数量一致性（找不到 {CHUNKS_JSON}）")
@@ -6057,12 +6056,12 @@ def cmd_health():
                         fail += bad(
                             f"词表与索引不一致（索引 {idx_lex} / 当前 {cur_lex}）——"
                             f"稀疏通道词空间已错配，召回会静默下降。"
-                            f"请运行: python rag.py reindex-sparse"
+                            f"请运行: python chatbot.py reindex-sparse"
                         )
                 except Exception as e:
                     fail += bad(f"词表一致性检查失败: {e}")
             else:
-                fail += bad(f"{coll} 为空，请运行: python rag.py index")
+                fail += bad(f"{coll} 为空，请运行: python chatbot.py index")
     except Exception as e:
         fail += bad(f"无法连接 Qdrant Docker服务 ({QDRANT_HOST}:{QDRANT_PORT}): {e}")
 
@@ -6155,7 +6154,7 @@ def cmd_health():
                 f"      curl -s {OLLAMA_BASE_URL}/api/chat -d "
                 f"'{{\"model\":\"{MODEL}\",\"messages\":[{{\"role\":\"user\","
                 f"\"content\":\"hi\"}}],\"stream\":false,\"think\":false}}' >/dev/null\n"
-                f"      python rag.py health --timeout 300"
+                f"      python chatbot.py health --timeout 300"
             )
         except Exception as e:
             fail += bad(f"模型应答失败({args.timeout}s): {type(e).__name__}: {e}")
@@ -6191,7 +6190,7 @@ def cmd_health():
 #     两者都看，因为书目命中高但关键词全错，说明只是书名那层在起作用。
 #
 # 用法:
-#   python rag.py compare-ab A B --top-k 5            # A、B 为两个 Qdrant 集合名
+#   python chatbot.py compare-ab A B --top-k 5            # A、B 为两个 Qdrant 集合名
 # 退出码: 0（本工具只报告，不做通过/失败判定）
 
 
@@ -6388,11 +6387,11 @@ def cmd_compare_ab():
 #   反而掩盖了真正的问题。按位置比对能直接暴露边界漂移。
 #
 # 用法:
-#   python rag.py compare-chunks A.json B.json          # 逐条比对两份分块产物
-#   python rag.py compare-chunks A.json B.json --allow contextual_text
+#   python chatbot.py compare-chunks A.json B.json          # 逐条比对两份分块产物
+#   python chatbot.py compare-chunks A.json B.json --allow contextual_text
 #       # --allow F: 只允许字段 F 不同（其余字段必须逐字节相同），适合"只改前缀"这类改动
 #
-#   A 通常是改动前用 `python rag.py process` 存档的副本，B 是改动后的
+#   A 通常是改动前用 `python chatbot.py process` 存档的副本，B 是改动后的
 #   cache_v2/chunks.json。本工具不生成基线：请自行在改动前复制存档。
 # 退出码: 0=通过（相同，或差异全部落在 --allow 字段内）  1=不通过
 
@@ -6566,7 +6565,7 @@ def cmd_compare_chunks():
 # 为什么不必重算稠密：稠密向量取自 child_text 原文，词表不参与，故完全没变。
 # 对比：全量 build_index 要重跑所有 embedding（本机 30~70 分钟）；本脚本十几秒。
 #
-# 用法: python rag.py reindex-sparse
+# 用法: python chatbot.py reindex-sparse
 
 
 
@@ -6588,7 +6587,7 @@ def cmd_reindex_sparse():
         # 都会 0==0 恒真，脚本最后打印"完成"并 return 0 —— 对"索引根本没建"
         # 这件事给出绿色结论。
         print(f"❌ 集合 {COLL} 为空（索引未构建或别名指向了空集合），无事可做")
-        print("   请先运行: python rag.py process && python rag.py index")
+        print("   请先运行: python chatbot.py process && python chatbot.py index")
         return 1
 
     t0 = time.time()
@@ -6649,7 +6648,7 @@ def cmd_reindex_sparse():
 # 注意：第 3 项的"关键词命中率"只是粗略代理指标（看 top-k 正文里有没有出现
 # 查询的显著词），不是标准 Recall 评测，仅用于判断混合通道有没有起作用。
 #
-# 用法: python rag.py verify-qdrant
+# 用法: python chatbot.py verify-qdrant
 
 
 
@@ -6671,7 +6670,7 @@ def cmd_verify_qdrant():
     # 集合不存在时直接 count()/get_collection() 会抛 404，报出来的却是
     # "连接失败"这类误导性信息。先判断存在性，与 RAGEngine.count() 一致。
     if not client.collection_exists(COLL):
-        print(f"  ❌ 集合 {COLL} 不存在，请先运行: python rag.py index")
+        print(f"  ❌ 集合 {COLL} 不存在，请先运行: python chatbot.py index")
         return 1
     info = client.get_collection(COLL)
     dense = list(info.config.params.vectors.keys())
@@ -6810,9 +6809,9 @@ def cmd_verify_qdrant():
 # 配置已经全部环境变量化（见 rag_engine 顶部的 _env_* 与 .env 里的清单），
 # 所以 A/B 不需要任何"两份检索逻辑"：
 #
-#     RAG_RERANK_ON=child  python rag.py ab-retrieval --label child  --json /tmp/a.json
-#     RAG_RERANK_ON=parent python rag.py ab-retrieval --label parent --json /tmp/b.json
-#     python rag.py ab-retrieval --compare /tmp/a.json /tmp/b.json
+#     RAG_RERANK_ON=child  python chatbot.py ab-retrieval --label child  --json /tmp/a.json
+#     RAG_RERANK_ON=parent python chatbot.py ab-retrieval --label parent --json /tmp/b.json
+#     python chatbot.py ab-retrieval --compare /tmp/a.json /tmp/b.json
 #
 # 三条命令共用同一个评测器，因此**不存在"两次评测测的不是一个检索器"**这种
 # 问题 —— 本项目已经吃过一次亏：探针曾在 compare_ab.py 与 verify_qdrant.py
@@ -6968,7 +6967,7 @@ def ab_retrieval_compare(path_a, path_b):
           f"改善 {win} / 退化 {loss} / 持平 {tie}   （n={n}）")
     if win + loss <= 2:
         print("  ⚠️  发生变化的探针不超过 2 条 —— 聚合指标的差异基本由个别探针驱动，")
-        print("     不足以据此改动默认配置。要下结论请先扩充探针集（见 PROJECT_DOC）。")
+        print("     不足以据此改动默认配置。要下结论请先扩充探针集（见 AGENTS.md §8）。")
     return 0
 
 
@@ -7024,9 +7023,9 @@ def cmd_ab_retrieval():
 #
 # 用法::
 #
-#     python rag.py ab-multiturn --label single                 # 现状
-#     RAG_QUERY_FUSION=1 python rag.py ab-multiturn --label fusion
-#     python rag.py ab-multiturn --compare single fusion        # 对拍两份 json
+#     python chatbot.py ab-multiturn --label single                 # 现状
+#     RAG_QUERY_FUSION=1 python chatbot.py ab-multiturn --label fusion
+#     python chatbot.py ab-multiturn --compare single fusion        # 对拍两份 json
 #
 #     # 输出默认写到 /tmp/ab_multiturn_<label>.json
 
@@ -7138,7 +7137,7 @@ def cmd_ab_multiturn():
     top_k = args.top_k or TOP_K
     engine = RAGEngine()
     if engine.count() == 0:
-        sys.exit("集合为空，请先 python rag.py index")
+        sys.exit("集合为空，请先 python chatbot.py index")
 
     t0 = time.time()
     per_probe = ab_multiturn_run(engine, top_k)
@@ -7187,8 +7186,8 @@ def cmd_ab_multiturn():
 #
 # ## 用法
 #
-#     python rag.py after-rebuild            # 全部检查（分钟级）
-#     python rag.py after-rebuild --skip-ab  # 跳过 A/B（省时间）
+#     python chatbot.py after-rebuild            # 全部检查（分钟级）
+#     python chatbot.py after-rebuild --skip-ab  # 跳过 A/B（省时间）
 
 
 
@@ -7201,7 +7200,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _DUMP = r"""
 import json, sys
 sys.path.insert(0, %(root)r)
-import rag_engine as RE
+import chatbot as RE
 from tests.eval_runner import run_probes, run_multiturn
 eng = RE.RAGEngine()
 out = {
@@ -7336,7 +7335,7 @@ def calibrate_abstention():
         if (best[0], best[1], best[2]) != (ABSTAIN_MEAN_HARD,
                                            ABSTAIN_MEAN_LOW, ABSTAIN_MIN_BOOKS):
             print("    ⚠️  与当前默认值不同 —— 请人工确认后再改，"
-                  "并把新阈值与本表一起写进 PROJECT_DOC")
+                  "并把新阈值与本表一起写进 AGENTS.md §4.6")
     return 0
 
 
@@ -7383,9 +7382,9 @@ def cmd_verify_after_rebuild():
     print("=" * 62)
     if not args.skip_ab:
         print("A/B 请另行执行：")
-        print("  RAG_RERANK_ON=child  python rag.py ab-retrieval --label child  --json /tmp/a.json")
-        print("  RAG_RERANK_ON=parent python rag.py ab-retrieval --label parent --json /tmp/b.json")
-        print("  python rag.py ab-retrieval --compare /tmp/a.json /tmp/b.json")
+        print("  RAG_RERANK_ON=child  python chatbot.py ab-retrieval --label child  --json /tmp/a.json")
+        print("  RAG_RERANK_ON=parent python chatbot.py ab-retrieval --label parent --json /tmp/b.json")
+        print("  python chatbot.py ab-retrieval --compare /tmp/a.json /tmp/b.json")
     return rc
 
 
@@ -7395,8 +7394,8 @@ def cmd_verify_after_rebuild():
 # 四大名著 RAG —— 别名词典 / 古白话停用词表 校验器。
 #
 # 用法：
-#     python rag.py lexicon          # 全部通过 -> 退出码 0；发现问题 -> 1
-#     python rag.py lexicon -q       # 只打印结论行（CI 用）
+#     python chatbot.py lexicon          # 全部通过 -> 退出码 0；发现问题 -> 1
+#     python chatbot.py lexicon -q       # 只打印结论行（CI 用）
 #
 # 它做四件事：
 #   1. 加载 data/aliases.txt 与 data/stopwords_classical.txt，校验格式合法性
@@ -7890,31 +7889,27 @@ def cmd_verify_lexicon(argv):
 
     # ---- 与**线上实现**对拍 ----
     # 上面那个 normalize 是本文件的参照实现，而真正决定检索的是
-    # rag_engine.normalize_aliases。两份实现只要不同步，这里"通过"就毫无意义
+    # normalize_aliases。两份实现只要不同步，这里"通过"就毫无意义
     # （参照实现永远自洽）—— 这与"工具脚本各抄一份检索管线"是同一类缺陷。
-    # 因此：rag_engine 可用时**必须**逐字对拍；不可用时要明说"没验"。
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    except Exception as exc:
-        warnings.append(
-            "未能 import rag_engine（%s），本次**没有**校验线上归一实现 —— "
-            "上面的结论只对这个参照实现成立" % type(exc).__name__)
+    #
+    # 合并成单文件之前这两份在两个模块里，"必须逐字对拍"是硬要求；现在它们在
+    # 同一个文件里，对拍仍然要跑（参照实现是刻意独立写的），但最坏情况已经
+    # 从"跨模块静默分叉"变成"同文件内可见"。
+    mismatch = []
+    for s in sample[:2]:      # 全书抽样，逐字对拍
+        got, want = normalize(s), normalize_aliases(s)
+        if got != want:
+            i = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]),
+                     min(len(got), len(want)))
+            mismatch.append((got[max(0, i - 12):i + 12], want[max(0, i - 12):i + 12]))
+    if mismatch:
+        for a, b in mismatch[:2]:
+            out("    与线上实现不一致：%r (本文件参照实现) vs %r (normalize_aliases)" % (a, b))
+        problems.append(
+            "本文件的参照实现与 normalize_aliases 输出不一致 —— "
+            "两份实现已分叉，参照实现的自检结论不可信")
     else:
-        mismatch = []
-        for s in sample[:2]:      # 全书抽样，逐字对拍
-            got, want = normalize(s), normalize_aliases(s)
-            if got != want:
-                i = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]),
-                         min(len(got), len(want)))
-                mismatch.append((got[max(0, i - 12):i + 12], want[max(0, i - 12):i + 12]))
-        if mismatch:
-            for a, b in mismatch[:2]:
-                out("    与线上实现不一致：%r (本文件) vs %r (rag_engine)" % (a, b))
-            problems.append(
-                "本文件的参照实现与 rag_engine.normalize_aliases 输出不一致 —— "
-                "两份实现已分叉，参照实现的自检结论不可信")
-        else:
-            out("与线上实现对拍：通过 —— rag_engine.normalize_aliases 输出逐字相同")
+        out("与线上实现对拍：通过 —— normalize_aliases 输出逐字相同")
 
     # ---------------- 4. 停用词表 ----------------
     out("")
@@ -8007,19 +8002,19 @@ COMMANDS = {
 
 
 def usage():
-    print("用法: python rag.py <命令> [参数]")
+    print("用法: python chatbot.py <命令> [参数]")
     print()
     for name in COMMANDS:
         print(f"  {name}")
     print()
-    print("Streamlit 界面: streamlit run rag.py     （RAG_UI=chat / bot 切界面）")
+    print("Streamlit 界面: streamlit run chatbot.py     （RAG_UI=chat / bot 切界面）")
 
 
 def main(argv=None):
     """分发到子命令。
 
     每个子命令**保留自己的 argparse**（含各自的 --help 与退出码）：这里只把
-    argv[0] 摘掉再交给它，因此 `python rag.py health --help` 与合并前
+    argv[0] 摘掉再交给它，因此 `python chatbot.py health --help` 与合并前
     `python check_health.py --help` 行为一致。
     """
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -8032,7 +8027,7 @@ def main(argv=None):
         print(f"未知命令: {name}")
         usage()
         return 1
-    sys.argv = [f"rag.py {name}"] + rest
+    sys.argv = [f"chatbot.py {name}"] + rest
     result = fn()
     return int(result) if isinstance(result, int) else 0
 

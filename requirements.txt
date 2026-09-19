@@ -3,7 +3,7 @@ streamlit>=1.32.0
 requests>=2.31.0
 qdrant-client>=1.12.0
 jieba>=0.42.1
-# 加载 .env 用（app.py 顶部）。缺失时不再是静默跳过而是直接报错：
+# 加载 .env 用（chatbot.py 顶部）。缺失时不再是静默跳过而是直接报错：
 # 静默跳过会让 .env 里的 MODEL / OLLAMA_BASE_URL 全部失效，
 # 程序悄悄用上代码里的默认值（如 qwen3.5:2b 而非 .env 的 qwen2.5:7b），极难定位。
 python-dotenv>=1.0.0
@@ -13,12 +13,12 @@ numpy>=1.26.0
 # 已删除三个从未被引用的依赖：pydantic / pydantic-settings / scikit-learn。
 # 全仓 grep 零引用（`grep -rn "pydantic\|sklearn" --include=*.py .`），
 # 留着只有坏处：多装约 100MB，且会让人以为项目用了 pydantic 做配置校验
-# （实际配置是 rag.py 顶部的 _env_int/_env_float/_env_bool 手写解析）。
+# （实际配置是 chatbot.py 顶部的 _env_int/_env_float/_env_bool 手写解析）。
 # 分句：MIT、零依赖、Wikimedia 维护。
 # 字符扫描不认引语边界与半角标点，实测全库 24%~36% 的句子以闭合引号 ” 开头
 # （sentencex 把引语当不可切分的原子，引号错位率 24%~36% → 0%）。
 #
-# **这是硬依赖，没有降级路径**：rag.py 顶层就是 `from sentencex import segment`，
+# **这是硬依赖，没有降级路径**：chatbot.py 顶层就是 `from sentencex import segment`，
 # 装不上则整个模块 ImportError 起不来。刻意如此 —— 曾经的"内置标点分句降级"
 # 会把闭合引号切给下一句，且是**静默**错的（难以察觉）。
 # 此前这里的注释声称"缺失时会自动降级为内置的标点分句函数"，但那个函数早已

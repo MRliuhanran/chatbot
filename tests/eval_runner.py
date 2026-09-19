@@ -10,8 +10,8 @@
 分母不同的比率相加没有意义，混在一起还会掩盖"长问句更差"这类分层事实。
 """
 
-import rag as RE
-from rag import CONCAT_ENABLED, REWRITE_ENABLED
+import chatbot as RE
+from chatbot import CONCAT_ENABLED, REWRITE_ENABLED
 from tests.probes import (
     MULTITURN_PROBES,
     NEGATIVE_PROBES,
@@ -51,7 +51,7 @@ def run_probes_with(searcher, top_k=None, probes=None, record_extra=None):
 
     searcher(query, top_k) -> (results, steps)：
         评测方把"检索"这一步注入进来。L3 与 record_baseline 传
-        `RAGEngine.hybrid_search`；rag.py 的 ab-retrieval 子命令传一个额外计时的
+        `RAGEngine.hybrid_search`；chatbot.py 的 ab-retrieval 子命令传一个额外计时的
         包装（它要报检索毫秒数与 rerank token 数）。
     record_extra(probe, results, steps, record)：
         就地补充该工具特有的字段（名次、token 数……）。
@@ -114,7 +114,7 @@ def run_multiturn(engine, top_k=None):
 def run_negative(engine, top_k=None):
     """对负样本探针跑一遍，记录"会不会拒答"的现状。
 
-    **判据取线上那一套**（`rag.confidence_signal`），而不是探针模块自带的
+    **判据取线上那一套**（`chatbot.confidence_signal`），而不是探针模块自带的
     rel_gap 口径：本仓库已经实测过 rel_gap 在这套栈上**零区分度**
     （正例与负例均值几乎相同），用它聚合出的 refuse_rate 恒为 0，
     会让人以为"完全没有拒答能力"，而线上其实有（实测 6/10）。

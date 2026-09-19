@@ -19,7 +19,7 @@ import os
 
 import pytest
 
-import rag as CP
+import chatbot as CP
 
 BOOKS_DIR = "books"
 

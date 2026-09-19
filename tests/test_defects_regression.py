@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-import rag as RE
+import chatbot as RE
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -42,7 +42,7 @@ class TestSoftWrappedTextCrashesIngest:
 
     sentencex 的输出里，句子内部保留单个 \\n（软换行）。该函数 `.strip()` 后
     仍发现 "\\n" 就抛 ValueError，于是任何"段落被硬折行"的 txt（每 40/76 列
-    换行，是网上 txt 最常见的排版）都会让 `python rag.py process` 直接崩掉。
+    换行，是网上 txt 最常见的排版）都会让 `python chatbot.py process` 直接崩掉。
 
     实测（本机）：
         四本典籍 句内残留换行 = 0，所以现有语料不触发；
@@ -190,7 +190,7 @@ class TestSourceTextIsDropped:
 # ============================================================================
 class TestEnvQdrantKeyMismatch:
     """`.env` 底部写的是 `RAG_QDRANT_HOST` / `RAG_QDRANT_PORT`，
-    而 `rag` 读的是 `QDRANT_HOST` / `QDRANT_PORT`。
+    而 `chatbot` 读的是 `QDRANT_HOST` / `QDRANT_PORT`。
 
     用户按 `.env` 的注释取消注释后，配置**静默无效** —— 这正是 .env 顶部
     "缺失时直接报错而不是静默跳过"那段注释想避免的问题。
@@ -200,7 +200,7 @@ class TestEnvQdrantKeyMismatch:
 
     def test_documented_env_key_is_actually_read(self):
         env = dict(os.environ, RAG_QDRANT_HOST="example.invalid", RAG_QDRANT_PORT="7999")
-        code = "import rag as RE; print(RE.QDRANT_HOST, RE.QDRANT_PORT)"
+        code = "import chatbot as RE; print(RE.QDRANT_HOST, RE.QDRANT_PORT)"
         out = subprocess.run(
             [sys.executable, "-c", code], cwd=ROOT, env=env,
             capture_output=True, text=True, timeout=120,
@@ -242,9 +242,9 @@ class TestEmptyQueryHasNoGuard:
 # ============================================================================
 class TestDocsReferenceNonexistentCode:
     """requirements.txt 写"sentencex 缺失时会自动降级为内置标点分句
-    （rag._split_sentences_rule），不会报错"，但：
+    （chatbot._split_sentences_rule），不会报错"，但：
 
-      * `rag` 顶层 `from sentencex import segment`，是硬依赖；
+      * `chatbot` 顶层 `from sentencex import segment`，是硬依赖；
       * `_split_sentences_rule` 在仓库里根本不存在。
 
     照这份文档理解，运维会以为删掉 sentencex 只是"降级"，实际是整个模块
@@ -255,9 +255,9 @@ class TestDocsReferenceNonexistentCode:
 
     def test_referenced_symbols_exist(self):
         text = (ROOT / "requirements.txt").read_text(encoding="utf-8")
-        refs = set(re.findall(r"rag\.([A-Za-z_][A-Za-z0-9_]*)", text))
+        refs = set(re.findall(r"chatbot\.([A-Za-z_][A-Za-z0-9_]*)", text))
         missing = sorted(r for r in refs if not hasattr(RE, r))
-        assert not missing, f"requirements.txt 引用了不存在的 rag.{missing}"
+        assert not missing, f"requirements.txt 引用了不存在的 chatbot.{missing}"
 
     def test_sentencex_is_declared_hard_dependency(self):
         """代码是硬依赖，文档就不能说"缺失会自动降级"。"""
@@ -266,7 +266,7 @@ class TestDocsReferenceNonexistentCode:
         src = inspect.getsource(RE)
         assert "from sentencex import segment" in src
         assert "_split_sentences_rule" not in src, (
-            "rag 里并不存在降级函数，requirements.txt 的说法与代码不符"
+            "chatbot 里并不存在降级函数，requirements.txt 的说法与代码不符"
         )
 
 
@@ -315,7 +315,7 @@ class TestGenerationErrorStoredAsAnswer:
     pytestmark = pytest.mark.unit
 
     def test_error_is_not_delivered_as_content(self, monkeypatch):
-        import rag as OC
+        import chatbot as OC
 
         # 指向一个必然拒绝连接的端口：等价于 Ollama 挂掉 / 超时
         monkeypatch.setattr(OC, "API_URL", "http://127.0.0.1:1/api/chat")
@@ -349,7 +349,7 @@ class TestEnvNotLoadedByImportOrder:
     def _run(env=None):
         out = subprocess.run(
             [sys.executable, "-c",
-             "import rag as R; print(R.REWRITE_ENABLED, R.REWRITE_MODEL)"],
+             "import chatbot as R; print(R.REWRITE_ENABLED, R.REWRITE_MODEL)"],
             cwd=ROOT, env=env, capture_output=True, text=True, timeout=120,
         )
         assert out.returncode == 0, out.stderr[-500:]
@@ -368,13 +368,13 @@ class TestEnvNotLoadedByImportOrder:
         got = self._run(env=env).split()[0]
         assert got == str(expected), (
             f".env 写着 RAG_QUERY_REWRITE={m.group(1)}（应为 {expected}），"
-            f"但 `import rag` 之后模块看到的是 {got} —— .env 没有生效"
+            f"但 `import chatbot` 之后模块看到的是 {got} —— .env 没有生效"
         )
 
     def test_cli_override_still_wins(self):
         """`load_dotenv()` 必须是 override=False，命令行环境变量优先。
 
-        这是 A/B 用法（`RAG_RERANK_ON=parent python rag.py ab-retrieval`）的基础。
+        这是 A/B 用法（`RAG_RERANK_ON=parent python chatbot.py ab-retrieval`）的基础。
         """
         off = {**os.environ, "RAG_QUERY_REWRITE": "0"}
         on = {**os.environ, "RAG_QUERY_REWRITE": "1"}
@@ -500,39 +500,45 @@ class TestHybridSearchCallSitesMatchReturnShape:
 
 
 # ============================================================================
-# D12（HIGH）rag 的配置依赖 import 顺序（D9 的根因在上一层）
+# D12（HIGH）配置必须在 import 时就被加载，不依赖调用方的顺序（D9 的根因在上一层）
 # ============================================================================
-class TestRagEngineLoadsEnvItself:
-    """`rag` 的常量在 import 时求值，而它自己不 load_dotenv()。
+class TestChatbotLoadsEnvItself:
+    """`chatbot.py` 的常量在 import 时求值，所以它**必须自己** load_dotenv()。
 
-    此前没出事纯属侥幸：文件里 import 了 rag，而 rag 自己
-    load_dotenv()、且那次 import 恰好排在配置段之前。把 import 挪一下，
-    check_health.py / tools/*.py / tests/conftest.py 这些"先 import rag"
-    的入口就会**静默**丢掉 .env 里的全部 RAG_* 配置。
+    此前没出事纯属侥幸：文件里 import 了 chatbot，而 chatbot 自己 load_dotenv()、且那次
+    import 恰好排在配置段之前。把 import 挪一下，入口就会**静默**丢掉 .env 里的
+    全部 RAG_* 配置。
+
+    合并成单文件后"先 import A 还是先 import B"不再存在（D12 的成因结构上消失），
+    但这条不变量必须继续守，且要换成合并后仍有意义的两条：
+      1. **冷启动** `import chatbot` 就能看到 .env 的显式非默认值 —— 说明它自己
+         加载了，不依赖调用方的顺序；
+      2. **命令行环境变量仍然优先**（`override=False`）—— 否则 A/B 用法会失效。
     """
 
     pytestmark = pytest.mark.unit
 
-    def _run(self, imports, env=None):
+    def _run(self, env=None):
         out = subprocess.run(
             [sys.executable, "-c",
-             f"{imports}; import rag as R; "
-             f"print(R.RRF_K, R.ABSTAIN_MEAN_HARD, R.CHILD_MAX_TOKENS)"],
+             "import chatbot as R; "
+             "print(R.RRF_K, R.ABSTAIN_MEAN_HARD, R.CHILD_MAX_TOKENS)"],
             cwd=ROOT, env=env, capture_output=True, text=True, timeout=120,
         )
         assert out.returncode == 0, out.stderr[-500:]
         return out.stdout.strip()
 
-    def test_import_order_does_not_change_effective_config(self):
-        via_engine = self._run("import rag")
-        via_app = self._run("import rag")
-        assert via_engine == via_app, (
-            f"检索配置随 import 顺序变化：先 import rag → {via_engine}，"
-            f"先 import app → {via_app}。"
+    def test_cli_env_overrides_env_file(self):
+        """命令行环境变量必须压过 .env（load_dotenv(override=False) 的语义）。"""
+        env = dict(os.environ, RAG_RRF_K="77")
+        got = self._run(env=env).split()[0]
+        assert got == "77", (
+            f"显式设 RAG_RRF_K=77 后模块看到的却是 {got} —— "
+            f"要么 .env 用了 override=True，要么根本没加载 .env"
         )
 
-    def test_env_file_value_actually_reaches_rag(self):
-        """只有"两种顺序一致"是不够的：两者都读到默认值时同样会通过。
+    def test_env_file_value_actually_reaches_module(self):
+        """只有"能 import 成功"是不够的：读到默认值同样会通过。
 
         这里挑一个 .env 里**显式写了非默认值**的检索侧变量对拍。
         """
@@ -550,10 +556,10 @@ class TestRagEngineLoadsEnvItself:
             if expected == default:
                 continue     # .env 写的就是默认值，对拍没有区分度
             env = {k: v for k, v in os.environ.items() if k != name}
-            got = self._run("import rag", env=env).split()[0]
+            got = self._run(env=env).split()[0]
             assert got == str(expected), (
-                f".env 写着 {name}={expected}，但 `import rag` 之后模块"
-                f"看到的是 {got} —— 配置在 import 时就被冻住了"
+                f".env 写着 {name}={expected}，但 `import chatbot` 之后模块"
+                f"看到的是 {got} —— .env 没有生效或配置在 import 时被冻住了"
             )
             return
         pytest.skip(".env 里没有显式非默认的检索侧变量，无从对拍")
@@ -568,13 +574,13 @@ class TestOllamaConfigHasSingleSource:
 
     后果全是缺陷：超时一处硬编码 180s 而另一处读 `OLLAMA_TIMEOUT`（用户调大超时
     只对一个入口生效）；RAG_USE_CONTEXT 只在 app.py 读、别的入口靠转发（chat.py
-    就漏过）。现在四个入口一律 `from rag import …`，值不可能分叉。
+    就漏过）。合并成单文件后四个入口一律读同一份模块常量，值不可能分叉。
     """
 
     pytestmark = pytest.mark.unit
 
-    ENTRY_FILES = ("rag.py",)
-    #: 这些环境变量只允许 rag 自己读
+    ENTRY_FILES = ("chatbot.py",)
+    #: 这些环境变量只允许生成侧那一节自己读
     OLLAMA_ENV = ("MODEL", "OLLAMA_BASE_URL", "OLLAMA_TIMEOUT",
                   "RAG_THINK", "RAG_NUM_CTX", "RAG_NUM_PREDICT")
 
@@ -585,10 +591,10 @@ class TestOllamaConfigHasSingleSource:
         所以按 hasattr 逐个校验；`is` 而不是 `==` 才是这里要的语义 ——
         值相等可能只是巧合，对象相同才说明没有第二份定义。
         """
-        src = (ROOT / "rag.py").read_text(encoding="utf-8")
+        src = (ROOT / "chatbot.py").read_text(encoding="utf-8")
         # 只有一个 stream_chat 定义（不是"四个入口都指向同一个"——合并后更强的性质）
         assert src.count("def stream_chat(") == 1, (
-            f"rag.py 里有 {src.count('def stream_chat(')} 个 stream_chat 定义"
+            f"chatbot.py 里有 {src.count('def stream_chat(')} 个 stream_chat 定义"
         )
         for name in ("MODEL", "THINK", "NUM_CTX", "NUM_PREDICT",
                      "OLLAMA_BASE_URL", "TIMEOUT", "OLLAMA_TIMEOUT"):
@@ -612,7 +618,7 @@ class TestOllamaConfigHasSingleSource:
                     if isinstance(arg, ast.Constant) and arg.value in self.OLLAMA_ENV:
                         offenders.append(f"{fname}:{node.lineno} 读了 {arg.value}")
         assert not offenders, (
-            "生成侧配置只允许 rag 读取，入口不得各读一遍：\n  "
+            "生成侧配置只允许 chatbot 读取，入口不得各读一遍：\n  "
             + "\n  ".join(offenders)
         )
 
@@ -692,12 +698,12 @@ class TestContractsHaveSingleSource:
         assert set(back) == set(RE.CHUNK_FIELDS)
 
     def test_compare_chunks_field_list_matches_schema(self):
-        """compare_chunks 保持零依赖（不 import rag），但它的字段表
+        """compare_chunks 保持零依赖（不 import chatbot），但它的字段表
         必须与 schema 一致 —— 否则它会对新字段静默给假绿。"""
         import compare_chunks
         # 比对的是 chunks.json 的记录，而 point_id 是建索引时才有的，故对 CHUNK_RECORD_FIELDS
         assert set(compare_chunks.FIELDS) == set(RE.CHUNK_RECORD_FIELDS), (
-            f"compare_chunks.FIELDS 与 rag.CHUNK_RECORD_FIELDS 不一致："
+            f"compare_chunks.FIELDS 与 chatbot.CHUNK_RECORD_FIELDS 不一致："
             f"{set(compare_chunks.FIELDS) ^ set(RE.CHUNK_RECORD_FIELDS)}"
         )
 
@@ -708,7 +714,7 @@ class TestContractsHaveSingleSource:
         assert set(check_health.REQUIRED_PAYLOAD_FIELDS) <= set(RE.PAYLOAD_FIELDS)
 
     def test_steps_has_a_single_writer(self):
-        """steps 的写者必须是 rag 里的 hybrid_search（以及 plan_generation）。
+        """steps 的写者必须是 chatbot 里的 hybrid_search（以及 plan_generation）。
 
         入口只允许写 STEP_INPUT_TOKENS —— 那是生成之后的实测值，检索链不可能知道。
         允许第二个写者就意味着 UI 得知道检索内部的结构（app.py 曾经往里塞
@@ -716,9 +722,9 @@ class TestContractsHaveSingleSource:
         """
         import ast
 
-        # 合并后只有 rag.py，故判据改为"写了哪些键"：
+        # 合并后只有 chatbot.py，故判据改为"写了哪些键"：
         # 除了唯一一个入口侧补充项（生成之后的实测值），其余必须都是 STEP_* 常量。
-        tree = ast.parse((ROOT / "rag.py").read_text(encoding="utf-8"))
+        tree = ast.parse((ROOT / "chatbot.py").read_text(encoding="utf-8"))
         written = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript):
@@ -736,10 +742,10 @@ class TestContractsHaveSingleSource:
         """四个入口都必须走 run_turn，不许自己拼序列。"""
         import ast
 
-        # 合并后三个 UI 入口都在 rag.py 里。判据：三个界面函数都只调 run_turn，
+        # 合并后三个 UI 入口都在 chatbot.py 里。判据：三个界面函数都只调 run_turn，
         # 谁都不许自己调 hybrid_search（那条路径一旦分叉就是 chat.py 漏 use_context
         # 那类缺陷的温床）。api.py 的 /search 是检索专用端点，不在其中。
-        tree = ast.parse((ROOT / "rag.py").read_text(encoding="utf-8"))
+        tree = ast.parse((ROOT / "chatbot.py").read_text(encoding="utf-8"))
         ui_funcs = {"run_streamlit", "run_chat_ui", "run_bot_ui"}
         seen = set()
         for node in tree.body:
@@ -757,6 +763,6 @@ class TestContractsHaveSingleSource:
 
     def test_probe_running_has_one_implementation(self):
         """"跑探针"只有 eval_runner.run_probes_with 一份。"""
-        src = (ROOT / "rag.py").read_text(encoding="utf-8")
+        src = (ROOT / "chatbot.py").read_text(encoding="utf-8")
         assert "run_probes_with" in src, "A/B 子命令没有走 eval_runner.run_probes_with"
         assert src.count("def run_probes_with(") == 1

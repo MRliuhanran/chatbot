@@ -3,13 +3,13 @@
 这一层回答的是"索引和分块源是否已经脱节"。此前没有任何自动检查，
 导致文档里长期写着错误的索引条数，却无人发现。
 
-需要: docker compose up -d  +  python rag.py index
+需要: docker compose up -d  +  python chatbot.py index
 运行: pytest -m needs_qdrant
 """
 
 import pytest
 
-import rag as RE
+import chatbot as RE
 
 pytestmark = pytest.mark.needs_qdrant
 
@@ -51,7 +51,7 @@ def all_payloads(qdrant_client, collection_info):
 class TestCollectionConfig:
     def test_collection_exists(self, qdrant_client):
         assert qdrant_client.collection_exists(COLL), (
-            f"集合 {COLL} 不存在，请运行: python rag.py index"
+            f"集合 {COLL} 不存在，请运行: python chatbot.py index"
         )
 
     def test_has_both_vector_spaces(self, collection_info):
@@ -93,7 +93,7 @@ class TestCounts:
         count = qdrant_client.count(collection_name=COLL, exact=True).count
         assert count == len(chunks), (
             f"集合 {COLL} 有 {count} 条，但 chunks.json 有 {len(chunks)} 条 —— "
-            f"索引与分块源已脱节，请重跑: python rag.py index"
+            f"索引与分块源已脱节，请重跑: python chatbot.py index"
         )
 
     def test_point_ids_contiguous(self, all_payloads, collection_info):

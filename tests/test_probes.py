@@ -263,7 +263,7 @@ class TestMultiturnKinds:
     #: 2–3 条的规模下，一条探针进出就能翻转整组的比率（`topic@k 95.2%→100%`
     #: 在 n=21 上只差一条）。2026-09-19 把每类补齐到 5 条后上调到 5：
     #: 这个下限本身就是护栏 —— 以后新增 kind 时必须一次带够样本，
-    #: 而不是先加一条占位。见 MULTITURN_PLAN.md §6。
+    #: 而不是先加一条占位。见 AGENTS.md「设计存档 B → 落地顺序与门禁」。
     MIN_PER_KIND = 5
 
     def test_every_probe_is_classified(self):
@@ -316,7 +316,7 @@ class TestTopicMetricIsAliasAware:
     全部 topic@k=N，看起来像"检索系统性失手"，实际是度量假象。
 
     归一化函数由调用方注入（probes.py 刻意零依赖），这里用一个等价于
-    `rag.normalize_aliases` 语义的小桩来钉住行为。
+    `chatbot.normalize_aliases` 语义的小桩来钉住行为。
     """
 
     #: 只认"云长/关公 → 关羽"这一条，够验证注入路径与比对逻辑

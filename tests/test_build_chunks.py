@@ -15,7 +15,7 @@ import json
 
 import pytest
 
-import rag as RE
+import chatbot as RE
 
 pytestmark = pytest.mark.needs_models
 

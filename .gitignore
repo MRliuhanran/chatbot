@@ -8,7 +8,7 @@ venv/
 models/
 
 # ---- 索引与缓存（可重建：process + index）----
-chroma_db_v2/
+qdrant_storage/
 cache_v2/
 *.pkl
 
@@ -16,11 +16,12 @@ cache_v2/
 books/
 
 # ---- 运行时产物 ----
-streamlit.pid
 *.log
+*.pid
 debug_*.png
 test_*_report.json
 .pytest_cache/
+.deepeval/
 
 # ---- 密钥 ----
 .env
@@ -28,7 +29,6 @@ test_*_report.json
 # ---- IDE ----
 .idea/
 .vscode/
-.claude/
 
 # ---- Python ----
 __pycache__/

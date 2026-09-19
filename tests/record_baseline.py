@@ -3,7 +3,7 @@
 
 为什么需要它：`compare_ab.py` 只能做"两个集合谁更好"的相对比较，回答不了
 "这次改动有没有让检索变差"。没有存档的基线，每次评测都在跟一个移动的靶子比
-（PROJECT_DOC 里那些 100% / 87.5% 的指标也没有任何机器可读的存档）。
+（AGENTS.md 里那些 100% / 87.5% 的指标也没有任何机器可读的存档）。
 
 用法（需 Qdrant + 模型，分钟级）:
     python -m tests.record_baseline            # 写入 tests/golden/retrieval_baseline.json
@@ -20,7 +20,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import rag as RE
+import chatbot as RE
 from tests.eval_runner import snapshot  # noqa: E402
 
 BASELINE_PATH = os.path.join(
@@ -84,7 +84,7 @@ def main():
     engine = RE.RAGEngine()
     n = engine.count()
     if n == 0:
-        sys.exit(f"❌ 集合 {engine.collection_name} 为空，请先运行: python rag.py index")
+        sys.exit(f"❌ 集合 {engine.collection_name} 为空，请先运行: python chatbot.py index")
     # 报实际访问的集合名（别名解析后可能是 books_current）：
     # 写 RE.COLLECTION_NAME 会让人以为基线录自 books_v3，而它可能早就没了
     print(f"集合 {engine.collection_name}: {n} 条，top_k={args.top_k}")

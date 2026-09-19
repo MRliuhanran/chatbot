@@ -4,7 +4,7 @@
 2 个模型 + Docker + 2 万条索引），导致实际执行频率极低，而恰恰是"改了分块
 参数却没人跑回归"最容易出事。
 
-之所以能这么便宜：rag 把 torch / transformers / jieba 放在函数内部
+之所以能这么便宜：chatbot 把 torch / transformers / jieba 放在函数内部
 惰性导入，模块顶层只依赖 sentencex。分块逻辑因此可以直接测。
 
 每条测试都对应一个**真实发生过的缺陷**（见 test docstring 里的出处），
@@ -13,7 +13,7 @@
 
 import pytest
 
-import rag as RE
+import chatbot as RE
 
 # 本模块整体属于 L0：不碰模型 / Qdrant / 语料
 pytestmark = pytest.mark.unit
@@ -38,7 +38,7 @@ class TestSplitSentences:
 
         注意判据是**空行**（段落分隔），不是"含任意 \\n"：句内单个 \\n 只是
         按列硬折行的排版（网上 txt 最常见的形式），把它当成"分句器失效"会让
-        新增这类书时 `python rag.py process` 直接崩掉。见下面的
+        新增这类书时 `python chatbot.py process` 直接崩掉。见下面的
         test_soft_wrap_is_not_a_paragraph_break。
         """
         monkeypatch.setattr(RE, "segment",

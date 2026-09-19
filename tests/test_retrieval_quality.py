@@ -19,7 +19,7 @@ import os
 
 import pytest
 
-import rag as RE
+import chatbot as RE
 from tests.eval_runner import (
     aggregate,
     multiturn_degrade_state,
@@ -253,7 +253,7 @@ class TestNegativeProbesAreRecorded:
     拒答召回 6/10），最终由生成侧结合上下文裁定。因此"检索返回了 top_k 条"
     本身并不等于"拒答失败" —— 硬断言 refuse_rate 会逼着实现去迎合一个
     并不正确的口径（实测过：负样本里有 4 条属于"语料部分相关"，
-    连"平均分 + 书目分散"都判不出来，见 PROJECT_DOC 的校准记录）。
+    连"平均分 + 书目分散"都判不出来，见 AGENTS.md §4.6 的校准记录）。
     所以这里只在缺失时提醒，不 fail。
     """
 
