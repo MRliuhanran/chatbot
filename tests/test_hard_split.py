@@ -20,7 +20,7 @@ import re
 
 import pytest
 
-import rag_engine as RE
+import rag as RE
 
 pytestmark = pytest.mark.needs_models
 

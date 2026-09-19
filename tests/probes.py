@@ -189,7 +189,7 @@ def evaluate_probe(probe, results):
 #   temporal       时间指代（"后来呢""再之后"）—— 代词表覆盖不到，只能靠语义
 #   recall_detail  指代对象**不是人名，而是上一轮回答里的一个内容词**
 #                  （"你刚说的那个官名"）。它考的是"上一轮到底说了什么"，
-#                  而答案原文并不会留在下一轮上下文里（见 rag_engine 的说明）
+#                  而答案原文并不会留在下一轮上下文里（见 rag 的说明）
 VALID_MULTITURN_KINDS = (
     "pronoun", "assistant_only", "entity_switch",
     "ellipsis", "temporal", "recall_detail",
@@ -679,7 +679,7 @@ def evaluate_multiturn(probe, results, normalize=None):
     **书对了、内容却与指代对象无关**（比如"他最后结局如何"在西游记里
     召回了不相干的段落）。book@k 会把这种情况判成通过，topic@k 不会。
 
-    normalize: 可注入的"词面归一"函数（`rag_engine.normalize_aliases`）。
+    normalize: 可注入的"词面归一"函数（`rag.normalize_aliases`）。
     **为什么必须归一**：同一个实体在一本书里有多种写法，只看字面会让判据
     **假失败** —— 实测踩过：新探针"后来这件事是怎么了结的"只写了
     topic_terms=("关羽",)，而《三国演义》里"关羽"9 次 / "云长"443 次 /
@@ -688,7 +688,7 @@ def evaluate_multiturn(probe, results, normalize=None):
     检索侧的稀疏通道早就在做同样的事（jieba → 别名归一 → BM25），
     度量侧不做就是两套口径。
 
-    这里**不 import rag_engine**：本模块刻意保持零依赖（只有 typing），
+    这里**不 import rag**：本模块刻意保持零依赖（只有 typing），
     以便 L0 纯函数层直接用它。归一化由调用方（`tests/eval_runner.py`）注入。
     """
     verdict = evaluate_probe(probe, results)
@@ -851,7 +851,7 @@ NEGATIVE_PROBES = [
 # 也就是说：域外问题同样会产出一个"看起来挺突出"的首位候选。本函数给出的
 # refuse=False **不代表系统有把握**，只代表"分数形态没给出反对证据"。
 # 因此在本栈上 refuse_rate 会接近 0 —— 这是对**引擎现状**的真实描述：
-# 引擎**有**拒答信号了（rag_engine.confidence_signal 的 refuse，实测校准：误拒 0/24、拒答召回 6/10），但它是**分层**的 —— 检索侧只给信号，最终由生成侧结合上下文裁定，且不硬拦用户。因此"检索仍返回了 top_k 条"并不等于拒答失败。
+# 引擎**有**拒答信号了（rag.confidence_signal 的 refuse，实测校准：误拒 0/24、拒答召回 6/10），但它是**分层**的 —— 检索侧只给信号，最终由生成侧结合上下文裁定，且不硬拦用户。因此"检索仍返回了 top_k 条"并不等于拒答失败。
 # 早先这里写的是"压根没有拒答通路"，那是加入 confidence_signal 之前的实情，
 # 不是本模块判定错了。
 #
@@ -920,7 +920,7 @@ def evaluate_negative(probe, results):
                 跨书提问（"孙悟空和关羽谁更厉害"）也可能全部落在同一本书里。
                 故只作诊断暴露，**不并入 refuse** —— 否则会让 refuse_rate
                 看起来"有拒答能力"，而当时的引擎确实一条拒答通路都没有。
-                （引擎**有**拒答信号了（rag_engine.confidence_signal 的 refuse，实测校准：误拒 0/24、拒答召回 6/10），但它是**分层**的 —— 检索侧只给信号，最终由生成侧结合上下文裁定，且不硬拦用户。因此"检索仍返回了 top_k 条"并不等于拒答失败。）
+                （引擎**有**拒答信号了（rag.confidence_signal 的 refuse，实测校准：误拒 0/24、拒答召回 6/10），但它是**分层**的 —— 检索侧只给信号，最终由生成侧结合上下文裁定，且不硬拦用户。因此"检索仍返回了 top_k 条"并不等于拒答失败。）
       n         参与判定的候选条数。
       empty     结果是否为空。
     """

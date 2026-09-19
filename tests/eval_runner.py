@@ -10,8 +10,8 @@
 分母不同的比率相加没有意义，混在一起还会掩盖"长问句更差"这类分层事实。
 """
 
-import rag_engine as RE
-from query_rewrite import CONCAT_ENABLED, REWRITE_ENABLED
+import rag as RE
+from rag import CONCAT_ENABLED, REWRITE_ENABLED
 from tests.probes import (
     MULTITURN_PROBES,
     NEGATIVE_PROBES,
@@ -51,7 +51,7 @@ def run_probes_with(searcher, top_k=None, probes=None, record_extra=None):
 
     searcher(query, top_k) -> (results, steps)：
         评测方把"检索"这一步注入进来。L3 与 record_baseline 传
-        `RAGEngine.hybrid_search`；tools/ab_retrieval.py 传一个额外计时的
+        `RAGEngine.hybrid_search`；rag.py 的 ab-retrieval 子命令传一个额外计时的
         包装（它要报检索毫秒数与 rerank token 数）。
     record_extra(probe, results, steps, record)：
         就地补充该工具特有的字段（名次、token 数……）。
@@ -114,7 +114,7 @@ def run_multiturn(engine, top_k=None):
 def run_negative(engine, top_k=None):
     """对负样本探针跑一遍，记录"会不会拒答"的现状。
 
-    **判据取线上那一套**（`rag_engine.confidence_signal`），而不是探针模块自带的
+    **判据取线上那一套**（`rag.confidence_signal`），而不是探针模块自带的
     rel_gap 口径：本仓库已经实测过 rel_gap 在这套栈上**零区分度**
     （正例与负例均值几乎相同），用它聚合出的 refuse_rate 恒为 0，
     会让人以为"完全没有拒答能力"，而线上其实有（实测 6/10）。
@@ -149,7 +149,7 @@ def multiturn_degrade_state(rewrite=None, concat=None):
     """本次运行里多轮检索**实际会落到哪一档**（纯函数，可 L0 单测）。
 
     降级链是 LLM 改写 → 拼接上轮用户问句 → 字面原句（见
-    query_rewrite.build_retrieval_query）。这里给出的是**上限**：
+    build_retrieval_query）。这里给出的是**上限**：
     真实一轮里 LLM 可能调用失败而掉到下一档，但"配置允许的最优档"
     是确定的，而基线与当前运行的比较必须以配置为准 —— 否则同一次
     比对里两边可能跑在不同的链上。

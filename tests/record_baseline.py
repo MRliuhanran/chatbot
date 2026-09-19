@@ -20,7 +20,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import rag_engine as RE  # noqa: E402
+import rag as RE
 from tests.eval_runner import snapshot  # noqa: E402
 
 BASELINE_PATH = os.path.join(
@@ -84,7 +84,7 @@ def main():
     engine = RE.RAGEngine()
     n = engine.count()
     if n == 0:
-        sys.exit(f"❌ 集合 {engine.collection_name} 为空，请先运行: python app.py index")
+        sys.exit(f"❌ 集合 {engine.collection_name} 为空，请先运行: python rag.py index")
     # 报实际访问的集合名（别名解析后可能是 books_current）：
     # 写 RE.COLLECTION_NAME 会让人以为基线录自 books_v3，而它可能早就没了
     print(f"集合 {engine.collection_name}: {n} 条，top_k={args.top_k}")

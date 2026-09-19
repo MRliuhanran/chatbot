@@ -17,7 +17,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-import api
+import rag as api
 
 pytestmark = pytest.mark.unit
 
@@ -29,7 +29,7 @@ class TestEngineLock:
         """`_ENGINE_LOCK` 必须可重入。
 
         复现方式（修好之前）：把这里换成 `threading.Lock()`，然后跑
-        `python api.py` 再 `curl /health` —— 会一直挂到超时。
+        `python rag.py api` 再 `curl /health` —— 会一直挂到超时。
         因为 do_GET 曾在持有该锁的情况下调用 get_engine()，而后者也要拿它。
         """
         lock = api._ENGINE_LOCK
@@ -49,7 +49,7 @@ class TestEngineLock:
         a = api.get_engine()
         b = api.get_engine()
         assert a is b
-        assert isinstance(a, __import__("rag_engine").RAGEngine)
+        assert isinstance(a, __import__("rag").RAGEngine)
 
 
 def _get(server, path, timeout=10):

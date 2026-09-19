@@ -6,9 +6,9 @@
 
 **只开发和设计。不要主动自测 —— 主动性别这么强。**
 
-- **不要自己跑测试**：`pytest`（任何 `-m` 分层）、`check_health.py`、
+- **不要自己跑测试**：`pytest`（任何 `-m` 分层）、`rag.py health`、
   `tools/ab_retrieval.py`、`tools/ab_multiturn.py`、`tools/verify_after_rebuild.py`、
-  `compare_ab.py`、`compare_chunks.py`、`verify_qdrant.py`、`record_baseline`
+  `rag.py compare-ab`、`rag.py compare-chunks`、`rag.py verify-qdrant`、`record_baseline`
   —— 一概不主动跑。
 - **不要自己做端到端验证**：不主动起服务（`app.py` / `api.py`）、不主动
   `docker compose up`、不主动 `process` / `index` / `reindex_sparse`、
@@ -43,61 +43,91 @@
 docker compose up -d
 
 # 2. 构建索引
-python app.py process
-python app.py index
+python rag.py process
+python rag.py index
 
 # 3. 健康检查
-python check_health.py
+python rag.py health
 
 # 4. 自动化测试（**由用户决定何时跑**；agent 不主动跑，见顶部"工作方式"）
 pytest -m unit
 
 # 5. 启动服务（二选一）
-python app.py            # Streamlit UI :8501
-python api.py            # HTTP API   :8000
+python rag.py serve      # Streamlit UI :8501
+python rag.py api        # HTTP API   :8000
 ```
 
 ## 项目结构
 
+**全部生产代码在一个文件里**：`rag.py`（约 8060 行，按依赖顺序分 9 节）。
+
 ```
-├── app.py                  # 统一入口：CLI 命令 + Streamlit UI
-├── api.py                  # HTTP API（标准库实现，零新依赖）：/health /search /ask
-├── rag_engine.py           # RAG 核心引擎：分块/嵌入/索引/检索（检索逻辑唯一权威实现）
-├── bootstrap.py            # 进程级基础设施（**单源**）：.env 加载 / 环境变量解析 / 日志
-├── rag_turn.py             # **一轮 RAG 的序列**（检索→装配→拒答→生成）事件流，四入口只渲染
-├── ollama_client.py        # Ollama 客户端（**单源**）：模型名/think/预算/超时 + 流式解析
-├── chapter_parse.py        # 章回体切回：按行首回目切分，纯标准库、逐字无损
-├── query_rewrite.py        # 多轮查询改写（指代消解），失败退回原查询
-├── check_health.py         # 系统健康检查（含词表指纹一致性）
-├── compare_chunks.py       # 分块 A/B 比较器（按列表位置逐条比对，暴露边界漂移）
-├── compare_ab.py           # 检索级 A/B（完整链路对比两个集合）
-├── verify_qdrant.py        # 稠密/稀疏通道校验（含召回对比）
-├── reindex_sparse.py       # 只重建稀疏向量（换词表/分词方案时免重跑 embedding）
-├── tools/
-│   ├── verify_lexicon.py   # 别名词典 / 古白话停用词表校验器（含语料接地检查）
-│   ├── ab_retrieval.py     # 检索配置 A/B（只改环境变量，正向探针 + MRR）
-│   └── ab_multiturn.py     # 多轮 A/B（降级档 / 融合 / 重排口径，逐类 + 逐条对拍）
+├── rag.py                  # 唯一的生产代码（引擎 + 四个入口 + 全部工具）
+│     ① 基础设施      .env 加载 / 环境变量解析 / 日志
+│     ② Ollama 客户端 模型名、think、预算、超时、流式解析（**单源**）
+│     ③ 章回体切分    按行首回目切回，纯标准库、逐字无损
+│     ④ 查询改写      多轮指代消解，三档降级链
+│     ⑤ RAG 引擎      分块/嵌入/索引/检索（检索逻辑唯一权威实现）
+│     ⑥ 一轮对话      检索→装配→拒答→生成 的事件流
+│     ⑦ 四个入口      Streamlit UI / HTTP API / 极简 UI / 通用机器人
+│     ⑧ 工具          健康检查 / 通道校验 / A-B / 词表 / 重建
+│     ⑨ 命令行分发
+├── tests/                  # 自动化测试 L0~L3 + 探针 + 评测执行器
+│   ├── probes.py               # 探针 + 判定函数的**唯一来源**
+│   ├── eval_runner.py          # "跑探针→聚合"的唯一实现
+│   ├── conftest.py / record_baseline.py
+│   └── test_*.py               # 见下"测试分层"
 ├── data/
 │   ├── aliases.txt             # 人物别名表（规范名 + 别名，制表符分隔）
 │   └── stopwords_classical.txt # 古白话停用词表（禁收否定词/程度词）
-├── tests/                  # 自动化测试 L0~L3（见下）
 ├── pytest.ini              # 测试分层 marker 配置
 ├── docker-compose.yml      # Docker编排文件
-├── qdrant/
-│   └── config.yaml         # Qdrant配置文件
+├── qdrant/config.yaml      # Qdrant配置文件
 ├── books/                  # 源文本文件（四大名著 .txt）
-├── models/                 # 预训练模型
-│   ├── bge-base-zh-v1.5/   # 向量化模型（768维）
-│   └── bge-reranker-base/  # 重排序模型
+├── models/                 # 预训练模型（bge-base-zh-v1.5 / bge-reranker-base）
 ├── qdrant_storage/         # Qdrant Docker数据存储
-├── cache_v2/               # 分块缓存
-│   ├── chunks.json             # 分块产物（process 产出，index 输入）
-│   ├── chunks.meta.json        # 分块配置指纹 + 源文本哈希 + 每回清单
-│   └── embeddings/             # 向量缓存（首次建索引时才创建，按内容哈希命中）
+├── cache_v2/               # 分块产物 + 向量缓存
 ├── .env                    # 环境变量配置
-├── requirements.txt        # 运行时依赖
-└── requirements-dev.txt    # 开发依赖（pytest）
+├── requirements.txt / requirements-dev.txt
+
+### 命令行（唯一的入口）
+
+```bash
+python rag.py process          # 分块（读 books/ → cache_v2/chunks.json）
+python rag.py index            # 向量化入库（写新集合 + 原子切别名）
+python rag.py serve            # Streamlit UI（:8501）
+python rag.py api              # HTTP API（:8000，NDJSON 流）
+python rag.py health           # 系统健康检查
+python rag.py verify-qdrant    # 稠密/稀疏通道校验
+python rag.py reindex-sparse   # 只重建稀疏向量（换词表时用）
+python rag.py compare-chunks A B
+python rag.py compare-ab A B
+python rag.py lexicon          # 别名表 / 停用词表校验
+python rag.py ab-retrieval --label x
+python rag.py ab-multiturn --label x
+python rag.py after-rebuild
+
+streamlit run rag.py           # UI；RAG_UI=chat 或 RAG_UI=bot 切到另两个界面
 ```
+
+每个子命令**保留自己的 argparse**（含各自的 `--help` 与退出码），分发器只把
+`argv[0]` 摘掉再交给它 —— 因此 `python rag.py health --help` 与合并前的
+`python check_health.py --help` 行为一致。
+
+### 为什么是"分节的单文件"而不是多模块
+
+合并前有 19 个源文件（15 个在根目录、4 个在 `tools/`）。合并**省的代码其实很少**
+（模块 docstring / import / `__main__` 包装共约 4.4%，另加 632 处跨模块前缀 ~4.1%），
+真正的收益是结构性的：
+
+* **"只有一份实现"成为结构事实**——参考 D9/D12（两份 `.env` 引导）、D13（两份流式
+  实现与两处配置）、D14/D15（三份入口序列、五份 schema）。这些缺陷的成因都是
+  "多个模块各自做同一件事"，单文件里它们**不可能发生**，不再依赖人的自觉。
+* 没有跨模块 import 顺序问题（`.env` 必须在任何常量求值之前加载）。
+
+代价（都已落在代码注释里）：两个 UI 要靠 `RAG_UI` 切换；重型依赖（torch /
+transformers / jieba / qdrant_client / streamlit）必须留在函数内惰性 import，
+否则 `pytest -m unit` 就不再是"零依赖可跑"。
 
 ## 测试分层
 
@@ -123,7 +153,7 @@ pytest -m slow          # L3 检索质量回归：需模型+索引，分钟级�
 | L0 | `tests/test_chapters.py` | 中文数字解析（含"第一百十回"这类省略写法）、逐字无损拼接、回序号连续、offset→回 二分查找、四本书真实回数（23/64/120/100） |
 | L0 | `tests/test_probes.py` | 探针结构/接地：关键词真的在对应书里、负样本主题真的不在语料里、rel_gap 口径、**多轮指代类型（kind）合法且每类样本够** |
 | L0 | `tests/test_retrieval_units.py` | `weighted_rrf` / `dedup_candidates_by_parent` / `confidence_signal` / 空查询守护 / 别名归一 / 平衡打包 / **上下文装配（system 只放规则、正文走独立消息、资料永不因裁剪而丢）** / 查询改写 / **生成侧历史预算（system 永不丢、整轮裁、装配后必落进窗口）** / 环境变量解析 |
-| L0 | `tests/test_defects_regression.py` | D1~D15 缺陷护栏（见下）+ 引号归一的**语料级验收**、`hybrid_search` 调用点的 AST 静态护栏、`.env` 到达性（子进程）、生成侧配置/流式的**单源**（对象同一性 + AST 禁读）、`plan_generation` 三入口同口径 |
+| L0 | `tests/test_defects_regression.py` | D1~D16 缺陷护栏（见下）+ 引号归一的**语料级验收**、`hybrid_search` 调用点的 AST 静态护栏、`.env` 到达性（子进程）、生成侧配置/流式的**单源**（对象同一性 + AST 禁读）、`plan_generation` 三入口同口径 |
 | L0 | `tests/test_api.py` | API 层：`_ENGINE_LOCK` 必须**可重入**（曾因非重入锁让 `/health` 自锁挂死 —— curl 只报超时、日志一个字都没有）、端点真能回话 |
 | — | `tests/test_hard_split.py` | 硬切兜底逐字无损（不引入分词器空格、不丢字）且仍守 token 上限（需真 tokenizer） |
 | — | `tests/test_build_chunks.py` | 真实 `build_chunks` 主函数：空白块被丢、短正文块被保留、编号无空洞 |
@@ -137,7 +167,7 @@ L3 基线需先录制：`python -m tests.record_baseline` → `tests/golden/retr
 **30 多轮**（每类 5 条，见 `test_probes.MIN_PER_KIND=5`；分六类指代：pronoun / assistant_only / entity_switch / ellipsis /
 temporal / recall_detail，见 `VALID_MULTITURN_KINDS`；每类的失手原因与修法不同，
 故 `aggregate_multiturn_by_kind` 分组报比率，不合成一个总分），
-`compare_ab.py` / `verify_qdrant.py` / L3 都从这里导入。三类指标**分开报告、
+`rag.py compare-ab` / `rag.py verify-qdrant` / L3 都从这里导入。三类指标**分开报告、
 不合成总分**（见 `tests/probes.py::aggregate_all`）——"短查询 100%、多轮 0%" 合成
 一个 50 分就看不出问题在哪。
 
@@ -145,7 +175,7 @@ temporal / recall_detail，见 `VALID_MULTITURN_KINDS`；每类的失手原因�
 
 每条对应一个**已复现**的功能缺陷，断言的是正确行为。缺陷未修时用
 `xfail(strict=True)` 保持套件绿色；修好后 strict xfail 会立刻变成 XPASS 失败，
-强制摘掉标记。**D1~D15 现已全部修复，文件里已无 xfail 标记**。
+强制摘掉标记。**D1~D16 现已全部修复，文件里已无 xfail 标记**。
 
 | # | 缺陷 | 修法 |
 |---|------|------|
@@ -157,13 +187,14 @@ temporal / recall_detail，见 `VALID_MULTITURN_KINDS`；每类的失手原因�
 | D6 | `requirements.txt` 描述了一个不存在的降级函数 | 注释改为"硬依赖、无降级路径"，并说明删掉 sentencex 是 ImportError 而非降级 |
 | D7 | `cmd_serve` 把"连不上 Qdrant"误报成"向量库为空" | 连接失败与空集合分开报，并给出 `docker compose up -d` 提示 |
 | D8 | 生成失败被当成"模型答案"写进会话历史并回灌模型 | `_stream_ollama` 新增独立的 `"error"` kind，UI/API 分开记录，不写入助手历史 |
-| D9 | .env 里的 `RAG_QUERY_REWRITE=0` 是否生效**取决于 import 顺序**：`query_rewrite` 在 import 时读常量，而 `rag_engine` 顶层就 import 它。UI/API 恰好对（先 `load_dotenv`），而 `check_health.py` 把"已关闭"报成"开启"，`record_baseline` / `ab_retrieval` / `compare_ab` / `verify_qdrant` 里 .env 的 0 一律失效（"关掉改写做 A/B"实际没关） | `query_rewrite` 自己 `load_dotenv()`（`override=False`，命令行环境变量仍优先，A/B 用法不受影响），与 app.py / ollama_client.py 一致；D9 用**子进程**断言两种 import 顺序得到同一结论 |
+| D9 | .env 里的 `RAG_QUERY_REWRITE=0` 是否生效**取决于 import 顺序**：`query_rewrite` 在 import 时读常量，而 `rag_engine` 顶层就 import 它。UI/API 恰好对（先 `load_dotenv`），而健康检查把"已关闭"报成"开启"，`record_baseline` / `ab_retrieval` / `compare_ab` / `verify_qdrant` 里 .env 的 0 一律失效（"关掉改写做 A/B"实际没关） | `query_rewrite` 自己 `load_dotenv()`（`override=False`，命令行环境变量仍优先，A/B 用法不受影响），与 app.py / ollama_client.py 一致；D9 用**子进程**断言两种 import 顺序得到同一结论 |
 | D10 | **`fix_quotes` 把闭引号改成了开引号**：D2 引入的"硬信号"假定"直引号左侧紧跟句读 ⇒ 必为开引号"，而该假定在本语料上是**反的**（红楼梦 `："` 0 次、`？"` 915 次、`！"` 402 次，直引号一律是闭引号）。后果：2426 个直引号里 2094 个被判成开引号，未配对 `“` 从 1600 涨到 **3362**，坏文本已烤进 `cache_v2/chunks.json`（可直接搜到 `意欲何往？“那僧笑道`） | 重写为**单遍二值状态机**：`“ ”` 与已判定的 `"` 共同维护"是否在引号内"，在内则闭、在外则开；删掉 `_OPEN_QUOTE_CTX` 与 `_paired_curly_positions`。复算：未配对 1600 → **12**。⚠️ 修好后**必须重跑 `process` + `index` 并重录基线**（旧基线建立在被改坏的正文上） |
 | D11 | `chat.py` 把 `hybrid_search` 的**列表**返回值按二元组解包（`results, _ = …`，而 `return_steps` 默认 False）→ 提问即 `ValueError`；条数恰为 2 时更糟（`results` 变成 dict，后续对它调 `.get`） | 改为单值赋值；并加 **AST 静态护栏**：凡按元组解包该调用者，必须显式带 `return_steps=True` |
-| D12 | `rag_engine` 的常量在 import 时求值，它自己却**不** `load_dotenv()`；此前靠"import 了 self-load 的 query_rewrite 且那次 import 恰好在配置段之前"侥幸成立，挪一下 import 就全仓库 `.env` 失效 | `.env` 加载收进 `bootstrap.py`（单源，`override=False`），任何读环境变量的模块先 `import bootstrap`；子进程断言两种 import 顺序同值 **且** .env 的显式非默认值真的到达模块 |
-| D13 | **生成侧有两份同逻辑实现**：`app._stream_ollama(payload)` 与 `ollama_client.stream_chat(messages)`，且 MODEL / THINK / NUM_CTX / NUM_PREDICT / OLLAMA_TIMEOUT 在两边各读一遍 —— 超时一处硬编码 180s 而另一处可配（用户调大只对一个入口生效），RAG_USE_CONTEXT 只在 app.py 读而别的入口靠转发（chat.py 漏过） | 删掉 `app._stream_ollama`，四个入口统一 `from ollama_client import …`；`RAG_USE_CONTEXT` 移到 `rag_engine`。护栏：断言四个入口拿到的是**同一个** `stream_chat` 对象与同一份常量，并用 AST 禁止入口再读这些环境变量 |
+| D12 | `rag_engine` 的常量在 import 时求值，它自己却**不** `load_dotenv()`；此前靠"import 了 self-load 的 query_rewrite 且那次 import 恰好在配置段之前"侥幸成立，挪一下 import 就全仓库 `.env` 失效 | `.env` 加载收进单源（`override=False`）；子进程断言 .env 的显式非默认值真的到达模块 **且** 命令行环境变量仍然优先 |
+| D13 | **生成侧有两份同逻辑实现**：`app._stream_ollama(payload)` 与 `ollama_client.stream_chat(messages)`，且 MODEL / THINK / NUM_CTX / NUM_PREDICT / OLLAMA_TIMEOUT 在两边各读一遍 —— 超时一处硬编码 180s 而另一处可配（用户调大只对一个入口生效），RAG_USE_CONTEXT 只在 app.py 读而别的入口靠转发（chat.py 漏过） | 删掉重复的 `_stream_ollama`，四个入口统一用同一个 `stream_chat`；`RAG_USE_CONTEXT` 收进引擎侧。护栏：`rag.py` 里 `def stream_chat(` **只能出现一次**，MODEL/THINK/NUM_CTX/NUM_PREDICT/OLLAMA_TIMEOUT 各只能赋值一次 |
 | D14 | `chat.py` 漏传 `use_context`，`RAG_USE_CONTEXT=0` 在它那里静默失效（app/api 都传了） | 抽 `rag_engine.plan_generation()`：三个入口共用同一个装配函数（use_context / low_evidence / 硬拒答 / 历史预算全在里面），入口只剩渲染 |
-| D15 | **同一份知识写在多处 → 必然分叉**（结构类，不是行为类）。实测三例：`compare_ab` 抄了一份召回管线（抄漏 `with_payload` 而崩）、`verify_qdrant` 抄了一份抽样检查（缺守卫、缺去重）、`chat.py` 抄了一份装配（漏 `use_context`）。同类还有：分块 schema 被声明 5 遍、`steps` 键名散落 8 个文件、`check_health` 与 `verify_qdrant` 各写一份抽样检查、`ab_retrieval` 与 `eval_runner` 各写一份跑探针的循环 | 全部收敛到单源：schema → `_PAYLOAD_SPEC`（写读两端派生）；steps 键 → `STEP_*` 常量且**写权收回 rag_engine**（`plan_generation` 产出上下文装配/历史裁剪，入口只 `steps.update(plan["trace"])`）；抽样检查 → `sample_vector_coverage`；跑探针 → `eval_runner.run_probes_with`；一轮序列 → **新模块 `rag_turn.run_turn`**，app/api/chat 只渲染事件。护栏：`TestContractsHaveSingleSource` 用 AST 断言"只允许一个写者/一个实现" |
+| D15 | **同一份知识写在多处 → 必然分叉**（结构类，不是行为类）。实测三例：`compare_ab` 抄了一份召回管线（抄漏 `with_payload` 而崩）、`verify_qdrant` 抄了一份抽样检查（缺守卫、缺去重）、`chat.py` 抄了一份装配（漏 `use_context`）。同类还有：分块 schema 被声明 5 遍、`steps` 键名散落 8 个文件、`check_health` 与 `verify_qdrant` 各写一份抽样检查、`ab_retrieval` 与 `eval_runner` 各写一份跑探针的循环 | 全部收敛到单源：schema → `_PAYLOAD_SPEC`（写读两端派生）；steps 键 → `STEP_*` 常量且**写权收回 rag_engine**（`plan_generation` 产出上下文装配/历史裁剪，入口只 `steps.update(plan["trace"])`）；抽样检查 → `sample_vector_coverage`；跑探针 → `eval_runner.run_probes_with`；一轮序列 → `run_turn` 事件流，三个 UI 只渲染事件。护栏：`TestContractsHaveSingleSource` 用 AST 断言"只允许一个写者/一个实现" |
+| D16 | **19 个源文件 → 单个 `rag.py`**（结构合并）。合并本身只省约 8.5% 的行，拿掉的是**模块边界**这个「防止同一件事写两处」的机制 —— 而 D9/D12/D13/D14/D15 的成因全是「多个模块各自做同一件事」。在单文件里这些成因结构上不存在 | 按依赖顺序分 9 节，每节保留原文件 docstring 作章节说明；重型依赖留在函数内惰性 import，保住 `pytest -m unit` 的零依赖可跑；两个 UI 用 `RAG_UI` 切换。合并工具做过**逐行对拍**（除 import 上移/改名/去前缀外一个字未动） |
 
 ### 其他已修缺陷（不在 D 表，但同样是"会静默出错"的那类）
 
@@ -182,12 +213,12 @@ temporal / recall_detail，见 `VALID_MULTITURN_KINDS`；每类的失手原因�
 | `chapter_parse` | 回目正则要求"回"后紧跟空白 → "第一回"单独成行时不匹配；**漏末回会被并进上一回 body 且不报错** | 分隔符改前瞻 `(?=[^\S\n]\|$)`；新增"漏尾审计"：正文里出现编号 == 已识别回数+1 的宽松回目时硬失败（对当前四本书零误报：水浒/西游/三国 宽松命中数 == 严格命中数，红楼梦多出的两条编号为 4/38，均已在集合内） |
 | `chapter_parse` | 注释声称兼容全角阿拉伯数字，字符类里只有 `0-9`（`chinese_to_int` 的全角分支永远不可达） | 字符类补 `\uff10-\uff19` |
 | `chapter_parse.chinese_to_int` | "万"被纳入"相邻单位必须递减"的校验 → `一万` ✔ 而 `十万`/`二十万` ✘ | 把 `unit == 10000` 的节结算**提到递减校验之前** |
-| `compare_ab.py` | `with_payload=False` 却读 `p.payload`（恒为 None）→ 工具**第一个探针即崩** | 改 `with_payload=True`，且字典构造统一走 `RE.chunk_from_payload`（`_get_chunks` 用的同一个函数） |
-| `compare_chunks.py` | 字段表漏 `parent_id / chapter_*`，未登记字段被静默忽略 → 对"零影响"改动给**假绿** | 补全字段表；新增**模式漂移自检**：产物出现未登记字段直接报错退出 |
-| `verify_qdrant.py` | 混合路是两通道**拼接未去重** → 命中数可超过分母上限（能打印出 `4/2`），而稠密侧无重复，两侧口径不对等 | 按 id 去重；并把 `命中数 > 上限` 变成断言（工具先能发现自己坏了） |
-| `verify_qdrant.py` | 诊断代码在它要诊断的故障下自己崩（首条缺稀疏向量 → KeyError；抽样为空 → IndexError） | 空抽样与缺失向量都用 `.get()` + 显式报告，且稠密/稀疏**对称**报告 |
-| `reindex_sparse.py` | 空集合时两处一致性检查恒真（`0==0`）→ 打印"完成"并 `return 0` | `total == 0` 直接失败退出；两遍写（改向量 / 写指纹）合并成一趟，避免中途中断留下"稀疏已换、指纹未换" |
-| `check_health.py` | 外层 except 把所有异常报成"无法连接 Qdrant Docker服务" → 本地 `chunks.json` 损坏被误诊成 Docker 没起 | 本地文件读取自带 try/except，报出真实原因 |
+| `rag.py compare-ab` | `with_payload=False` 却读 `p.payload`（恒为 None）→ 工具**第一个探针即崩** | 改 `with_payload=True`，且字典构造统一走 `RE.chunk_from_payload`（`_get_chunks` 用的同一个函数） |
+| `rag.py compare-chunks` | 字段表漏 `parent_id / chapter_*`，未登记字段被静默忽略 → 对"零影响"改动给**假绿** | 补全字段表；新增**模式漂移自检**：产物出现未登记字段直接报错退出 |
+| `rag.py verify-qdrant` | 混合路是两通道**拼接未去重** → 命中数可超过分母上限（能打印出 `4/2`），而稠密侧无重复，两侧口径不对等 | 按 id 去重；并把 `命中数 > 上限` 变成断言（工具先能发现自己坏了） |
+| `rag.py verify-qdrant` | 诊断代码在它要诊断的故障下自己崩（首条缺稀疏向量 → KeyError；抽样为空 → IndexError） | 空抽样与缺失向量都用 `.get()` + 显式报告，且稠密/稀疏**对称**报告 |
+| `rag.py reindex-sparse` | 空集合时两处一致性检查恒真（`0==0`）→ 打印"完成"并 `return 0` | `total == 0` 直接失败退出；两遍写（改向量 / 写指纹）合并成一趟，避免中途中断留下"稀疏已换、指纹未换" |
+| `rag.py health` | 外层 except 把所有异常报成"无法连接 Qdrant Docker服务" → 本地 `chunks.json` 损坏被误诊成 Docker 没起 | 本地文件读取自带 try/except，报出真实原因 |
 | `app.py` | `THINK=0` 时 `done_reason=length`（答案被截断）的告警整块不执行 | 截断判定移出 `if think_status is not None`，改用 `st.warning` |
 | `app.py` | 端口 8501 被别的进程占用时误报"Streamlit 服务已在运行"并 `exit 0` | 端口占用但 `_streamlit_pids()` 为空 → 报"端口被占用"并 `exit 1` |
 | `app.py` | 每轮把整份 trace（同一批正文存两份，20~40KB/轮）写进 `session_state`，每轮 rerun 全量重建 | `_slim_trace()` 只留计数/名次/id；**保留 `上下文装配 → messages`**（"资料进没进"的唯一证据） |
@@ -264,10 +295,10 @@ RAG_QUERY_REWRITE              # 多轮指代消解的**开关**，取值不在�
                                #   **2026-09-19 起 .env 是 1**，与"恢复 _SYSTEM_PROMPT
                                #   四行规则"配套：实测"prompt 置空 + 开关打开"是最差的
                                #   一档（topic@k 66.7%），两者不可分开动。
-                               #   想确认当前生效值：python check_health.py
+                               #   想确认当前生效值：python rag.py health
                                #   或 GET /health 的 query_rewrite 字段。
 RAG_THINK / RAG_NUM_CTX / RAG_NUM_PREDICT
-# 生成侧装配（三个入口共用 rag_engine.build_generation_messages）
+# 生成侧装配（三个入口共用 plan_generation / build_generation_messages）
 RAG_HISTORY_MAX_TOKENS = 1500  # 兜底历史预算；**正常不用它** —— 调用方一律用
                                #   history_budget(num_ctx, num_predict, system) 现算：
                                #   实测 system 占 1620~2590 token、num_predict 再扣 4096，
@@ -309,27 +340,27 @@ docker compose up -d
 
 ### 添加新书
 1. 把 `.txt` 文件放到 `books/` 目录
-2. 运行 `python app.py process`
-3. 运行 `python app.py index`
+2. 运行 `python rag.py process`
+3. 运行 `python rag.py index`
 
 非章回体文本不会崩：`parse_chapters` 找不到回目时整本按单段处理（`chapter_index=0`）。
 
 ### 改了词表（别名/停用词）
 ```bash
-python tools/verify_lexicon.py   # 先校验：语料接地 + 停用词里不得有否定词
-python reindex_sparse.py         # 只重建稀疏向量（十几秒，不必重算 embedding）
+python rag.py lexicon   # 先校验：语料接地 + 停用词里不得有否定词
+python rag.py reindex-sparse         # 只重建稀疏向量（十几秒，不必重算 embedding）
 ```
-不跑的话检索端与 `check_health.py` 会报警"词表与索引不一致"——那是**对的**：
+不跑的话检索端与 `rag.py health` 会报警"词表与索引不一致"——那是**对的**：
 查询侧现算的词空间与索引侧对不上，稀疏通道会静默错配。
 
 ### 健康检查
 ```bash
-python check_health.py
+python rag.py health
 ```
 
 ### HTTP API
 ```bash
-python api.py                    # 默认 127.0.0.1:8000
+python rag.py api                # 默认 127.0.0.1:8000
 curl -s localhost:8000/health
 curl -s -X POST localhost:8000/search -d '{"query":"武松打虎","top_k":5}'
 curl -s -X POST localhost:8000/ask    -d '{"query":"武松打虎"}'   # NDJSON 流
@@ -343,9 +374,9 @@ pytest -m slow
 
 ### 改多轮（改写 / 拼接 / 融合）
 ```bash
-python tools/ab_multiturn.py --label a                       # 现状，~4 分钟
-RAG_QUERY_FUSION=1 python tools/ab_multiturn.py --label b    # 一个状态一个进程！
-python tools/ab_multiturn.py --compare /tmp/ab_multiturn_a.json /tmp/ab_multiturn_b.json
+python rag.py ab-multiturn --label a                       # 现状，~4 分钟
+RAG_QUERY_FUSION=1 python rag.py ab-multiturn --label b    # 一个状态一个进程！
+python rag.py ab-multiturn --compare /tmp/ab_multiturn_a.json /tmp/ab_multiturn_b.json
 ```
 开关是 import 时常量，**同进程改环境变量不生效**（见"几个必须知道的坑"第 4 条）。
 
@@ -366,7 +397,7 @@ python tools/ab_multiturn.py --compare /tmp/ab_multiturn_a.json /tmp/ab_multitur
 4. **别把"文档里写了的环境变量"当已生效**：本仓库踩过**三次**——`RAG_QDRANT_HOST`
    （名字写错）、`RAG_ABSTAIN_RATIO`、以及 `RAG_QUERY_REWRITE`（D9：**import 顺序**
    决定 .env 生不生效，`import rag_engine` 在前就整个失效）。所以：①改配置前先 grep
-   代码确认它真被读取；②确认当前生效值用 `python check_health.py`（它现在会把
+   代码确认它真被读取；②确认当前生效值用 `python rag.py health`（它现在会把
    多轮改写开关的实际状态打出来），而不是读文档。
 5. **`RAG_RERANK_ON` 默认保持 `child`（已实测两轮，样本不足）**：24 条正向探针上
    `parent` 三项判别性指标同向更好（kw@k 83.3%→87.5%、MRR 0.8021→0.8472、
@@ -375,8 +406,8 @@ python tools/ab_multiturn.py --compare /tmp/ab_multiturn_a.json /tmp/ab_multitur
    探针驱动，n=24 不足以据此改默认值。要下结论请先扩充探针集。
    **融合权重已扫描：等权 1:1 就是最优**（`sparse=0.5` 与 `dense=2.0` 都降到
    kw@k 79.2%、MRR 0.7604；`sparse=2.0` 与等权同值），无需调整。
-   A/B 用 `python tools/ab_retrieval.py`（同一评测器跑两次，只改环境变量）；
-   重建后的全套复核用 `python tools/verify_after_rebuild.py`
+   A/B 用 `python rag.py ab-retrieval`（同一评测器跑两次，只改环境变量）；
+   重建后的全套复核用 `python rag.py after-rebuild`
    （确定性双跑 diff + 拒答阈值扫描 + 分类指标）。
 6. **别把"给模型的上下文"寄生在 system 上**（2026-09-19 拆开，原因见下）：
    旧写法把检索正文拼进 system（`CONTEXT_SYSTEM_PROMPT` 里的 `{context}`），于是
@@ -396,11 +427,11 @@ python tools/ab_multiturn.py --compare /tmp/ab_multiturn_a.json /tmp/ab_multitur
 - **分块**: 按「回」分段 → sentencex 单层分句（引语不可切）→ 语义定界 → 父块(512) / 子块(128, 重叠 32)
 - **嵌入模型**: BGE-base-zh-v1.5 (768维)，CLS pooling，query 侧加 instruction
 - **重排序模型**: BGE-reranker-base (fp16)
-- **多轮**: `query_rewrite.py` 用本地 Ollama 做指代消解，**三档降级链**
+- **多轮**: 本地 Ollama 做指代消解，**三档降级链**
   （LLM 改写 → 拼接上一轮用户问句 → 字面原句，每档都记进推理链的 `source`/`reason`）；
   `RAG_QUERY_FUSION` 可把 LLM 档与拼接档**各召回一次再融合**。
   ⚠️ "两路失手点互补（LLM 独家救 assistant_only、拼接档独家救 entity_switch）"
   这一结论是在 **`topic@k` 还不认别名时**做的独家命中分析，**未在新口径下复验**，
-  引用前请先重跑 `tools/ab_multiturn.py`（见 MULTITURN_PLAN.md §1.1 的注记）
-- **UI**: Streamlit；**HTTP API**: `api.py`（标准库，零新依赖）
+  引用前请先重跑 `python rag.py ab-multiturn`（见 MULTITURN_PLAN.md §1.1 的注记）
+- **UI**: Streamlit（`RAG_UI=app|chat|bot`）；**HTTP API**: 标准库 `ThreadingHTTPServer`，零新依赖
 - **生成模型**: Ollama（取自 `.env` 的 `MODEL`，当前 qwen3.5:4b-q4_K_M）

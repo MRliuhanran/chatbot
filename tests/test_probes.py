@@ -316,7 +316,7 @@ class TestTopicMetricIsAliasAware:
     全部 topic@k=N，看起来像"检索系统性失手"，实际是度量假象。
 
     归一化函数由调用方注入（probes.py 刻意零依赖），这里用一个等价于
-    `rag_engine.normalize_aliases` 语义的小桩来钉住行为。
+    `rag.normalize_aliases` 语义的小桩来钉住行为。
     """
 
     #: 只认"云长/关公 → 关羽"这一条，够验证注入路径与比对逻辑

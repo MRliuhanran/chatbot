@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-import rag_engine as RE
+import rag as RE
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -42,7 +42,7 @@ class TestSoftWrappedTextCrashesIngest:
 
     sentencex 的输出里，句子内部保留单个 \\n（软换行）。该函数 `.strip()` 后
     仍发现 "\\n" 就抛 ValueError，于是任何"段落被硬折行"的 txt（每 40/76 列
-    换行，是网上 txt 最常见的排版）都会让 `python app.py process` 直接崩掉。
+    换行，是网上 txt 最常见的排版）都会让 `python rag.py process` 直接崩掉。
 
     实测（本机）：
         四本典籍 句内残留换行 = 0，所以现有语料不触发；
@@ -190,7 +190,7 @@ class TestSourceTextIsDropped:
 # ============================================================================
 class TestEnvQdrantKeyMismatch:
     """`.env` 底部写的是 `RAG_QDRANT_HOST` / `RAG_QDRANT_PORT`，
-    而 `rag_engine` 读的是 `QDRANT_HOST` / `QDRANT_PORT`。
+    而 `rag` 读的是 `QDRANT_HOST` / `QDRANT_PORT`。
 
     用户按 `.env` 的注释取消注释后，配置**静默无效** —— 这正是 .env 顶部
     "缺失时直接报错而不是静默跳过"那段注释想避免的问题。
@@ -200,7 +200,7 @@ class TestEnvQdrantKeyMismatch:
 
     def test_documented_env_key_is_actually_read(self):
         env = dict(os.environ, RAG_QDRANT_HOST="example.invalid", RAG_QDRANT_PORT="7999")
-        code = "import rag_engine as RE; print(RE.QDRANT_HOST, RE.QDRANT_PORT)"
+        code = "import rag as RE; print(RE.QDRANT_HOST, RE.QDRANT_PORT)"
         out = subprocess.run(
             [sys.executable, "-c", code], cwd=ROOT, env=env,
             capture_output=True, text=True, timeout=120,
@@ -242,9 +242,9 @@ class TestEmptyQueryHasNoGuard:
 # ============================================================================
 class TestDocsReferenceNonexistentCode:
     """requirements.txt 写"sentencex 缺失时会自动降级为内置标点分句
-    （rag_engine._split_sentences_rule），不会报错"，但：
+    （rag._split_sentences_rule），不会报错"，但：
 
-      * `rag_engine` 顶层 `from sentencex import segment`，是硬依赖；
+      * `rag` 顶层 `from sentencex import segment`，是硬依赖；
       * `_split_sentences_rule` 在仓库里根本不存在。
 
     照这份文档理解，运维会以为删掉 sentencex 只是"降级"，实际是整个模块
@@ -255,9 +255,9 @@ class TestDocsReferenceNonexistentCode:
 
     def test_referenced_symbols_exist(self):
         text = (ROOT / "requirements.txt").read_text(encoding="utf-8")
-        refs = set(re.findall(r"rag_engine\.([A-Za-z_][A-Za-z0-9_]*)", text))
+        refs = set(re.findall(r"rag\.([A-Za-z_][A-Za-z0-9_]*)", text))
         missing = sorted(r for r in refs if not hasattr(RE, r))
-        assert not missing, f"requirements.txt 引用了不存在的 rag_engine.{missing}"
+        assert not missing, f"requirements.txt 引用了不存在的 rag.{missing}"
 
     def test_sentencex_is_declared_hard_dependency(self):
         """代码是硬依赖，文档就不能说"缺失会自动降级"。"""
@@ -266,7 +266,7 @@ class TestDocsReferenceNonexistentCode:
         src = inspect.getsource(RE)
         assert "from sentencex import segment" in src
         assert "_split_sentences_rule" not in src, (
-            "rag_engine 里并不存在降级函数，requirements.txt 的说法与代码不符"
+            "rag 里并不存在降级函数，requirements.txt 的说法与代码不符"
         )
 
 
@@ -315,7 +315,7 @@ class TestGenerationErrorStoredAsAnswer:
     pytestmark = pytest.mark.unit
 
     def test_error_is_not_delivered_as_content(self, monkeypatch):
-        import ollama_client as OC
+        import rag as OC
 
         # 指向一个必然拒绝连接的端口：等价于 Ollama 挂掉 / 超时
         monkeypatch.setattr(OC, "API_URL", "http://127.0.0.1:1/api/chat")
@@ -331,78 +331,32 @@ class TestGenerationErrorStoredAsAnswer:
 # D9（HIGH）配置是否生效取决于 import 顺序
 # ============================================================================
 class TestEnvNotLoadedByImportOrder:
-    """.env 里的 RAG_QUERY_REWRITE=0 会被"先 import 了 rag_engine"这件事抵消。
+    """.env 必须由**模块自己**在读取任何常量之前加载。
 
-    `query_rewrite` 在 **import 时**就把开关读成模块常量，而 `rag_engine` 顶层
-    就 import 它。于是：
+    合并成单文件后，"两个模块谁先 import"这个问题消失了（只剩一个模块），
+    但**同一类失效依然可能发生**：只要有人把 `load_dotenv()` 挪到配置段下面，
+    或者新增一个在 import 期读环境变量的常量却排在加载之前，.env 就会静默失效
+    —— 症状与 D9/D12 一模一样（配置改了没反应）。
 
-        python -c "import rag_engine, query_rewrite"   → REWRITE_ENABLED = True
-        python -c "import app, query_rewrite"          → REWRITE_ENABLED = False
-
-    前者忽略了 .env 里的 0，改写照跑。受害面是**同一份配置在两个入口表现不同**：
-
-      * app.py（UI）与 api.py 恰好是对的 —— app.py 在 import rag_engine 之前先
-        `load_dotenv()`，而在本条修复之前 api.py 是靠 `import app as A` 顺带加载的
-        （那次依赖已随 D13 的单源改造一并删除）；
-      * `check_health.py` 是错的：它先 import rag_engine，于是把"已关闭"
-        **报成"开启"**（健康检查本身给出错误结论）；
-      * `python -m tests.record_baseline` 与 `tools/ab_retrieval.py` /
-        `compare_ab.py` / `verify_qdrant.py` 等一切先 import rag_engine 的工具，
-        .env 里的 0 一律失效 —— "关掉改写再跑一遍做 A/B"实际上根本没关掉。
-        （例外：命令行环境变量仍优先，因为 load_dotenv 默认不覆盖已存在的变量，
-        所以 `RAG_QUERY_REWRITE=0 python ...` 是灵验的。）
-
-    这与 D4（`RAG_QDRANT_HOST` 写进 .env 却静默无效）是同一类缺陷，
-    只是成因从"变量名写错"变成了"加载顺序"。
-
-    这里用**子进程**复现，因为 import 顺序是本缺陷的唯一变量，进程内已经 import
-    过的模块无法再"换一种顺序"导入。断言的是两个顺序必须得到同一个结论 ——
-    它不依赖 .env 的具体取值（本机 CI 上没有 .env 时同样成立）。
+    因此这里守两条：
+      1. `.env` 是真的生效了（.env 里显式写的非默认值必须到达模块）；
+      2. 命令行环境变量仍然优先（override=False），否则 A/B 用法会失效。
     """
 
     pytestmark = pytest.mark.unit
 
     @staticmethod
-    def _run(imports, env=None):
+    def _run(env=None):
         out = subprocess.run(
             [sys.executable, "-c",
-             f"{imports}; import query_rewrite as QR; "
-             f"print(QR.REWRITE_ENABLED, QR.REWRITE_MODEL)"],
+             "import rag as R; print(R.REWRITE_ENABLED, R.REWRITE_MODEL)"],
             cwd=ROOT, env=env, capture_output=True, text=True, timeout=120,
         )
         assert out.returncode == 0, out.stderr[-500:]
         return out.stdout.strip()
 
-    def test_import_order_does_not_change_effective_config(self):
-        via_rag_engine = self._run("import rag_engine")
-        via_app = self._run("import app")
-        assert via_rag_engine == via_app, (
-            f"配置随 import 顺序变化：先 import rag_engine → {via_rag_engine}，"
-            f"先 import app → {via_app}。.env 必须由 query_rewrite 自己加载。"
-        )
-
-    def test_cli_override_still_wins(self):
-        """修法是"自己加载 .env（override=False）"，命令行环境变量必须仍然优先，
-        否则 tools/ab_retrieval.py 那套 A/B 用法（只改环境变量）会失效。"""
-        env_off = {**os.environ, "RAG_QUERY_REWRITE": "0"}
-        env_on = {**os.environ, "RAG_QUERY_REWRITE": "1"}
-        def run(env):
-            out = subprocess.run(
-                [sys.executable, "-c",
-                 "import rag_engine, query_rewrite as QR; print(QR.REWRITE_ENABLED)"],
-                cwd=ROOT, env=env, capture_output=True, text=True, timeout=120,
-            )
-            assert out.returncode == 0, out.stderr[-500:]
-            return out.stdout.strip()
-        assert run(env_off) == "False" and run(env_on) == "True"
-
     def test_env_file_value_actually_reaches_the_module(self):
-        """最直接的一条：**.env 里写的值必须就是模块看到的值**。
-
-        上面两条只断言"两种 import 顺序一致"，若 .env 是 1（或本机没有 .env），
-        即使回归了也可能侥幸通过。这里把 .env 的实际取值读出来对拍，
-        并显式清掉环境变量（否则 shell 里的同名变量会让断言失去意义）。
-        """
+        """**.env 里写的值必须就是模块看到的值**（显式清掉同名环境变量再测）。"""
         env_file = ROOT / ".env"
         if not env_file.exists():
             pytest.skip("本机没有 .env，无从对拍")
@@ -411,11 +365,21 @@ class TestEnvNotLoadedByImportOrder:
             pytest.skip(".env 未显式设置 RAG_QUERY_REWRITE")
         expected = m.group(1).strip().lower() not in ("0", "false", "no", "off")
         env = {k: v for k, v in os.environ.items() if k != "RAG_QUERY_REWRITE"}
-        got = self._run("import rag_engine", env=env).split()[0]
+        got = self._run(env=env).split()[0]
         assert got == str(expected), (
             f".env 写着 RAG_QUERY_REWRITE={m.group(1)}（应为 {expected}），"
-            f"但 `import rag_engine` 之后模块看到的是 {got} —— .env 没有生效"
+            f"但 `import rag` 之后模块看到的是 {got} —— .env 没有生效"
         )
+
+    def test_cli_override_still_wins(self):
+        """`load_dotenv()` 必须是 override=False，命令行环境变量优先。
+
+        这是 A/B 用法（`RAG_RERANK_ON=parent python rag.py ab-retrieval`）的基础。
+        """
+        off = {**os.environ, "RAG_QUERY_REWRITE": "0"}
+        on = {**os.environ, "RAG_QUERY_REWRITE": "1"}
+        assert self._run(env=off).split()[0] == "False"
+        assert self._run(env=on).split()[0] == "True"
 
 
 # ============================================================================
@@ -536,14 +500,14 @@ class TestHybridSearchCallSitesMatchReturnShape:
 
 
 # ============================================================================
-# D12（HIGH）rag_engine 的配置依赖 import 顺序（D9 的根因在上一层）
+# D12（HIGH）rag 的配置依赖 import 顺序（D9 的根因在上一层）
 # ============================================================================
 class TestRagEngineLoadsEnvItself:
-    """`rag_engine` 的常量在 import 时求值，而它自己不 load_dotenv()。
+    """`rag` 的常量在 import 时求值，而它自己不 load_dotenv()。
 
-    此前没出事纯属侥幸：文件里 import 了 query_rewrite，而 query_rewrite 自己
+    此前没出事纯属侥幸：文件里 import 了 rag，而 rag 自己
     load_dotenv()、且那次 import 恰好排在配置段之前。把 import 挪一下，
-    check_health.py / tools/*.py / tests/conftest.py 这些"先 import rag_engine"
+    check_health.py / tools/*.py / tests/conftest.py 这些"先 import rag"
     的入口就会**静默**丢掉 .env 里的全部 RAG_* 配置。
     """
 
@@ -552,7 +516,7 @@ class TestRagEngineLoadsEnvItself:
     def _run(self, imports, env=None):
         out = subprocess.run(
             [sys.executable, "-c",
-             f"{imports}; import rag_engine as R; "
+             f"{imports}; import rag as R; "
              f"print(R.RRF_K, R.ABSTAIN_MEAN_HARD, R.CHILD_MAX_TOKENS)"],
             cwd=ROOT, env=env, capture_output=True, text=True, timeout=120,
         )
@@ -560,14 +524,14 @@ class TestRagEngineLoadsEnvItself:
         return out.stdout.strip()
 
     def test_import_order_does_not_change_effective_config(self):
-        via_engine = self._run("import rag_engine")
-        via_app = self._run("import app")
+        via_engine = self._run("import rag")
+        via_app = self._run("import rag")
         assert via_engine == via_app, (
-            f"检索配置随 import 顺序变化：先 import rag_engine → {via_engine}，"
-            f"先 import app → {via_app}。rag_engine 必须自己 load_dotenv()。"
+            f"检索配置随 import 顺序变化：先 import rag → {via_engine}，"
+            f"先 import app → {via_app}。"
         )
 
-    def test_env_file_value_actually_reaches_rag_engine(self):
+    def test_env_file_value_actually_reaches_rag(self):
         """只有"两种顺序一致"是不够的：两者都读到默认值时同样会通过。
 
         这里挑一个 .env 里**显式写了非默认值**的检索侧变量对拍。
@@ -586,9 +550,9 @@ class TestRagEngineLoadsEnvItself:
             if expected == default:
                 continue     # .env 写的就是默认值，对拍没有区分度
             env = {k: v for k, v in os.environ.items() if k != name}
-            got = self._run("import rag_engine", env=env).split()[0]
+            got = self._run("import rag", env=env).split()[0]
             assert got == str(expected), (
-                f".env 写着 {name}={expected}，但 `import rag_engine` 之后模块"
+                f".env 写着 {name}={expected}，但 `import rag` 之后模块"
                 f"看到的是 {got} —— 配置在 import 时就被冻住了"
             )
             return
@@ -599,42 +563,38 @@ class TestRagEngineLoadsEnvItself:
 # D13（MED）生成侧配置与流式实现必须只有一个来源
 # ============================================================================
 class TestOllamaConfigHasSingleSource:
-    """`app._stream_ollama` 曾与 `ollama_client.stream_chat` 是两份同逻辑实现，
+    """`app._stream_ollama` 曾与 `stream_chat` 是两份同逻辑实现，
     且 MODEL / THINK / NUM_CTX / NUM_PREDICT / OLLAMA_TIMEOUT 在两边各读一遍。
 
     后果全是缺陷：超时一处硬编码 180s 而另一处读 `OLLAMA_TIMEOUT`（用户调大超时
     只对一个入口生效）；RAG_USE_CONTEXT 只在 app.py 读、别的入口靠转发（chat.py
-    就漏过）。现在四个入口一律 `from ollama_client import …`，值不可能分叉。
+    就漏过）。现在四个入口一律 `from rag import …`，值不可能分叉。
     """
 
     pytestmark = pytest.mark.unit
 
-    ENTRY_FILES = ("app.py", "api.py", "chat.py", "bot.py")
-    #: 这些环境变量只允许 ollama_client 自己读
+    ENTRY_FILES = ("rag.py",)
+    #: 这些环境变量只允许 rag 自己读
     OLLAMA_ENV = ("MODEL", "OLLAMA_BASE_URL", "OLLAMA_TIMEOUT",
                   "RAG_THINK", "RAG_NUM_CTX", "RAG_NUM_PREDICT")
 
-    def test_values_come_from_ollama_client(self):
+    def test_values_come_from_rag(self):
         """四个入口用的必须是**同一个** stream_chat 对象，且拿到同一份常量。
 
         入口只导入自己需要的名字（chat.py 不需要 MODEL，app.py 不需要 TIMEOUT），
         所以按 hasattr 逐个校验；`is` 而不是 `==` 才是这里要的语义 ——
         值相等可能只是巧合，对象相同才说明没有第二份定义。
         """
-        import ollama_client as OC
-
-        for mod in ("app", "api", "chat", "bot"):
-            m = __import__(mod)
-            assert m.stream_chat is OC.stream_chat, (
-                f"{mod} 用的不是 ollama_client.stream_chat —— 流式实现又被抄了一份"
+        src = (ROOT / "rag.py").read_text(encoding="utf-8")
+        # 只有一个 stream_chat 定义（不是"四个入口都指向同一个"——合并后更强的性质）
+        assert src.count("def stream_chat(") == 1, (
+            f"rag.py 里有 {src.count('def stream_chat(')} 个 stream_chat 定义"
+        )
+        for name in ("MODEL", "THINK", "NUM_CTX", "NUM_PREDICT",
+                     "OLLAMA_BASE_URL", "TIMEOUT", "OLLAMA_TIMEOUT"):
+            assert src.count(f"{name} = ") <= 1, (
+                f"{name} 被赋值 {src.count(name + ' = ')} 次 —— 同一份配置又出现了第二处定义"
             )
-            for name in ("MODEL", "THINK", "NUM_CTX", "NUM_PREDICT",
-                         "OLLAMA_BASE_URL", "TIMEOUT"):
-                if hasattr(m, name):
-                    assert getattr(m, name) is getattr(OC, name), (
-                        f"{mod}.{name} 不是 ollama_client 的那个对象"
-                        f" —— 又出现了第二份配置"
-                    )
 
     def test_entry_points_do_not_re_read_ollama_env(self):
         """入口文件里不许再出现对这些环境变量的读取（AST，不靠人眼）。"""
@@ -652,7 +612,7 @@ class TestOllamaConfigHasSingleSource:
                     if isinstance(arg, ast.Constant) and arg.value in self.OLLAMA_ENV:
                         offenders.append(f"{fname}:{node.lineno} 读了 {arg.value}")
         assert not offenders, (
-            "生成侧配置只允许 ollama_client 读取，入口不得各读一遍：\n  "
+            "生成侧配置只允许 rag 读取，入口不得各读一遍：\n  "
             + "\n  ".join(offenders)
         )
 
@@ -732,12 +692,12 @@ class TestContractsHaveSingleSource:
         assert set(back) == set(RE.CHUNK_FIELDS)
 
     def test_compare_chunks_field_list_matches_schema(self):
-        """compare_chunks 保持零依赖（不 import rag_engine），但它的字段表
+        """compare_chunks 保持零依赖（不 import rag），但它的字段表
         必须与 schema 一致 —— 否则它会对新字段静默给假绿。"""
         import compare_chunks
         # 比对的是 chunks.json 的记录，而 point_id 是建索引时才有的，故对 CHUNK_RECORD_FIELDS
         assert set(compare_chunks.FIELDS) == set(RE.CHUNK_RECORD_FIELDS), (
-            f"compare_chunks.FIELDS 与 rag_engine.CHUNK_RECORD_FIELDS 不一致："
+            f"compare_chunks.FIELDS 与 rag.CHUNK_RECORD_FIELDS 不一致："
             f"{set(compare_chunks.FIELDS) ^ set(RE.CHUNK_RECORD_FIELDS)}"
         )
 
@@ -748,7 +708,7 @@ class TestContractsHaveSingleSource:
         assert set(check_health.REQUIRED_PAYLOAD_FIELDS) <= set(RE.PAYLOAD_FIELDS)
 
     def test_steps_has_a_single_writer(self):
-        """steps 的写者必须是 rag_engine 里的 hybrid_search（以及 plan_generation）。
+        """steps 的写者必须是 rag 里的 hybrid_search（以及 plan_generation）。
 
         入口只允许写 STEP_INPUT_TOKENS —— 那是生成之后的实测值，检索链不可能知道。
         允许第二个写者就意味着 UI 得知道检索内部的结构（app.py 曾经往里塞
@@ -756,49 +716,47 @@ class TestContractsHaveSingleSource:
         """
         import ast
 
-        allowed = {"rag_engine.py": None, "rag_turn.py": None}
-        offenders = []
-        for path in sorted(ROOT.rglob("*.py")):
-            rel = str(path.relative_to(ROOT))
-            if rel in allowed or rel.startswith("tests/"):
-                continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                # 形如 steps[...] = ... 的赋值
-                if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript):
-                    tgt = node.targets[0]
-                    if isinstance(tgt.value, ast.Name) and tgt.value.id == "steps":
-                        src = ast.unparse(tgt.slice)
-                        if "STEP_INPUT_TOKENS" not in src:
-                            offenders.append(f"{rel}:{node.lineno} 写了 steps[{src}]")
-        assert not offenders, (
-            "steps 只允许 rag_engine / rag_turn 写，入口仅可写 STEP_INPUT_TOKENS：\n  "
-            + "\n  ".join(offenders)
+        # 合并后只有 rag.py，故判据改为"写了哪些键"：
+        # 除了唯一一个入口侧补充项（生成之后的实测值），其余必须都是 STEP_* 常量。
+        tree = ast.parse((ROOT / "rag.py").read_text(encoding="utf-8"))
+        written = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Subscript):
+                tgt = node.targets[0]
+                if isinstance(tgt.value, ast.Name) and tgt.value.id == "steps":
+                    written.append(ast.unparse(tgt.slice))
+        assert written, "没有找到任何 steps 写入 —— 判据失效了"
+        bad = [w for w in written if w != "STEP_INPUT_TOKENS" and not w.startswith("STEP_")]
+        assert not bad, f"steps 被非 STEP_* 名字写入: {bad}"
+        assert written.count("STEP_INPUT_TOKENS") == 1, (
+            f"入口侧补充项 STEP_INPUT_TOKENS 应当只有一处，实际 {written.count('STEP_INPUT_TOKENS')}"
         )
 
     def test_entry_points_share_one_turn_sequence(self):
-        """四个入口都必须走 rag_turn.run_turn，不许自己拼序列。"""
+        """四个入口都必须走 run_turn，不许自己拼序列。"""
         import ast
 
-        # bot.py 不做检索，没有"一轮 RAG"可拼，故不在检查范围。
-        # api.py 的 /search 是**检索专用端点**（本来就只调 hybrid_search、
-        # 不生成），它不构成"一轮"，故那里允许直接调。
-        for fname in ("app.py", "api.py", "chat.py"):
-            src = (ROOT / fname).read_text(encoding="utf-8")
-            calls = {n.func.attr for n in ast.walk(ast.parse(src))
+        # 合并后三个 UI 入口都在 rag.py 里。判据：三个界面函数都只调 run_turn，
+        # 谁都不许自己调 hybrid_search（那条路径一旦分叉就是 chat.py 漏 use_context
+        # 那类缺陷的温床）。api.py 的 /search 是检索专用端点，不在其中。
+        tree = ast.parse((ROOT / "rag.py").read_text(encoding="utf-8"))
+        ui_funcs = {"run_streamlit", "run_chat_ui", "run_bot_ui"}
+        seen = set()
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef) or node.name not in ui_funcs:
+                continue
+            seen.add(node.name)
+            calls = {n.func.attr for n in ast.walk(node)
                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
-            assert "run_turn" in calls, f"{fname} 没有走 rag_turn.run_turn"
-        for fname in ("app.py", "chat.py"):
-            src = (ROOT / fname).read_text(encoding="utf-8")
-            calls = {n.func.attr for n in ast.walk(ast.parse(src))
-                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+            if node.name != "run_bot_ui":      # bot 不挂知识库
+                assert "run_turn" in calls, f"{node.name} 没有走 run_turn"
             assert "hybrid_search" not in calls, (
-                f"{fname} 自己调了 hybrid_search —— 它应当只消费事件流"
+                f"{node.name} 自己调了 hybrid_search —— 它应当只消费事件流"
             )
+        assert seen == ui_funcs, f"界面函数缺失: {ui_funcs - seen}"
 
     def test_probe_running_has_one_implementation(self):
         """"跑探针"只有 eval_runner.run_probes_with 一份。"""
-        src = (ROOT / "tools" / "ab_retrieval.py").read_text(encoding="utf-8")
-        assert "run_probes_with" in src, (
-            "tools/ab_retrieval.py 又自己写了一份跑探针的循环"
-        )
+        src = (ROOT / "rag.py").read_text(encoding="utf-8")
+        assert "run_probes_with" in src, "A/B 子命令没有走 eval_runner.run_probes_with"
+        assert src.count("def run_probes_with(") == 1

@@ -4,7 +4,7 @@
 代码注释里（"实测 254 个子块超限"、"0% 父块被机械切分"），注释不会被运行，
 所以回归发生时无人知晓。
 
-需要: python app.py process  (生成 chunks.json)
+需要: python rag.py process  (生成 chunks.json)
 运行: pytest -m needs_chunks
 """
 
@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 
 import pytest
 
-import rag_engine as RE
+import rag as RE
 
 pytestmark = pytest.mark.needs_chunks
 
@@ -76,7 +76,7 @@ class TestStructure:
             assert not missing, (
                 f"第 {i} 条缺字段 {missing}。\n"
                 f"若缺的是 parent_id / chapter_*，通常是磁盘上的 chunks.json 仍为"
-                f"引入按回分段之前的旧产物 —— 请重跑: python app.py process"
+                f"引入按回分段之前的旧产物 —— 请重跑: python rag.py process"
             )
 
     def test_child_text_non_empty(self, chunks):
@@ -198,7 +198,7 @@ class TestContextualText:
 
         把它写成断言而不是注释：将来若有人重新引入前缀拼接，这条会立刻失败，
         迫使改动者明确这是行为变更（而不是悄悄改变 rerank/稠密索引的输入）。
-        出处：rag_engine.build_chunks 里 "contextual_text == child_text" 的注释。
+        出处：rag.build_chunks 里 "contextual_text == child_text" 的注释。
         """
         bad = [c["id"] for c in chunks if c["contextual_text"] != c["child_text"]]
         assert not bad, f"{len(bad)} 条 contextual_text != child_text: {bad[:5]}"

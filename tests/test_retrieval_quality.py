@@ -19,7 +19,7 @@ import os
 
 import pytest
 
-import rag_engine as RE
+import rag as RE
 from tests.eval_runner import (
     aggregate,
     multiturn_degrade_state,

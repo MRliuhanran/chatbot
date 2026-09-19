@@ -1,4 +1,4 @@
-"""chapter_parse 的测试：合成文本（L0）+ 真实语料不变量。
+"""章回体切分的测试：合成文本（L0）+ 真实语料不变量。
 
 分两层，理由与项目其余测试一致 —— 资源缺失时 skip 而不是 fail：
 
@@ -19,7 +19,7 @@ import os
 
 import pytest
 
-import chapter_parse as CP
+import rag as CP
 
 BOOKS_DIR = "books"
 
