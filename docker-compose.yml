@@ -10,16 +10,14 @@ services:
       - "6334:6334"   # gRPC API
     volumes:
       - ./qdrant_storage:/qdrant/storage
-      - ./qdrant/config.yaml:/qdrant/config/production.yaml
+      - ./qdrant_config/config.yaml:/qdrant/config/production.yaml
     environment:
       - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}
     healthcheck:
-      # 原实现用 curl，但 qdrant 官方镜像里没有 curl/wget，
-      # 导致容器永远处于 unhealthy（实测 FailingStreak 1031）。
-      # 该镜像自带 bash，故用 bash 的 /dev/tcp 直接发 HTTP 请求并校验状态码：
-      # 既能发现端口未监听，也能发现服务未真正就绪。
-      # 注意 $$line：compose 会把 $ 当变量插值，必须用 $$ 转义成字面量 $，
-      # 否则命令里的变量会被替换成空串、探测永远失败。
+      # 不能用 curl：qdrant 官方镜像没有 curl/wget（原实现让容器永远 unhealthy，
+      # 实测 FailingStreak 1031）。镜像自带 bash，故用 /dev/tcp 发 HTTP 请求并校验
+      # 状态码 —— 既能发现端口未监听，也能发现服务未真正就绪。
+      # $$line 必须双写：compose 会把单个 $ 当变量插值，会让探测永远失败。
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333; printf \"GET /healthz HTTP/1.0\\r\\n\\r\\n\" >&3; read -r line <&3; [[ $$line == *200* ]]'"]
       interval: 30s
       timeout: 10s

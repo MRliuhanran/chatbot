@@ -9,19 +9,19 @@ models/
 
 # ---- 索引与缓存（可重建：process + index）----
 qdrant_storage/
-cache_v2/
+artifacts/
 *.pkl
 
 # ---- 源文本（体积大，可重新获取）----
-books/
+corpus/
 
 # ---- 运行时产物 ----
 *.log
 *.pid
 debug_*.png
-test_*_report.json
-.pytest_cache/
-.deepeval/
+
+# ---- 本地备份 ----
+bak/
 
 # ---- 密钥 ----
 .env
