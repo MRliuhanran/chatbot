@@ -92,14 +92,16 @@ _download_model() {
     done
     if [ "${_ok}" != 1 ] && command -v huggingface-cli >/dev/null 2>&1; then
         _log "⚠️ ModelScope 下载不完整，改用 HF 镜像重试: ${_name}"
-        if huggingface-cli download "${_repo}" --local-dir "${_dir}" >/dev/null 2>&1; then
+        # 只按清单文件下（reranker 仓库里还有 pytorch_model.bin/onnx 冗余，全量会多拉 2.1G）
+        if huggingface-cli download "${_repo}" --local-dir "${_dir}" "$@" >/dev/null 2>&1; then
             _ok=1
         fi
     fi
-    if [ -s "${_dir}/${_weight}" ]; then
+    if [ "${_ok}" = 1 ] && [ -s "${_dir}/${_weight}" ]; then
         _log "权重下载完成: ${_name}"
     else
-        _log "❌ 权重下载失败: ${_name}（嵌入/重排不可用，请检查外网/磁盘）"
+        rm -rf "${_dir}"
+        _log "❌ 权重下载失败: ${_name}（已清理残留，重启容器重试；嵌入/重排不可用）"
     fi
 }
 
