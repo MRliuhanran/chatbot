@@ -1,18 +1,87 @@
 # RAG 知识库依赖（唯一安装文件；纯运行时，不含任何测试框架）
-streamlit>=1.32.0
-requests>=2.31.0
-qdrant-client>=1.12.0
-jieba>=0.42.1
+#
+# ★ 版本锁定 = 本地现役环境的精确快照（2026-09-27，全部 == 本机实际运行版本）★
+# 为什么锁：旧写法全是 >= 松约束，镜像每次构建都解析"当天最新"——实测漂移到
+#   transformers 4.53.2→5.17.0、pandas 1.5.3→3.0.6、numpy 1.26→2.4、torch 2.7→2.14。
+#   "health 通过"≠"与本地一致"，跨大版本的"碰巧能跑"随时会变成静默行为差异。
+# Python 同理要对齐：本地 3.10 ↔ 镜像 python:3.10-slim-bookworm（官方无 3.10.0
+#   精确 tag，取 3.10 系列最新 patch，仅含 CPython 自身 bug/安全修复）。
+# 升级流程：本地先 pip install -U <包> 并验证 → 同步改这里的版本号 → git push
+#   → 创空间重建镜像。改了本地却不改这里 = 服务器落后于本地（同步的唯一真相文件）。
+
+# --- 直接依赖（chatbot.py 显式 import / 使用）---
+streamlit==1.62.0
+requests==2.32.4
+qdrant-client==1.19.0
+jieba==0.42.1
 # .env 加载（chatbot.py 顶部）。缺失即报错、不静默跳过 —— 静默跳过会让 .env 的
 # MODEL/OLLAMA_BASE_URL 全失效，程序悄悄跑在代码默认值上，极难定位。
-python-dotenv>=1.0.0
-torch>=2.2.0
-transformers>=4.38.0
-numpy>=1.26.0
+python-dotenv==1.1.1
+torch==2.7.1
+transformers==4.53.2
+numpy==1.26.4
 # 分句。**硬依赖、无降级路径**：chatbot.py 顶层 `from sentencex import segment`。
 # 曾经的"内置标点分句降级"会把闭合引号切给下一句且**静默**错（字符扫描不认引语边界：
 # 实测全库 24%~36% 的句子以 ” 开头，sentencex 下为 0%）。
-sentencex>=1.0.30
-# 已删三个从未被引用的依赖：pydantic / pydantic-settings / scikit-learn（全仓 grep 零引用；
-# 多装约 100MB，且让人以为配置走 pydantic，实际是顶部手写的 env_int/env_float/env_bool）。
-# 已删 pytest：随 2026-09-19 测试套件一并移除，"运行时不含测试框架"重新成为文件事实。
+sentencex==1.0.30
+
+# --- 传递闭包（上述依赖解析出的间接包，同样锁定本地现役版本，56 个）---
+# 说明：pydantic 仍在此列，但身份已变 —— 不再是被批判的"直接声明"（配置走代码手写
+# env_*），而是 qdrant-client 的必需传递依赖，无法移除。scikit-learn / pydantic-settings
+# / pytest 与本项目无关，保持不装（"运行时不含测试框架"依然成立）。
+altair==6.2.2
+annotated-types==0.7.0
+anyio==4.9.0
+attrs==25.3.0
+blinker==1.9.0
+certifi==2026.7.22
+charset-normalizer==3.4.2
+click==8.2.1
+exceptiongroup==1.3.0
+filelock==3.18.0
+fsspec==2026.6.0
+grpcio==1.80.0
+h11==0.16.0
+hf-xet==1.1.5
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+huggingface-hub==0.33.2
+idna==3.10
+itsdangerous==2.2.0
+jinja2==3.1.6
+jsonschema==4.24.0
+jsonschema-specifications==2025.4.1
+markupsafe==3.0.2
+mpmath==1.3.0
+narwhals==2.25.0
+networkx==3.4.2
+packaging==25.0
+pandas==1.5.3
+pillow==12.3.0
+portalocker==3.2.0
+protobuf==5.29.6
+pyarrow==25.0.1
+pydantic==2.11.7
+pydantic-core==2.33.2
+pydeck==0.9.3
+python-dateutil==2.9.0.post0
+python-multipart==0.0.29
+pytz==2025.2
+pyyaml==6.0.3
+referencing==0.36.2
+regex==2024.11.6
+rpds-py==0.26.0
+safetensors==0.5.3
+six==1.17.0
+sniffio==1.3.1
+starlette==1.2.0
+sympy==1.14.0
+tokenizers==0.21.2
+toml==0.10.2
+tqdm==4.67.1
+typing-extensions==4.15.0
+typing-inspection==0.4.1
+urllib3==2.7.0
+uvicorn==0.48.0
+websockets==16.0
