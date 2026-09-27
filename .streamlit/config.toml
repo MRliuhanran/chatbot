@@ -6,3 +6,9 @@
 address = "127.0.0.1"
 port = 8501
 headless = true
+
+[client]
+# 极简前端：隐藏工具条，异常不显示细节
+# 可选值：auto / developer / viewer / minimal
+toolbarMode = "minimal"
+showErrorDetails = "none"

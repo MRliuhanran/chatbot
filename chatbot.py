@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -22,6 +21,9 @@ try:
     from dotenv import load_dotenv
 except ImportError as exc:
     raise ImportError("缺少依赖 python-dotenv（配置会静默退到代码默认值），安装: pip install python-dotenv") from exc
+# 记录 load_dotenv 之前的环境变量：health 的 env_declared_but_unread 只点名「写进 .env 但代码
+# 从不读取」的变量，避免把本机为 Ollama 服务进程准备的 OLLAMA_* 等 shell 变量误报成应用配置。
+_ENV_KEYS_BEFORE_DOTENV = frozenset(os.environ)
 load_dotenv()
 
 # ── 启动副作用 ──
@@ -97,7 +99,7 @@ def env_declared_but_unread():
         except (OSError, TypeError, KeyError):
             src = ""
         _ENV_READ_SOURCE = {m[0] or m[1] for m in _ENV_NAME_RE.findall(src)}
-    declared = { k for k in os.environ if k.startswith(_ENV_FAMILIES) or k in _ENV_STANDALONE }
+    declared = { k for k in os.environ if k not in _ENV_KEYS_BEFORE_DOTENV and (k.startswith(_ENV_FAMILIES) or k in _ENV_STANDALONE) }
     return sorted(declared - _ENV_READ_SOURCE)
 
 
@@ -208,181 +210,6 @@ def _has_searchable_content(text):
     return any(unicodedata.category(ch)[0] in ("L", "N") for ch in text)
 
 
-# ── 查询改写 ──
-REWRITE_MODEL = os.getenv("RAG_REWRITE_MODEL") or os.getenv("MODEL", "qwen3.5:4b-q4_K_M")
-REWRITE_ENABLED = env_bool("RAG_QUERY_REWRITE", True)
-REWRITE_TIMEOUT = int(os.getenv("RAG_QUERY_REWRITE_TIMEOUT", "20"))
-REWRITE_MAX_TURNS = int(os.getenv("RAG_QUERY_REWRITE_MAX_TURNS", "0"))
-MAX_REWRITE_CHARS = int(os.getenv("RAG_QUERY_REWRITE_MAX_CHARS", "120"))
-REWRITE_NUM_CTX = int(os.getenv("RAG_QUERY_REWRITE_NUM_CTX") or os.getenv("RAG_NUM_CTX", "8192"))
-REWRITE_SYSTEM_PROMPT = os.getenv("RAG_REWRITE_SYSTEM_PROMPT", "")
-_PREFIX_RE = re.compile(r"^\s*(改写后(的)?(问句|查询)?|检索(问句|查询)|问句|答案)\s*[:：]\s*")
-_META_LINE_RE = re.compile( r"^\s*(好的|好，|当然|可以|没问题|明白|收到|以下是|下面是|我来|让我|根据|" r"改写后|改写如下|简化为|整理后)")
-
-
-def build_rewrite_prompt(query, history, max_turns=REWRITE_MAX_TURNS):
-    turns = list(history or [])
-    if max_turns and max_turns > 0:
-        turns = turns[-max_turns * 2:]
-    lines = []
-    for m in turns:
-        if not isinstance(m, dict):
-            continue
-        role = "用户" if m.get("role") == "user" else "助手"
-        raw_content = m.get("content")
-        content = raw_content.strip() if isinstance(raw_content, str) else ""
-        if not content:
-            continue
-        lines.append(f"{role}：{content}")
-    user = "\n".join(lines + [query])
-    msgs = []
-    if REWRITE_SYSTEM_PROMPT:
-        msgs.append({"role": "system", "content": REWRITE_SYSTEM_PROMPT})
-    msgs.append({"role": "user", "content": user})
-    return msgs
-REASON_DISABLED = "disabled"
-REASON_NO_HISTORY = "no_history"
-REASON_BLANK_QUERY = "blank_query"
-REASON_CALL_ERROR = "call_error"
-REASON_EMPTY_OUTPUT = "empty_output"
-REASON_TOO_LONG = "too_long"
-REASON_IDENTICAL = "identical"
-REASON_APPLIED = "applied"
-REASON_CONCAT = "concat_fallback"
-CONCAT_ENABLED = env_bool("RAG_QUERY_REWRITE_CONCAT", True)
-# 拼接档只兜"改写开着、但这次模型调用没成功"；主开关关闭时 reason=disabled 不在表里（纯字面检索）。
-CONCAT_FROM_REASONS = (REASON_CALL_ERROR, REASON_EMPTY_OUTPUT, REASON_TOO_LONG)
-CONCAT_MAX_CHARS = int(os.getenv("RAG_QUERY_REWRITE_CONCAT_CHARS", "60"))
-
-
-def clean_rewritten_detailed(text):
-    if not text or not isinstance(text, str):
-        return "", REASON_EMPTY_OUTPUT
-    out = ""
-    for line in text.strip().splitlines():
-        line = _PREFIX_RE.sub("", line.strip()).strip()
-        line = line.strip("“”\"'《》").strip()
-        if not line:
-            continue
-        if line.endswith("：") or line.endswith(":"):
-            continue
-        if _META_LINE_RE.match(line):
-            continue
-        out = line
-        break
-    if not out:
-        return "", REASON_EMPTY_OUTPUT
-    if len(out) > MAX_REWRITE_CHARS:
-        return "", REASON_TOO_LONG
-    return out, ""
-
-
-def _ollama_chat(payload):
-    import requests
-    r = requests.post(API_URL, json=payload, timeout=REWRITE_TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    return ((data.get("message") or {}).get("content") or "")
-
-
-def _build_payload(query, history, messages=None):
-    if messages is None:
-        messages = build_rewrite_prompt(query, history)
-    return { "model": REWRITE_MODEL, "messages": messages, "stream": False, "think": False, "options": {"temperature": 0, "num_predict": 64, "num_ctx": REWRITE_NUM_CTX}, }
-
-
-def rewrite_prompt_stats(query, history, max_turns=REWRITE_MAX_TURNS, prompt=None):
-    if prompt is None:
-        prompt = build_rewrite_prompt(query, history, max_turns=max_turns)
-    text = prompt[-1]["content"]
-    hist_msgs = sum(1 for ln in text.splitlines() if ln.startswith("用户：") or ln.startswith("助手："))
-    system_chars = len(REWRITE_SYSTEM_PROMPT)
-    total_chars = len(text) + system_chars
-    return { "prompt_chars": total_chars, "history_msgs": hist_msgs, "num_ctx": REWRITE_NUM_CTX, "over_window": total_chars > REWRITE_NUM_CTX, }
-
-
-def rewrite_query_detailed(query, history, call=None, enabled=None, messages=None):
-    if enabled is None:
-        enabled = REWRITE_ENABLED
-    def no(reason):
-        return {"query": query, "applied": False, "reason": reason}
-    if not enabled:
-        return no(REASON_DISABLED)
-    if not history:
-        return no(REASON_NO_HISTORY)
-    if not _has_searchable_content(query):
-        return no(REASON_BLANK_QUERY)
-    try:
-        raw = (call or _ollama_chat)(_build_payload(query, history, messages=messages))
-    except Exception as exc:
-        logger.warning(f"⚠️  查询改写失败（交给降级链处理）: {type(exc).__name__}: {exc}")
-        return no(f"{REASON_CALL_ERROR}:{type(exc).__name__}")
-    cleaned, why = clean_rewritten_detailed(raw)
-    if not cleaned:
-        return no(why)
-    if cleaned == query.strip():
-        return no(REASON_IDENTICAL)
-    return {"query": cleaned, "applied": True, "reason": REASON_APPLIED}
-
-
-def last_turn_text(history, role):
-    for m in reversed(list(history or [])):
-        if isinstance(m, dict) and m.get("role") == role:
-            text = (m.get("content") or "").strip()
-            if text:
-                return text
-    return ""
-
-
-def build_concat_query(query, history, max_chars=CONCAT_MAX_CHARS):
-    prev = last_turn_text(history, "user")
-    if not prev or not _has_searchable_content(query):
-        return ""
-    if prev.strip() == query.strip():
-        return ""
-    head = prev if max_chars <= 0 else prev[:max_chars]
-    return f"{head} {query.strip()}"
-
-
-def build_retrieval_query(query, history, call=None, enabled=None, concat_enabled=None, allow_concat=True):
-    try:
-        return _build_retrieval_query_inner( query, history, call=call, enabled=enabled, concat_enabled=concat_enabled, allow_concat=allow_concat)
-    except Exception as exc:
-        logger.warning(f"⚠️  检索问句决策失败，退回字面原句: {type(exc).__name__}: {exc}")
-        return {"query": query, "applied": False, "reason": f"{REASON_CALL_ERROR}:{type(exc).__name__}", "source": "literal"}
-
-
-def _build_retrieval_query_inner(query, history, call=None, enabled=None, concat_enabled=None, allow_concat=True):
-    is_on = REWRITE_ENABLED if enabled is None else enabled
-    # 主开关关闭 = 纯字面检索，连改写 prompt 都不构建
-    prompt = build_rewrite_prompt(query, history) if is_on else None
-    stats = rewrite_prompt_stats(query, history, prompt=prompt) if is_on else {}
-    outcome = rewrite_query_detailed(query, history, call=call, enabled=enabled, messages=prompt)
-    if outcome["applied"]:
-        return {**outcome, "source": "llm", **stats}
-    if concat_enabled is None:
-        concat_enabled = CONCAT_ENABLED
-    reason_code = str(outcome["reason"]).split(":", 1)[0]
-    if concat_enabled and allow_concat and reason_code in CONCAT_FROM_REASONS:
-        concat = build_concat_query(query, history)
-        if concat:
-            return {"query": concat, "applied": True, "reason": f"{REASON_CONCAT}<={outcome['reason']}", "source": "concat", **stats}
-    return {**outcome, "source": "literal", **stats}
-
-
-def build_retrieval_routes(query, history, call=None, enabled=None, concat_enabled=None, allow_concat=True, fusion=False):
-    if concat_enabled is None:
-        concat_enabled = CONCAT_ENABLED
-    primary = build_retrieval_query( query, history, call=call, enabled=enabled, concat_enabled=concat_enabled, allow_concat=allow_concat)
-    queries = [{"query": primary["query"], "source": primary["source"]}]
-    if fusion and allow_concat and concat_enabled and primary.get("source") == "llm":
-        alt = build_concat_query(query, history)
-        if alt and alt != primary["query"]:
-            queries.append({"query": alt, "source": "concat"})
-    return { "primary": primary, "queries": queries, "extra": [q["query"] for q in queries[1:]], }
-
-
 # ── 领域与检索侧配置 ──
 # 全部可配置；默认值面向通用垂直领域，核心代码不假设语料形态、文件名或来源字段。
 DATA_DIR = os.getenv("RAG_DATA_DIR") or os.getenv("RAG_BOOKS_DIR") or "corpus"
@@ -474,8 +301,6 @@ if _RECALL_LIMIT_RAW < 0:
     raise ValueError(f"环境变量 RAG_RECALL_LIMIT={_RECALL_LIMIT_RAW!r} 不能为负数（0 表示跟随 RAG_RERANK_TOP_K，当前 {RERANK_TOP_K}）")
 RECALL_LIMIT = _RECALL_LIMIT_RAW or RERANK_TOP_K
 DEDUP_BY_PARENT = env_bool("RAG_DEDUP_BY_PARENT", True)
-QUERY_FUSION = env_bool("RAG_QUERY_FUSION", False)
-RERANK_QUERY_MODE = env_choice("RAG_RERANK_QUERY", "primary", ("primary", "join", "per_route"))
 BGE_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
@@ -1103,7 +928,9 @@ def read_book_text(filepath):
 
 
 read_document_text = read_book_text  # 通用别名；保留 read_book_text 以兼容分块指纹
-_CHUNKING_CODE_UNITS = ( "fix_quotes", "_split_keep", "_split_sentences", "_enforce_token_limit", "_hard_split_by_tokens", "_semantic_split", "_merge_small_texts", "_hierarchical_split", "_balanced_pack_groups", "_group_tokens", "_split_two", "_merge_small_groups", "_enforce_group_cap", "_split_by_tokens", "_split_into_children", "read_book_text", )
+# 语义定界依赖句子嵌入（_encode_sentences→_embed_batch），必须纳入指纹：改嵌入代码会改变
+# 切分边界，漏掉就会让"切分产物过期"不被发现（_semantic_split 源码本身不含这些函数的实现）。
+_CHUNKING_CODE_UNITS = ( "fix_quotes", "_split_keep", "_split_sentences", "_enforce_token_limit", "_hard_split_by_tokens", "_semantic_split", "_merge_small_texts", "_hierarchical_split", "_balanced_pack_groups", "_group_tokens", "_split_two", "_merge_small_groups", "_enforce_group_cap", "_split_by_tokens", "_split_into_children", "read_book_text", "_encode_sentences", "_embed_batch", "_get_embed_model", )
 
 
 def _package_version(name):
@@ -1158,7 +985,13 @@ def _document_paths():
 def _document_name(path):
     rel = os.path.relpath(path, DATA_DIR)
     stem = os.path.splitext(rel)[0]
-    return stem.replace(os.sep, "__")
+    name = stem.replace(os.sep, "__")
+    # "__" 既用来编码路径分隔符、也可能原样出现在文件名里（a/b.txt 与 a__b.txt 会映射成
+    # 同一个名字，文档缓存与 source 字段互相覆盖）。名字里出现 "__" 就追加相对路径的短
+    # 哈希保证唯一；平铺语料不含 "__"，名字保持不变。
+    if "__" in name:
+        name = f"{name}_{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:16]}"
+    return name
 
 
 def _doc_cache_path(source_name):
@@ -1443,8 +1276,12 @@ def lexicon_fingerprint():
     except Exception:
         parts.append("jieba=unknown")
     parts.append("bm25=" + json.dumps(BM25_TEXT_OPTIONS, sort_keys=True))
+    # BM25 模型名、分词标点集与解析/归一链路源码同样决定稀疏词空间：漏掉会让换编码后
+    # 指纹不变、stages 误报 C 新鲜，稀疏索引静默错配。
+    parts.append("bm25_model=" + BM25_MODEL_NAME)
+    parts.append("punct=" + "".join(sorted(_PUNCT_ONLY)))
     import inspect
-    for name in ("bm25_tokenize", "sparse_encode"):
+    for name in ("parse_aliases", "parse_stopwords", "_read_aliases", "_read_stopwords", "load_lexicon", "normalize_aliases", "bm25_tokenize", "sparse_encode"):
         fn = globals().get(name)
         try:
             parts.append(f"{name}:" + inspect.getsource(fn))
@@ -1487,9 +1324,42 @@ def _embed_cache_key(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+_EMBED_CODE_FINGERPRINT = None
+
+
+def _embed_code_fingerprint():
+    """嵌入代码指纹：_embed_batch/embed 源码变化必须作废稠密向量缓存（换池化/归一化/截断等）。
+
+    旧实现只按模型路径+精度给缓存起名，改嵌入代码会静默复用旧向量。
+    """
+    global _EMBED_CODE_FINGERPRINT
+    if _EMBED_CODE_FINGERPRINT is None:
+        import inspect
+        parts = []
+        for name in ("_embed_batch", "embed"):
+            fn = globals().get(name)
+            try:
+                parts.append(f"{name}:" + inspect.getsource(fn))
+            except (OSError, TypeError):
+                parts.append(f"{name}:<unavailable>")
+        _EMBED_CODE_FINGERPRINT = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+    return _EMBED_CODE_FINGERPRINT
+
+
 def _embed_cache_file(precision):
     model_key = hashlib.sha256( os.path.abspath(EMBED_MODEL_PATH).encode("utf-8") ).hexdigest()[:12]
-    return os.path.join(EMBED_CACHE_DIR, f"{model_key}_{precision}.npz")
+    code_key = _embed_code_fingerprint()
+    return os.path.join(EMBED_CACHE_DIR, f"{model_key}_{code_key}_{precision}.npz")
+
+
+def _index_cache_precision():
+    """与 build_index 相同的缓存精度选择：INDEX_DEVICE 显式指定优先，否则按设备自动。
+
+    注意 build_index 在 MPS/CUDA 初始化失败时会回退 CPU/fp32，stages 无法预知这一回退，
+    只能按常规路径预测。
+    """
+    device = INDEX_DEVICE or get_device()
+    return "fp16" if device in ("mps", "cuda") else "fp32"
 
 
 def _load_embed_cache(path, expected_dim=None):
@@ -1545,20 +1415,20 @@ def build_index():
     log(f"索引建造标识: {build_id}")
     log(f"词表指纹: {lexicon_id}（别名 {ALIASES_ENABLED} / 停用词 {STOPWORDS_ENABLED}）")
     device = INDEX_DEVICE or get_device()
-    use_gpu = device == "mps"
+    use_gpu = device in ("mps", "cuda")
     tokenizer = model = None
     if use_gpu:
         try:
-            tokenizer, model, _ = load_embedding_model(device="mps")
+            tokenizer, model, _ = load_embedding_model(device=device)
             model = model.half()
         except Exception as exc:
-            log(f"    ⚠️  MPS 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
+            log(f"    ⚠️  {device.upper()} 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
             tokenizer, model, use_gpu = None, None, False
     if use_gpu:
         batch_size = 128
         cool_down_sleep = 0.1
         precision = "fp16"
-        log(f"Embedding 设备: mps (fp16, batch_size={batch_size})")
+        log(f"Embedding 设备: {device} (fp16, batch_size={batch_size})")
     else:
         tokenizer, model, device = load_embedding_model(device="cpu")
         torch.set_num_threads(6)
@@ -1581,7 +1451,7 @@ def build_index():
         for bi, idxs in enumerate(batches):
             batch_texts = [texts[i] for i in idxs]
             vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_gpu)
-            if use_gpu:
+            if device == "mps":
                 _mps_empty_cache()
             for row, i in enumerate(idxs):
                 embeddings[i] = vecs[row]
@@ -1602,7 +1472,7 @@ def build_index():
         _save_embed_cache(cache_path, keys, embeddings)
         log(f"向量缓存已更新: {cache_path}")
     del model, tokenizer
-    if use_gpu:
+    if device == "mps":
         _mps_empty_cache()
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     alias_ok = USE_COLLECTION_ALIAS
@@ -1668,12 +1538,12 @@ def build_index():
             stragglers = []
         if stragglers:
             log(f"  ⚠️  检测到 {len(stragglers)} 个同名前缀历史集合（检索已不读）: {stragglers}")
-            log(f"     确认新索引可用后可回收磁盘（保留仅占空间）：")
+            log("     确认新索引可用后可回收磁盘（保留仅占空间）：")
             for name in stragglers:
                 log(f"       curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{name}")
     else:
         log(f"  ⚠️  未使用别名：检索端读 {COLLECTION_NAME}，重建期间该集合会短暂不可用")
-    log(f"  索引建造标识: {build_id}（检索端据此自动丢弃进程内的分块缓存）")
+    log(f"  索引建造标识: {build_id}")
     log(f"总耗时: {time.time() - t0:.1f} 秒")
 
 
@@ -1695,17 +1565,6 @@ def rerank_indices(query, documents, tokenizer, model, device, top_k=TOP_K, batc
     order = np.argsort(all_scores)[::-1]
     ranked = [(int(i), float(all_scores[i])) for i in order]
     return ranked[:top_k]
-
-
-def merge_route_scores(score_lists, top_k=None):
-    best = {}
-    for ranked in score_lists:
-        for idx, score in ranked:
-            if idx not in best or score > best[idx]:
-                best[idx] = score
-    order = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
-    out = [(int(i), float(s)) for i, s in order]
-    return out[:top_k] if top_k is not None else out
 
 
 def weighted_rrf(rankings, k=RRF_K, limit=None):
@@ -1844,10 +1703,12 @@ def build_system_prompt(use_context=True):
 def build_context_message(results):
     """资料消息：没有结果就不发；正文是纯检索原文。"""
     return format_context(results) if results else ""
-GEN_HISTORY_MAX_TOKENS = env_int("RAG_HISTORY_MAX_TOKENS", 1500)
 GEN_INPUT_RESERVE = env_int("RAG_INPUT_RESERVE", 256)
+# 生成历史的硬上限（token）：把"历史最多塞多少"从窗口余量里独立出来。
+# 0=不设上限（行为与不带该配置完全一致，只受 history_budget 的窗口余量约束）。
+# 生效形式是 min(窗口余量, 本上限)：本上限只做第二道、更严的约束，永不越过窗口安全边界。
+GEN_HISTORY_MAX_TOKENS = env_int_min("RAG_GEN_HISTORY_MAX_TOKENS", 0, 0)
 _TRUNCATION_MARK = "……（已按上下文预算截断）"
-_USER_TRUNCATION_MARK = "……（本轮提问过长，已按上下文预算截断）"
 
 
 def estimate_tokens(text):
@@ -1868,70 +1729,54 @@ def history_budget(num_ctx, num_predict, system="", reserve=None, extra=""):
     return max(0, left)
 
 
-def split_turns(history):
-    turns, current = [], []
-    for m in history or []:
-        if m.get("role") == "user" and current:
-            turns.append(current)
-            current = []
-        current.append(m)
-    if current:
-        turns.append(current)
-    return turns
+def _truncate_history_to_budget(msgs, budget):
+    """历史超预算：从最旧一侧直接按 token 截断到预算内，保留尽可能多的近期内容。
+
+    只做整条丢弃 + 最旧一条按剩余额度截断正文；截断/丢弃后若首条是 assistant
+    （其对应提问已被整条丢弃），继续整条丢弃，保证历史首条恒为 user —— 否则模型
+    会收到一条没有对应提问的"孤儿回答"。就地修改 msgs（调用方已持有副本）。
+    返回 (丢弃条数, 是否截断, 被截断的是否 user)。
+    """
+    total = message_tokens(msgs)
+    dropped, truncated, truncated_user = 0, False, False
+    while msgs and total > budget:
+        first = msgs[0]
+        cost = estimate_tokens(first.get("content") or "")
+        excess = total - budget
+        if cost <= excess:
+            total -= cost
+            msgs.pop(0)
+            dropped += 1
+            continue
+        first["content"] = _cut_to_tokens(first.get("content") or "", cost - excess)
+        truncated, truncated_user = True, first.get("role") != "assistant"
+        total = message_tokens(msgs)
+    while msgs and msgs[0].get("role") != "user":
+        msgs.pop(0)
+        dropped += 1
+    return dropped, truncated, truncated_user
 
 
-def build_generation_messages(system, history, query, context=None, max_history_tokens=None, context_role=None):
-    budget = GEN_HISTORY_MAX_TOKENS if max_history_tokens is None else max(0, int(max_history_tokens))
+def build_generation_messages(system, history, query, max_history_tokens, context=None, context_role=None):
+    budget = max(0, int(max_history_tokens))
     role = context_role or CONTEXT_ROLE
-    msgs = history_to_messages(history)
-    turns = split_turns(msgs)
-    kept, used, truncated, truncated_user = [], 0, False, False
-    for turn in reversed(turns):
-        cost = message_tokens(turn)
-        if kept and used + cost > budget:
+    msgs = [dict(m) for m in history_to_messages(history)]
+    # 调用方可能把本轮提问也塞进 history（漏了 [:-1]），甚至连续塞了多份。必须剥干净：
+    # 否则模型会收到同一问题两份。本轮提问只在末尾追加这一次。
+    while True:
+        msgs, dropped = strip_current_turn(msgs, query)
+        if not dropped:
             break
-        if not kept and cost > budget:
-            turn, tu = _truncate_turn(turn, budget)
-            truncated = True
-            truncated_user = truncated_user or tu
-            cost = message_tokens(turn)
-        kept.insert(0, turn)
-        used += cost
-    flat = [m for turn in kept for m in turn]
+    # 超限整条丢弃 + 最旧一条按预算截断；截断后首条历史恒为 user。
+    dropped_messages, truncated, truncated_user = _truncate_history_to_budget(msgs, budget)
     context = context or ""
     ctx_tokens = estimate_tokens(context) if context else 0
     out = [{"role": "system", "content": system}] if system else []
-    out += flat
+    out += msgs
     if context:
         out.append({"role": role, "content": context})
     out.append({"role": "user", "content": query})
-    return { "messages": out, "dropped_turns": len(turns) - len(kept), "used_tokens": used, "context_tokens": ctx_tokens, "budget": budget, "truncated": truncated, "truncated_user": truncated_user, }
-
-
-def _truncate_turn(turn, budget):
-    msgs = [dict(m) for m in turn]
-    user_msgs = [m for m in msgs if m.get("role") != "assistant"]
-    user_cost = sum(estimate_tokens(m.get("content") or "") for m in user_msgs)
-    truncated_user = False
-    if user_cost > budget:
-        left = max(0, budget)
-        for m in user_msgs:
-            content = m.get("content") or ""
-            m["content"] = _cut_to_tokens(content, left, mark=_USER_TRUNCATION_MARK)
-            left = max(0, left - estimate_tokens(m["content"]))
-        user_cost = sum(estimate_tokens(m.get("content") or "") for m in user_msgs)
-        truncated_user = True
-    left = max(0, budget - user_cost)
-    for m in msgs:
-        if m.get("role") != "assistant":
-            continue
-        content = m.get("content") or ""
-        if estimate_tokens(content) <= left:
-            left -= estimate_tokens(content)
-            continue
-        m["content"] = _cut_to_tokens(content, left)
-        left = 0
-    return msgs, truncated_user
+    return { "messages": out, "dropped_messages": dropped_messages, "used_tokens": message_tokens(msgs), "context_tokens": ctx_tokens, "budget": budget, "truncated": truncated, "truncated_user": truncated_user, }
 
 
 def _cut_to_tokens(text, max_tokens, mark=_TRUNCATION_MARK):
@@ -1955,12 +1800,22 @@ def _cut_to_tokens(text, max_tokens, mark=_TRUNCATION_MARK):
 def plan_generation(results, history, query, num_ctx, num_predict, use_context=True, context_role=None, trace=True):
     system = build_system_prompt(use_context=use_context)
     context = (build_context_message(results) if use_context else "")
-    budget = history_budget(num_ctx, num_predict, system, extra=context)
+    # 本轮提问的 token 必须占位：短问句（≤ RAG_INPUT_RESERVE）预算逐字不变，长问句历史让位。
+    q_tokens = estimate_tokens(query)
+    reserve_eff = max(GEN_INPUT_RESERVE, q_tokens)
+    budget = history_budget(num_ctx, num_predict, system, extra=context, reserve=reserve_eff)
+    # 精确算式（不看 budget<0）：历史归零也装不下才报警，避免"归零但实际没超"的假阳性。
+    over_window = (estimate_tokens(system) + estimate_tokens(context) + q_tokens > int(num_ctx) - int(num_predict))
+    # 配置只做第二道上限：更严时收紧历史预算，0 或比窗口余量宽时不改变行为。
+    if GEN_HISTORY_MAX_TOKENS > 0:
+        budget = min(budget, GEN_HISTORY_MAX_TOKENS)
     gen = build_generation_messages( system, history, query, context=context, max_history_tokens=budget, context_role=context_role, )
+    gen["query_tokens"], gen["over_window"] = q_tokens, over_window
+    if over_window:
+        log("⚠️  本轮提问+资料超出可用窗口（历史已全部让位仍不足）：本轮提问未截断，超出部分可能被服务端截断")
     return { "system": system, "context": context, "messages": gen["messages"], "stats": gen, "trace": (plan_trace(results, gen) if trace else {}), }
 
 
-STEP_REWRITE = "查询改写"
 STEP_BLANK_QUERY = "空查询"
 STEP_SPARSE_TERMS = "稀疏编码 (jieba + BM25)"
 STEP_RECALL = "单通道召回"
@@ -1968,16 +1823,13 @@ STEP_RRF = "RRF 融合"
 STEP_CANDIDATES = "候选落地分块表"
 STEP_DEDUP = "父块去重"
 STEP_RERANK = "Rerank 重排"
-STEP_RERANK_MODE = "Rerank 打分口径"
 STEP_RESULTS = "检索汇总"
 STEP_RESULT_COUNT = "检索汇总条数"
 STEP_CONFIDENCE = "置信度"
 STEP_CONTEXT = "上下文装配"
 STEP_HISTORY_TRIM = "历史裁剪"
-STEP_INPUT_TOKENS = "输入 token"
 STEP_DEGRADE = "降级"
 TRACE_NOTES = {
-    "融合": "多路召回已开启：{n} 路各召回一次后统一 RRF 融合",
     "去重": "同一父块下的兄弟子块只保留融合名次最好的一个；上下文装配用的是 parent_text，不去重会让同一段父文本重复出现",
     "条数": "返回条数少于 top_k 只可能是『去重后不同父块本身不够』；不补同父子块，见 hybrid_search 末尾的说明",
 }
@@ -1985,8 +1837,11 @@ TRACE_NOTES = {
 
 def plan_trace(results, gen):
     trace = { STEP_CONTEXT: { "context": format_context(results), "sources": context_sources(results), "messages": [{"role": m["role"], "chars": len(m["content"])} for m in gen["messages"]], } }
-    if gen["dropped_turns"] or gen["truncated"]:
-        trace[STEP_HISTORY_TRIM] = { "丢弃轮数": gen["dropped_turns"], "预算 token": gen["budget"], "实用 token": gen["used_tokens"], "资料 token": gen["context_tokens"], "截断": gen["truncated"], "用户提问被截断": gen["truncated_user"], "说明": "历史超出上下文预算，已按整轮从最旧开始丢弃；system、检索资料与本轮提问始终保留", }
+    if gen["dropped_messages"] or gen["truncated"] or gen.get("over_window"):
+        note = "历史超出上下文预算，已从最旧一侧整条丢弃/截断，截断后首条历史恒为 user；system、检索资料与本轮提问始终保留"
+        if gen.get("over_window"):
+            note += "。本轮提问+资料超出可用窗口：历史让位为 0 仍不足，本轮提问未截断，超出部分可能被服务端截断"
+        trace[STEP_HISTORY_TRIM] = { "丢弃条数": gen["dropped_messages"], "预算 token": gen["budget"], "实用 token": gen["used_tokens"], "资料 token": gen["context_tokens"], "截断": gen["truncated"], "被截断的是 user": gen["truncated_user"], "本轮提问 token": gen.get("query_tokens"), "超出可用窗口": bool(gen.get("over_window")), "说明": note, }
     return trace
 
 
@@ -2018,14 +1873,11 @@ class RAGEngine:
     def __init__(self, client=None, embed=None, rerank=None):
         self._embed = embed
         self._rerank = rerank
-        self._chunks = None
-        self._chunks_build_id = None
         self._client = client
         self._collection_name = COLLECTION_NAME
         self._lexicon_checked = False
         self._empty_warned = False
         self._model_lock = threading.Lock()
-        self._chunk_lock = threading.Lock()
     @property
     def collection_name(self):
         return self._collection_name
@@ -2053,78 +1905,46 @@ class RAGEngine:
             if self._rerank is None:
                 self._rerank = load_reranker_model()
             return self._rerank
-    def _current_build_id(self):
-        pts = self._get_client().retrieve( collection_name=self._collection_name, ids=[0], with_payload=True)
-        if not pts:
-            return None
-        payload = pts[0].payload or {}
-        self._check_lexicon_consistency(payload.get(LEXICON_ID_FIELD))
-        return payload.get(INDEX_BUILD_ID_FIELD)
     def _check_lexicon_consistency(self, index_lexicon_id):
         if index_lexicon_id is None or self._lexicon_checked:
             return
+        self._lexicon_checked = True  # 一致与否都只查一次：词表文件不做运行期热加载
         current = lexicon_fingerprint()
         if index_lexicon_id == current:
             return
-        self._lexicon_checked = True
         logger.error( "词表与索引不一致：索引 %s / 当前 %s。稀疏通道词空间已错配，召回会静默下降。请运行 `python chatbot.py reindex-sparse`。", index_lexicon_id, current, )
-    def _get_chunks(self, point_ids):
-        """按需拉取命中点的 payload（按 id 精确检索，不再全量滚动 2 万条：省数秒首查与数百 MB 内存）。
+    def _fetch_chunks(self, point_ids):
+        """按命中 id 逐次回取 payload（按 id 精确检索，不全量滚动 2 万条）。
 
-        旧实现的全量滚动 + 条数校验是为了防"静默漏召回"；按 id retrieve 结构性做不到部分
-        加载——缺失的 id 由调用方显式计数告警，完整性由 Qdrant 本身保证。
+        每次调用都向 Qdrant 取，进程内不留分块表：既不占常驻内存，也不存在"索引重建后
+        旧缓存失步"这个状态点。按 id retrieve 结构性做不到部分加载——缺失的 id 由调用方
+        显式计数告警，完整性由 Qdrant 本身保证。
         """
-        with self._chunk_lock:
-            self._resolve_collection()
-            current_id = self._current_build_id()
-            if current_id is None:
-                if not self._empty_warned:
-                    log(f"⚠️  集合 {self._collection_name} 为空，请先运行: python chatbot.py index")
-                    self._empty_warned = True
-                self._chunks, self._chunks_build_id = {}, None
-                return {}
-            if self._chunks is None or current_id != self._chunks_build_id:
-                if self._chunks is not None:
-                    log(f"检测到索引已重建（build_id {self._chunks_build_id} → {current_id}），丢弃进程内旧分块缓存")
-                self._chunks, self._chunks_build_id = {}, current_id
-                self._empty_warned = False
-            missing = [i for i in point_ids if i not in self._chunks]
-            if missing:
-                points = self._get_client().retrieve( collection_name=self._collection_name, ids=missing, with_payload=True, with_vectors=False, )
-                for p in points:
-                    self._chunks[p.id] = chunk_from_payload(p.payload, p.id)
-            return {i: self._chunks[i] for i in point_ids if i in self._chunks}
+        if not point_ids:
+            return {}
+        self._resolve_collection()
+        points = self._get_client().retrieve( collection_name=self._collection_name, ids=list(point_ids), with_payload=True, with_vectors=False, )
+        if not points:
+            # 命中 id 回取为空：集合为空或索引正在重建。不再用 id=0 探针判断——id 0 缺失时
+            # 旧写法会把非空集合误判为空并静默丢掉全部命中。
+            if not self._empty_warned:
+                log(f"⚠️  集合 {self._collection_name} 按命中 id 回取为空，请确认已运行: python chatbot.py index")
+                self._empty_warned = True
+            return {}
+        self._empty_warned = False
+        self._check_lexicon_consistency((points[0].payload or {}).get(LEXICON_ID_FIELD))
+        return {p.id: chunk_from_payload(p.payload, p.id) for p in points}
     def _source_filter(self, source):
         if not source:
             return None
         from qdrant_client import models
         return models.Filter(must=[ models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=source)) ])
-    def hybrid_search(self, query, top_k=TOP_K, return_steps=False, source=None, book=None, history=None):
+    def hybrid_search(self, query, top_k=TOP_K, return_steps=False, source=None, book=None):
         source = source if source is not None else book
-        from qdrant_client import models
         steps = {} if return_steps else None
         if not _has_searchable_content(query):
             if steps is not None:
                 steps[STEP_BLANK_QUERY] = f"查询 {query!r} 不含可检索内容，直接返回空结果"
-            return _empty_search_result(steps)
-        search_query = query
-        route_queries = [query]
-        if history:
-            history, dropped = strip_current_turn(history, query)
-            if dropped:
-                log("⚠️  history 末尾是本次提问（调用方漏了 [:-1]），已剥掉后再改写")
-            routes = build_retrieval_routes( query, history, allow_concat=_has_searchable_content(query), fusion=QUERY_FUSION)
-            outcome = routes["primary"]
-            search_query = outcome["query"]
-            route_queries = [r["query"] for r in routes["queries"]]
-            if steps is not None:
-                steps[STEP_REWRITE] = outcome
-                if len(route_queries) > 1:
-                    steps[STEP_REWRITE]["routes"] = routes["queries"]
-                    steps[STEP_REWRITE]["融合"] = TRACE_NOTES["融合"].format(n=len(route_queries))
-        if not _has_searchable_content(search_query):
-            if steps is not None:
-                steps[STEP_BLANK_QUERY] = f"查询 {search_query!r}（改写后）不含可检索内容，直接返回空结果"
             return _empty_search_result(steps)
         self._resolve_collection()
         client = self._get_client()
@@ -2132,26 +1952,21 @@ class RAGEngine:
         query_filter = self._source_filter(source)
         tokenizer, model, device = self._get_embed()
         # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
-        q_emb = embed(route_queries, tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
-        dense_embeddings = [v.tolist() for v in q_emb]
-        sparse_queries = [sparse_encode(q) for q in route_queries]
-        sparse_terms = sparse_queries[0].text.split()
+        q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
+        sparse_query = sparse_encode(query)
         if steps is not None:
-            steps[STEP_SPARSE_TERMS] = sparse_terms
-        recall_limit = RECALL_LIMIT
-        rankings = []
-        for r_i, (r_query, r_emb, r_sparse) in enumerate( zip(route_queries, dense_embeddings, sparse_queries)):
-            suffix = "" if len(route_queries) == 1 else f"#{r_i + 1}"
-            dense_hits, sparse_hits, note = dual_channel_recall( client, collection, r_emb, r_sparse, recall_limit, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=bool(RRF_SPARSE_WEIGHT), )
-            if note:
-                _degraded(steps, note)
-            rankings += channel_rankings(dense_hits, sparse_hits, suffix)
+            steps[STEP_SPARSE_TERMS] = sparse_query.text.split()
+        # 两种检索：稠密 + 稀疏各召回一次，随后统一加权 RRF 融合。
+        dense_hits, sparse_hits, note = dual_channel_recall( client, collection, q_emb[0].tolist(), sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=bool(RRF_SPARSE_WEIGHT), )
+        if note:
+            _degraded(steps, note)
+        rankings = channel_rankings(dense_hits, sparse_hits)
         if steps is not None:
             steps[STEP_RECALL] = [ {"channel": ch, "rank": r, "point_id": pid} for ch, pids, _w in rankings for r, pid in enumerate(pids, 1) ]
         n_channels = max(1, len(rankings))
         fuse_limit = RERANK_TOP_K * n_channels if DEDUP_BY_PARENT else RERANK_TOP_K
         fused = weighted_rrf(rankings, k=RRF_K, limit=fuse_limit)
-        chunks = self._get_chunks([point_id for point_id, _score, _res in fused]) if fused else {}
+        chunks = self._fetch_chunks([point_id for point_id, _score, _res in fused]) if fused else {}
         if steps is not None:
             steps[STEP_RRF] = [ { "resource": resources, "score": float(score), "id": (chunks.get(point_id) or {}).get("id", str(point_id)), "text": (chunks.get(point_id) or {}).get("child_text", ""), } for point_id, score, resources in fused ]
         candidates = []
@@ -2182,34 +1997,19 @@ class RAGEngine:
         rr_tok, rr_model, rr_dev = self._get_rerank()
         cand_texts = [rerank_text_for(c) for c in candidates]
         rr_k = min(top_k, len(candidates))
-        rr_query = None
-        if RERANK_QUERY_MODE == "per_route" and len(route_queries) > 1:
-            score_lists = [ rerank_indices(q, cand_texts, rr_tok, rr_model, rr_dev, top_k=len(cand_texts)) for q in route_queries ]
-            reranked = merge_route_scores(score_lists, top_k=rr_k)
-        else:
-            rr_query = (" ".join(route_queries) if (RERANK_QUERY_MODE == "join" and len(route_queries) > 1) else search_query)
-            reranked = rerank_indices(rr_query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
+        reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
         if steps is not None:
-            rr_query_tokens = (len(rr_tok.encode(rr_query)) if rr_query is not None else None)
-            rr_doc_budget = (max(0, RERANK_MAX_LENGTH - rr_query_tokens - 3) if rr_query_tokens is not None else None)
+            rr_query_tokens = len(rr_tok.encode(query))
+            rr_doc_budget = max(0, RERANK_MAX_LENGTH - rr_query_tokens - 3)
             rr_rows = []
             for idx, score in reranked:
                 text = cand_texts[idx]
                 full_tokens = len(rr_tok.encode(text))
                 row = { "id": candidates[idx]["id"], "fused_rank": candidate_fused_rank.get(candidates[idx]["id"]), "score": float(score), "tokens": full_tokens, "text": candidates[idx]["child_text"] }
-                if rr_doc_budget is not None:
-                    row["送入上限"] = rr_doc_budget
-                    row["被截断"] = full_tokens > rr_doc_budget
+                row["送入上限"] = rr_doc_budget
+                row["被截断"] = full_tokens > rr_doc_budget
                 rr_rows.append(row)
             steps[STEP_RERANK] = rr_rows
-            if len(route_queries) > 1:
-                if RERANK_QUERY_MODE == "per_route":
-                    rr_queries = list(route_queries)
-                elif RERANK_QUERY_MODE == "join":
-                    rr_queries = [" ".join(route_queries)]
-                else:
-                    rr_queries = [search_query]
-                steps[STEP_RERANK_MODE] = { "mode": RERANK_QUERY_MODE, "queries": rr_queries, }
         output = []
         for idx, score in reranked:
             c = candidates[idx]
@@ -2259,12 +2059,16 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     use_context = RAG_USE_CONTEXT if use_context is None else use_context
     num_ctx = NUM_CTX if num_ctx is None else num_ctx
     num_predict = NUM_PREDICT if num_predict is None else num_predict
+    # 入口统一剥一次：调用方漏剥 [:-1] 时本轮提问不进历史（也不进裁剪），一个闸口管整轮。
+    history, _leaked = strip_current_turn(history, query)
+    if _leaked:
+        log("⚠️  history 末尾是本轮提问（调用方漏剥），已在 run_turn 入口剥除")
     started = time.time()
     if trace:
-        results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source, history=history, )
+        results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source )
         confidence = steps.get(STEP_CONFIDENCE) or {}
     else:
-        results = engine.hybrid_search( query, top_k=top_k, source=source, history=history, )
+        results = engine.hybrid_search( query, top_k=top_k, source=source )
         steps = {}
         confidence = results_confidence(results)
     elapsed = time.time() - started
@@ -2339,7 +2143,7 @@ def cmd_serve():
     if _port_in_use(8501):
         pids = _streamlit_pids()
         if not pids:
-            log(f"错误: 端口 8501 已被其它进程占用，但没找到本项目启动的 Streamlit。")
+            log("错误: 端口 8501 已被其它进程占用，但没找到本项目启动的 Streamlit。")
             log("  请先确认占用者: lsof -nP -iTCP:8501 -sTCP:LISTEN")
             sys.exit(1)
         log("Streamlit 服务已在运行: http://localhost:8501")
@@ -2350,106 +2154,26 @@ def cmd_serve():
     log("启动 Streamlit 服务...")
     log("服务地址: http://localhost:8501  （按 Ctrl+C 停止）")
     log("")
-    os.execv(sys.executable, [ sys.executable, "-m", "streamlit", "run", __file__, "--server.address", "127.0.0.1", "--server.port", "8501", "--server.headless", "true", ])
+    os.execv(sys.executable, [ sys.executable, "-m", "streamlit", "run", __file__, "--server.address", "::", "--server.port", "8501", "--server.headless", "true", ])
 
 
 # ── 交互入口：Streamlit 主界面 ──
-def _trace_same(value):
-    return value
-
-
-def _trace_rows_subset(rows, keys):
-    return [ {k: item.get(k) for k in keys} if isinstance(item, dict) else item for item in rows ]
-
-
-def _trace_rrf_visible(rows):
-    return [ {k: v for k, v in item.items() if k != "resource"} if isinstance(item, dict) else item for item in rows ]
-
-
-def _trace_results_slim(rows):
-    return [ { "id": r.get("id", ""), "source": _source_of(r), "score": r.get("rerank_score"), "chars": len(r.get("parent_text", "") or ""), } for r in rows ]
-
-
-def _trace_context_slim(value):
-    out = {k: v for k, v in value.items() if k != "context"}
-    if "context" in value:
-        out["context_chars"] = len(value.get("context") or "")
-    return out
-
-
-_TRACE_SAME = (_trace_same, _trace_same)
-_TRACE_VIEW = {
-    STEP_REWRITE: _TRACE_SAME,
-    STEP_BLANK_QUERY: _TRACE_SAME,
-    STEP_SPARSE_TERMS: _TRACE_SAME,
-    STEP_RECALL: (None, None),
-    STEP_DEGRADE: _TRACE_SAME,
-    STEP_RRF: (_trace_rrf_visible, lambda rows: _trace_rows_subset(rows, ("id", "score"))),
-    STEP_CANDIDATES: _TRACE_SAME,
-    STEP_DEDUP: _TRACE_SAME,
-    STEP_RERANK: (None, lambda rows: _trace_rows_subset(rows, ("id", "fused_rank", "score", "tokens", "被截断"))),
-    STEP_RERANK_MODE: _TRACE_SAME,
-    STEP_RESULTS: (None, _trace_results_slim),
-    STEP_RESULT_COUNT: _TRACE_SAME,
-    STEP_CONFIDENCE: _TRACE_SAME,
-    STEP_CONTEXT: (None, _trace_context_slim),
-    STEP_HISTORY_TRIM: _TRACE_SAME,
-    STEP_INPUT_TOKENS: _TRACE_SAME,
-}
-
-
-def _project_trace(steps, slot):
-    out = {}
-    for name, value in steps.items():
-        view = _TRACE_VIEW.get(name)
-        if view is None:
-            log(f"⚠️  推理链出现未登记的步骤 {name!r}，按原样输出（请补 _TRACE_VIEW）")
-            view = _TRACE_SAME
-        fn = view[slot]
-        if fn is not None:
-            out[name] = fn(value)
-    return out
-
-
-def _visible_trace(steps):
-    return _project_trace(steps, 0)
-
-
-def _slim_trace(steps):
-    return _project_trace(steps, 1)
-
-
-def _render_trace(steps):
-    import streamlit as st
-    st.json(_visible_trace(steps), expanded=1)
-
-
-def _render_assistant_extras(msg):
-    import streamlit as st
-    if msg.get("trace"):
-        with st.status("🔍", state="complete", expanded=False):
-            _render_trace(msg["trace"])
-    # 历史重放同样看开关：开着时写下的旧条目，关掉后不再展开思维链。
-    if THINK and msg.get("thinking"):
-        with st.status("🧠", state="complete", expanded=False):
-            st.markdown(msg["thinking"])
-
-
 def _render_stored_message(msg):
+    """渲染输入、输出、思维链与错误（兼容旧会话里带 error 字段的历史条目）。"""
     import streamlit as st
     with st.chat_message(msg["role"]):
-        if msg["role"] == "assistant":
-            _render_assistant_extras(msg)
-        if msg["content"]:
+        if msg["role"] == "assistant" and THINK and msg.get("thinking"):
+            with st.expander("🧠", expanded=False):
+                st.markdown(msg["thinking"])
+        if msg.get("content"):
             st.markdown(msg["content"])
         elif msg["role"] == "assistant" and msg.get("error"):
             st.error(msg["error"])
-        elif msg["role"] == "assistant":
-            st.markdown("⚠️")
 
 
 def _stream_reply(events):
-    """流式渲染本轮答案，返回 (thinking, answer, gen_error, stats)。思维链面板只在 RAG_THINK 打开时创建。"""
+    """流式渲染本轮答案：生成失败与 num_predict 截断必须可见（静默失效违背项目不变量）。
+    返回 (thinking, answer, gen_error, done)；done 为空即生成未正常结束（与 API 侧同判据）。"""
     import streamlit as st
     think_status, think_ph = None, None
     if THINK:
@@ -2457,7 +2181,7 @@ def _stream_reply(events):
         with think_status:
             think_ph = st.empty()
     answer_ph = st.empty()
-    thinking, answer, gen_error, stats = drain_events(
+    thinking, answer, gen_error, done = drain_events(
         events,
         on_thinking=(lambda _chunk, total: think_ph.markdown(total)) if think_ph is not None else None,
         on_delta=lambda _chunk, total: answer_ph.markdown(total),
@@ -2466,48 +2190,36 @@ def _stream_reply(events):
         answer_ph.error(gen_error)
     elif not answer:
         answer_ph.markdown("⚠️")
-    truncated = stats.get("done_reason") == "length"
     if think_status is not None:
         if thinking:
             think_ph.markdown(thinking)
-        think_status.update( label="🧠 ⚠️" if truncated else "🧠", state="error" if truncated else "complete", expanded=False, )
-    if truncated:
+        think_status.update(state="complete", expanded=False)
+    if done and done.get("done_reason") == "length":
         st.warning("⚠️ 生成被 num_predict 截断（done_reason=length）：答案没写完，可调大 RAG_NUM_PREDICT。")
-    return thinking, answer, gen_error, stats
-
-
-def _report_input_tokens(steps, ollama_messages, stats):
-    """把 Ollama 实测与本地估算的输入 token 写进推理链，并告警逼近 num_ctx 的情况。"""
-    import streamlit as st
-    prompt_tokens = stats.get("prompt_eval_count")
-    if not prompt_tokens:
-        return
-    est_tokens = message_tokens(ollama_messages)
-    steps[STEP_INPUT_TOKENS] = { "Ollama 实测": prompt_tokens, "本地估算": est_tokens, "num_ctx": NUM_CTX, "余量": NUM_CTX - prompt_tokens, }
-    if prompt_tokens >= NUM_CTX - GEN_INPUT_RESERVE:
-        st.warning(f"⚠️ 本轮输入 {prompt_tokens} token，已逼近 num_ctx={NUM_CTX}：服务端会开始整条丢弃消息（不报错），历史会静默少掉几轮，请调大 RAG_NUM_CTX。")
-    if est_tokens > prompt_tokens * 1.5:
-        st.info(f"ℹ️ 本地估算 {est_tokens}、实测 {prompt_tokens} token：估算偏保守，历史预算可调大。")
+    return thinking, answer, gen_error, done
 
 
 def _run_assistant_turn(engine, prompt, history):
-    """跑一轮检索与生成并渲染，把助手消息写进会话历史。"""
+    """跑一轮检索与生成并渲染；只有生成正常结束且答案非空才把助手消息写进会话历史。"""
     import streamlit as st
-    rag_status = st.status("🔍", expanded=True)
-    events = run_turn( engine, prompt, history, top_k=TOP_K, )
-    _kind, payload = next(events)   # 首事件恒为 retrieval，没有第二种起始契约
-    steps = payload["steps"]
-    gen = payload["gen"]
-    ollama_messages = payload["messages"]
-    with rag_status:
-        _render_trace(steps)
-    rag_status.update(label="🔍", state="complete", expanded=False)
-    if gen["truncated_user"]:
-        st.warning(f"⚠️ 本轮提问过长（{estimate_tokens(prompt)} token），已按上下文预算截断；可调大 RAG_NUM_CTX 或分次提问。")
-    thinking, answer, gen_error, stats = _stream_reply(events)
-    _report_input_tokens(steps, ollama_messages, stats)
-    # 会话条目是下一轮上下文候选：thinking/trace 只是页面旁路字段，永不进入模型消息。
-    entry = { "role": "assistant", "content": "" if gen_error else answer, "error": gen_error, "trace": _slim_trace(steps) }
+    try:
+        events = run_turn(engine, prompt, history, top_k=TOP_K, trace=False)
+        next(events)  # 首事件恒为 retrieval，不在页面上渲染
+        thinking, answer, gen_error, done = _stream_reply(events)
+    except Exception as exc:
+        log(f"⚠️  本轮执行异常: {type(exc).__name__}: {exc}")
+        st.error(f"本轮执行异常: {type(exc).__name__}: {exc}")
+        return
+    # 生成失败（stream_chat 只产出 error、不产出 done，与 API 侧同判据）或空答案：不入历史。
+    if not done or not answer or not answer.strip():
+        if gen_error:
+            log(f"⚠️  生成失败，本轮回复未写入历史: {gen_error[:300]}")
+        elif not done:
+            log("⚠️  生成未正常结束（无 done 事件），本轮回复未写入历史")
+        else:
+            log("⚠️  生成为空答案，本轮回复未写入历史")
+        return
+    entry = {"role": "assistant", "content": answer}
     if THINK and thinking:
         entry["thinking"] = thinking
     st.session_state.messages.append(entry)
@@ -2520,9 +2232,14 @@ def _st_engine():
 
 def run_streamlit():
     import streamlit as st
-    st.set_page_config(page_title="🤖", layout="wide")
+    st.set_page_config(layout="wide")
     engine = _st_engine()
-    if engine.count() == 0:
+    try:
+        empty = engine.count() == 0
+    except Exception as exc:
+        st.error(f"无法访问向量库: {type(exc).__name__}: {exc}")
+        st.stop()
+    if empty:
         st.error("向量库为空，先跑：python chatbot.py process && python chatbot.py index")
         st.stop()
     if "messages" not in st.session_state:
@@ -2680,7 +2397,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             _json_response(self, 503, { "status": "error", "error": f"无法访问向量库: {type(exc).__name__}: {exc}", }, close=True)
             return
-        _json_response(self, 200, { "status": "ok" if count else "empty", "chunks": count, "collection": collection, "model": MODEL, "ollama": OLLAMA_BASE_URL, "use_context": RAG_USE_CONTEXT, "think": THINK, "query_rewrite": REWRITE_ENABLED, })
+        _json_response(self, 200, { "status": "ok" if count else "empty", "chunks": count, "collection": collection, "model": MODEL, "ollama": OLLAMA_BASE_URL, "use_context": RAG_USE_CONTEXT, "think": THINK, })
     def do_POST(self):
         path = self.path.split("?")[0]
         if path not in ("/search", "/ask"):
@@ -2694,20 +2411,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         history, history_stripped = strip_current_turn(history, query)
         if path == "/search":
-            self._handle_search(query, top_k, source, history, history_stripped)
+            self._handle_search(query, top_k, source, history_stripped)
         else:
             self._handle_ask(query, top_k, source, history, data, history_stripped)
-    def _handle_search(self, query, top_k, source, history, history_stripped=False):
+    def _handle_search(self, query, top_k, source, history_stripped=False):
         try:
             with _REQUEST_LOCK:
                 engine = get_engine()
                 t0 = time.time()
-                results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source, history=history, )
+                results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source )
         except Exception as exc:
             _json_response(self, 500, {"error": f"检索失败: {type(exc).__name__}: {exc}"})
             return
-        rewrite = steps.get(STEP_REWRITE) or {}
-        _json_response(self, 200, { "query": query, "rewritten": rewrite.get("query") if rewrite.get("applied") else None, "rewrite_detail": rewrite, "source": source, "source_field": SOURCE_FIELD, "elapsed": round(time.time() - t0, 3), "confidence": steps.get(STEP_CONFIDENCE), "history_stripped": history_stripped, "results": [_result_json(r) for r in results], "steps": steps, })
+        _json_response(self, 200, { "query": query, "source": source, "source_field": SOURCE_FIELD, "elapsed": round(time.time() - t0, 3), "confidence": steps.get(STEP_CONFIDENCE), "history_stripped": history_stripped, "results": [_result_json(r) for r in results], "steps": steps, })
     def _handle_ask(self, query, top_k, source, history, data, history_stripped=False):
         headers_sent = False
         t0 = time.time()
@@ -2728,8 +2444,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             emit({ "type": "retrieval", "query": query, "elapsed": round(payload["elapsed"], 3), "confidence": payload["confidence"], "source": source, "source_field": SOURCE_FIELD, "sources": context_sources(payload["results"]), "history_stripped": history_stripped, "results": [_result_json(r) for r in payload["results"]], })
             gen = payload["gen"]
-            if gen["dropped_turns"] or gen["truncated"]:
-                emit({ "type": "history_trimmed", "dropped_turns": gen["dropped_turns"], "budget": gen["budget"], "used_tokens": gen["used_tokens"], "context_tokens": gen["context_tokens"], "truncated": gen["truncated"], "truncated_user": gen["truncated_user"], })
+            if gen["dropped_messages"] or gen["truncated"] or gen.get("over_window"):
+                emit({ "type": "history_trimmed", "dropped_messages": gen["dropped_messages"], "budget": gen["budget"], "used_tokens": gen["used_tokens"], "context_tokens": gen["context_tokens"], "truncated": gen["truncated"], "truncated_user": gen["truncated_user"], "query_tokens": gen.get("query_tokens"), "over_window": bool(gen.get("over_window")), })
             # 无拒答分支：首个事件恒为 retrieval，之后一律走 drain_events；检索为空也照常生成。
             _thinking, _answer, _error, done = drain_events(
                 events,
@@ -2753,19 +2469,24 @@ class Handler(BaseHTTPRequestHandler):
 
 def cmd_api():
     parser = argparse.ArgumentParser(description="RAG 知识库 HTTP API")
-    parser.add_argument("--host", default=os.getenv("RAG_API_HOST", "127.0.0.1"), help="监听地址（默认 127.0.0.1，仅本机可访问）")
+    parser.add_argument("--host", default=os.getenv("RAG_API_HOST", "::"), help="监听地址（默认 :: 双栈，IPv4/IPv6 localhost 均可访问）")
     parser.add_argument("--port", type=int, default=int(os.getenv("RAG_API_PORT", "8000")))
     args = parser.parse_args()
     _client, _coll, count = _qdrant_gate()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    log(f"API 就绪: http://{args.host}:{args.port}  （{count} 条，模型 {MODEL}）")
+    import socket as _socket
+    server_cls = ThreadingHTTPServer
+    if ":" in args.host:
+        server_cls = type("DualStackHTTPServer", (ThreadingHTTPServer,), {"address_family": _socket.AF_INET6})
+    server = server_cls((args.host, args.port), Handler)
+    _shown = f"[{args.host}]" if ":" in args.host else args.host
+    log(f"API 就绪: http://{_shown}:{args.port}  （{count} 条，模型 {MODEL}）")
     log("  GET  /health")
     log("  POST /search  {\"query\": \"<你的问题>\", \"top_k\": 5}")
     log("  POST /ask     {\"query\": \"<你的问题>\"}  → NDJSON 流")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        log("收到中断，正在关闭…")
+        pass
     finally:
         server.server_close()
 
@@ -2813,26 +2534,6 @@ def cmd_health():
     else:
         sys_note = f"规则 {len(SYSTEM_RULES_PROMPT)} 字" if SYSTEM_RULES_PROMPT else "空"
         ok(f"上下文注入: 纯资料消息(role={CONTEXT_ROLE}，只含检索 parent_text) + 本轮提问；system={sys_note}")
-    if REWRITE_ENABLED:
-        window = (f"只取最近 {REWRITE_MAX_TURNS} 轮" if (REWRITE_MAX_TURNS and REWRITE_MAX_TURNS > 0)
-                  else f"历史全量（粗略窗口 {REWRITE_NUM_CTX} 字，超出只报警不裁剪）")
-        ok(f"多轮查询改写: 开启（模型 {REWRITE_MODEL}，{window}，失败退回原查询）")
-    else:
-        log("  \u26a0\ufe0f  多轮查询改写: 关闭（RAG_QUERY_REWRITE=0） —— 指代性问句以字面检索会召回错来源；恢复: RAG_QUERY_REWRITE=1")
-    if REWRITE_ENABLED and CONCAT_ENABLED:
-        ok(f"多轮降级链: LLM 改写 → 拼接上轮用户句 → 字面原句（拼接档截断 {CONCAT_MAX_CHARS} 字）")
-    elif REWRITE_ENABLED:
-        log("  \u26a0\ufe0f  多轮降级链: 只剩 LLM 改写 → 字面原句（RAG_QUERY_REWRITE_CONCAT=0，实测 topic@k 掉到 42.9%）")
-    else:
-        log("  \u26a0\ufe0f  多轮降级链: 纯字面检索（RAG_QUERY_REWRITE=0） —— 实测多轮指标会掉（source@1 100%→81%、topic@k 95.2%→42.9%）")
-        if CONCAT_ENABLED:
-            log("  \u2139\ufe0f  RAG_QUERY_REWRITE_CONCAT=1 在关档下不生效：拼接档只属于「开」这一档")
-    if QUERY_FUSION:
-        ok(f"多路召回融合: 开启（LLM 档成功时额外召回拼接档；rerank 口径 {RERANK_QUERY_MODE}）")
-        if RERANK_QUERY_MODE != "primary":
-            log(f"  \u2139\ufe0f  RAG_RERANK_QUERY={RERANK_QUERY_MODE} 是实测未定论项，改默认前请先扩探针")
-    else:
-        log("  \u2139\ufe0f  多路召回融合: 关闭（RAG_QUERY_FUSION=0） —— 实测 3 改善 / 1 退化，撑不起改默认值；数字见 .env 注释")
     if RERANK_ON == "parent" and RERANK_MAX_LENGTH < PARENT_MAX_TOKENS:
         log(f"  \u26a0\ufe0f  RERANK_ON=parent 但 RERANK_MAX_LENGTH={RERANK_MAX_LENGTH} < 父块上限 {PARENT_MAX_TOKENS}：父块尾部会被静默截掉")
     if not RRF_DENSE_WEIGHT:
@@ -2842,9 +2543,9 @@ def cmd_health():
     ok(f"检索参数: top_k={TOP_K} / 候选池 {RERANK_TOP_K} / 每通道召回 {RECALL_LIMIT} / RRF k={RRF_K} 权重 稠密 {RRF_DENSE_WEIGHT} 稀疏 {RRF_SPARSE_WEIGHT} / rerank {RERANK_ON}（max_length {RERANK_MAX_LENGTH}）")
     unread = env_declared_but_unread()
     if unread:
-        log(f"  \u26a0\ufe0f  以下 {len(unread)} 个变量本应用不读取（写了对本应用无效）: {unread}")
+        log(f"  \u26a0\ufe0f  以下 {len(unread)} 个 .env 变量本应用不读取（写了对本应用无效）: {unread}")
     else:
-        ok("配置项检查: 环境里声明的检索/生成变量全部被代码读取")
+        ok("配置项检查: .env 里声明的检索/生成变量全部被代码读取")
     log("\n[2] 源文档")
     try:
         doc_paths = _document_paths()
@@ -3472,16 +3173,18 @@ def cmd_stages():
     elif not os.path.exists(CHUNKS_JSON):
         log("  ⏭  缺 chunks.json，先跑 process")
     else:
-        cache_path = next((p for p in (_embed_cache_file("fp32"), _embed_cache_file("fp16")) if os.path.exists(p)), None)
-        if cache_path is None:
-            stale.append("B"); log("  ❌ 没有本嵌入模型的缓存文件 -> index 会全量重算稠密向量")
+        precision = _index_cache_precision()
+        preferred = _embed_cache_file(precision)
+        if not os.path.exists(preferred):
+            stale.append("B")
+            log(f"  ❌ 缺少当前设备精度（{precision}）的缓存文件 {os.path.basename(preferred)} -> index 会全量重算稠密向量")
         else:
             try:
-                cache = _load_embed_cache(cache_path)
+                cache = _load_embed_cache(preferred)
                 with open(CHUNKS_JSON, encoding="utf-8") as f:
                     chunks = json.load(f)
                 need = sum(1 for c in chunks if _embed_cache_key(c.get("contextual_text") or c.get("child_text", "")) not in cache)
-                log(f"  ✅ 缓存 {os.path.basename(cache_path)}：{len(cache)} 条；当前产物 {need}/{len(chunks)} 条需重算（增量）")
+                log(f"  ✅ 缓存 {os.path.basename(preferred)}（{precision}）：{len(cache)} 条；当前产物 {need}/{len(chunks)} 条需重算（增量）")
             except Exception as exc:
                 log(f"  ⚠️  缓存检查失败（不影响 A/C/D 判定）: {type(exc).__name__}: {exc}")
 
@@ -3494,7 +3197,7 @@ def cmd_stages():
             stale.append("D"); log("  [D] ❌ 集合不存在 -> 需要: python chatbot.py index")
         else:
             qd_count = client.count(collection_name=coll, exact=True).count
-            pts = client.retrieve(collection_name=coll, ids=[0], with_payload=True) if qd_count else []
+            pts, _ = client.scroll(collection_name=coll, limit=1, with_payload=True) if qd_count else ([], None)
             idx_lex = (pts[0].payload or {}).get(LEXICON_ID_FIELD) if pts else None
             lex_now = lexicon_fingerprint()
             if idx_lex is None:

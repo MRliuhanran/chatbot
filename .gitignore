@@ -17,6 +17,7 @@ corpus/
 
 # ---- 运行时产物 ----
 *.log
+*.out
 *.pid
 debug_*.png
 
