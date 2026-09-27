@@ -1,0 +1,5 @@
+# 魔搭创空间要求单文件 >100MB 必须走 Git LFS。
+# 注意：models/ 现在已从镜像移除、改由 entrypoint 运行时下载，正常情况下不需要推送模型。
+# 仅当你选择"自带模型"（git add -f models/）时，下面两条 LFS 规则才生效。
+models/**/*.bin filter=lfs diff=lfs merge=lfs -text
+models/**/*.safetensors filter=lfs diff=lfs merge=lfs -text

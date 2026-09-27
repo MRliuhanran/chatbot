@@ -1,0 +1,20 @@
+# 构建上下文瘦身。
+# 进镜像：.env / artifacts / qdrant_storage / corpus / lexicon（本地数据，开箱即用）
+# 不进镜像：models/ —— 嵌入/重排权重可由服务器下载，entrypoint 启动时按需拉取（省 ~1.5G）
+.git
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+.ruff_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+venv/
+.venv/
+bak/
+*.log
+*.out
+.DS_Store
+snapshots/
+models/
