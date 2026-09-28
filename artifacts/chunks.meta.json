@@ -1,0 +1,30 @@
+{
+  "meta_version": 1,
+  "fingerprint": "91b50c8672cb0ecb",
+  "chunking_config": {
+    "child_max_tokens": 128,
+    "child_min_tokens": 32,
+    "parent_max_tokens": 512,
+    "parent_min_tokens": 192,
+    "chunk_overlap": 32,
+    "semantic_threshold": 0.6,
+    "semantic_min_chars": 500,
+    "normalize_quotes": true,
+    "embed_model": "./models/bge-base-zh-v1.5",
+    "sentencex": "1.0.30",
+    "chunking_code": "c2bc4985e087e5b8",
+    "sentence_terminators": "。！？．…!?",
+    "paragraph_gap_re": "\\r?\\n[ \\t\\r]*\\r?\\n",
+    "soft_wrap_re": "\\s*\\r?\\n\\s*"
+  },
+  "sources": {
+    "三国演义.txt": "48922aa73c07e0b9",
+    "水浒传.txt": "0f0130fcbc4ac8a3",
+    "红楼梦.txt": "0917603d01be8d7b",
+    "西游记.txt": "3f2bf2164ee63ad7"
+  },
+  "total_chunks": 22020,
+  "total_parents": 5711,
+  "reused_documents": 0,
+  "build_time": "2026-09-27T09:22:35"
+}
