@@ -41,14 +41,15 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # Qdrant + Ollama(CPU)：
-# - Qdrant 官方发版 amd64 只有 gnu 版、arm64 只有 musl 版（实测对端 404/200），故按架构取；
+# - Qdrant 两架构统一用官方 musl 静态版：gnu 版链接 glibc≥2.38，bookworm 基座只有 2.36
+#   （实测 amd64 gnu 版起不来：GLIBC_2.38 not found），musl 静态版不挑发行版；
 # - Ollama 只发 .tar.zst（.tgz 已 404），解压需要 zstd；
 # - 删掉 Ollama 的 CUDA/ROCm 运行库：CPU 服务器只用 libggml-cpu-*，删后 ollama 仍可用；
 # - 多源下载：直连 GitHub 常被限速到 <100KB/s，低于 200KB/s 持续 30s 即判慢，自动改走
 #   gh-proxy.com 镜像（只是加前缀，真实资产仍在 GitHub）。
 RUN set -eux; \
     case "${TARGETARCH}" in \
-      amd64) _qarch="x86_64-unknown-linux-gnu" ;; \
+      amd64) _qarch="x86_64-unknown-linux-musl" ;; \
       arm64) _qarch="aarch64-unknown-linux-musl" ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
