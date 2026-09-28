@@ -19,6 +19,27 @@ if [ ! -f .env ]; then
     _log "⚠️ 缺少 .env（git 推送前没 git add -f .env？）：将退到代码默认配置"
 fi
 
+# ── 0.5 内存观测（压 8G 边界调参用）：每 30 秒一行打进 run 日志 ───────────────────
+# 读数：cg_max=max 表示无 cgroup 限额；anon=匿名内存（OOM 真正判据，file 页可回收
+# 不算）；top=RSS 前 4 进程。调 RAG_NUM_CTX 后看 anon 是否逼近 ~7.5G 再继续加码。
+(
+    while :; do
+        _m="[mem]"
+        if [ -r /proc/meminfo ]; then
+            _m="${_m} $(awk '/MemTotal|MemAvailable/{printf "%s %sM ", $1, int($2/1024)}' /proc/meminfo)"
+        fi
+        if [ -r /sys/fs/cgroup/memory.current ] && [ -r /sys/fs/cgroup/memory.max ]; then
+            _m="${_m} cg_cur:$(($(cat /sys/fs/cgroup/memory.current) / 1048576))M cg_max:$(cat /sys/fs/cgroup/memory.max)"
+            if [ -r /sys/fs/cgroup/memory.stat ]; then
+                _m="${_m} anon:$(($(awk '/^anon /{print $2}' /sys/fs/cgroup/memory.stat) / 1048576))M"
+            fi
+        fi
+        _m="${_m} top:$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -4 | awk '{printf "%s(%sM) ", $2, int($1/1024)}')"
+        printf '%s\n' "${_m}"
+        sleep 30
+    done
+) &
+
 # ── 1. Qdrant ──────────────────────────────────────────────────────────────
 # 与本地 docker-compose 完全同配置：加载同一份 qdrant_config/config.yaml
 # （memmap/indexing 阈值、log_level 等与本地一致），storage_path 用环境变量
