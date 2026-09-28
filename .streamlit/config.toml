@@ -6,6 +6,12 @@
 address = "127.0.0.1"
 port = 8501
 headless = true
+# 平台网关会把 Host 改写为容器内部地址，外部域名与之不同源，
+# 不在白名单会被 Streamlit 拒绝 WebSocket（页面 200 但一直转圈）。
+corsAllowedOrigins = [
+  "https://liuhanran-chatbot.ms.show",
+  "https://studio-liuhanran-chatbot.api-inference.modelscope.net",
+]
 
 [client]
 # 极简前端：隐藏工具条，异常不显示细节
