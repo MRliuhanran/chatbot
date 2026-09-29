@@ -33,6 +33,7 @@ ARG QDRANT_VERSION=v1.19.1
 ARG OLLAMA_VERSION=0.34.4
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG PIP_FALLBACK_INDEX=https://mirrors.aliyun.com/pypi/simple
 
 # 系统依赖单独成层（这个层很慢但很稳定，与下面的下载分层，改下载逻辑不必重装 apt）
 RUN set -eux; \
@@ -91,8 +92,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir \
         --index-url "${TORCH_INDEX_URL}" \
         --extra-index-url "${PIP_INDEX_URL}" \
+        --extra-index-url "${PIP_FALLBACK_INDEX}" \
         "torch==2.7.1+cpu" \
-    && pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt \
+    && pip install --no-cache-dir \
+        --index-url "${PIP_INDEX_URL}" \
+        --extra-index-url "${PIP_FALLBACK_INDEX}" \
+        -r requirements.txt \
     && pip check \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
     && rm -rf /root/.cache
