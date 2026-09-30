@@ -12,6 +12,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -178,8 +179,13 @@ def stream_chat(messages, temperature=0.0):
                 continue
             chunk = json.loads(line)
             if chunk.get("error"):
+                # return 而不是 continue：本函数对外承诺「error 与 done 互斥」，消费侧
+                # （_run_assistant_turn 只在 done 时入历史、_handle_ask 只在 done 时收尾）
+                # 全靠这条。旧写法 continue 会让同一流后面的 {"done":true} 照常产出 done，
+                # 于是「被错误打断的残缺答案」同时满足 done 与非空，被写进会话历史 ——
+                # 而页面只渲染了错误，那段答案用户一个字符都没见过。
                 yield EVENT_ERROR, f"[Ollama] {chunk['error']}"
-                continue
+                return
             message = chunk.get("message") or {}
             # 生产端唯一闸门：关着时事件流里不存在 EVENT_THINKING。
             if message.get("thinking"):
@@ -204,7 +210,10 @@ def stream_chat(messages, temperature=0.0):
 
 # ── 通用文本谓词 ──
 def _has_searchable_content(text):
-    # 只认 Unicode 字母/数字（CJK 的 Lo、数字的 Nd）；标点、符号、零宽等格式字符不算内容。
+    # 认 Unicode 字母与数字（CJK 的 Lo、数字的 Nd）；标点、符号、零宽等格式字符不算内容。
+    # 数字必须算：年份/编号（"1998"、"300 强"、"3.5"）是合法提问，按"仅字母"拦会让它们
+    # 零检索，随后无拒答链路照常生成 —— 正是 AGENTS 点名的"检索为空却照常作答"。
+    # 不变量是"空查询与纯标点必拦"：纯数字既非空也非标点，不该被这道闸门吃掉。
     if not isinstance(text, str) or not text:
         return False
     return any(unicodedata.category(ch)[0] in ("L", "N") for ch in text)
@@ -222,6 +231,13 @@ HEALTH_PROBE_QUESTION = os.getenv("RAG_HEALTH_PROBE", "请用一句话说明你�
 _RESERVED_SOURCE_FIELDS = {
     "chunk_id", "id", "child_text", "parent_text", "chunk_index", "total_chunks",
     "contextual_text", "parent_id", "parent_chunk_count", "build_id", "lexicon_id",
+    # 见 INDEX_BUILD_ID_FIELD 一组：这两个字段名也是内部保留键，不能被来源字段占用
+    "chunk_fingerprint",
+    # 以下不是 payload 字段，而是**对外输出**要用的键：SOURCE_FIELD 原样写进 /search 的
+    # _result_json 与 steps.context_sources，同名即就地覆盖 —— score/text/context/n/
+    # rerank_score/source_label/point_id 会静默变成来源字符串（响应看着正常，字段全错）。
+    # source 是默认值本身，不能列入，否则启动必炸。
+    "score", "text", "context", "n", "rerank_score", "source_label", "point_id",
 }
 if SOURCE_FIELD in _RESERVED_SOURCE_FIELDS:
     raise ValueError(
@@ -239,6 +255,8 @@ PARENT_MAX_TOKENS = env_int("RAG_PARENT_MAX_TOKENS", 512)
 CHUNK_OVERLAP = env_int("RAG_CHUNK_OVERLAP", 32)
 PARENT_MIN_TOKENS = env_int("RAG_PARENT_MIN_TOKENS", 192)
 CHILD_MIN_TOKENS = env_int("RAG_CHILD_MIN_TOKENS", 32)
+if CHILD_MAX_TOKENS > PARENT_MAX_TOKENS:
+    raise ValueError(f"RAG_CHILD_MAX_TOKENS={CHILD_MAX_TOKENS} 不能大于 RAG_PARENT_MAX_TOKENS={PARENT_MAX_TOKENS}")
 SEMANTIC_THRESHOLD = env_float("RAG_SEMANTIC_THRESHOLD", 0.6)
 SEMANTIC_MIN_CHARS = env_int("RAG_SEMANTIC_MIN_CHARS", 500)
 EMBED_BATCH_SIZE = env_int("RAG_EMBED_BATCH_SIZE", 64)
@@ -246,6 +264,9 @@ SEMANTIC_EMBED_DEVICE = os.getenv("SEMANTIC_EMBED_DEVICE", "")  # 空=自动选�
 INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
 QDRANT_HOST = os.getenv("QDRANT_HOST") or os.getenv("RAG_QDRANT_HOST") or "localhost"
 QDRANT_PORT = int(os.getenv("QDRANT_PORT") or os.getenv("RAG_QDRANT_PORT") or "6333")
+# docker-compose.yml 的 QDRANT__SERVICE__API_KEY 取的就是它：不接这条通路，一旦设置了
+# key，应用侧每个 Qdrant 请求都会 401，且日志里没有任何地方能填 key（失效原型：静默）。
+QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("RAG_QDRANT_API_KEY") or "").strip() or None
 COLLECTION_BASE = os.getenv("RAG_COLLECTION_BASE", "rag_documents_v1")
 COLLECTION_NAME = COLLECTION_BASE
 COLLECTION_ALIAS = os.getenv("RAG_COLLECTION_ALIAS", "rag_current")
@@ -265,6 +286,7 @@ LEXICON_DIR = os.getenv("RAG_LEXICON_DIR", "./lexicon")
 SCROLL_PAGE_SIZE = 1000
 INDEX_BUILD_ID_FIELD = "build_id"
 LEXICON_ID_FIELD = "lexicon_id"
+CHUNK_FINGERPRINT_FIELD = "chunk_fingerprint"
 _PAYLOAD_SPEC = ( ("chunk_id", "id", ""), ("child_text", "child_text", ""), ("parent_text", "parent_text", ""), (SOURCE_FIELD, "source", ""), ("chunk_index", "chunk_index", 0), ("total_chunks", "total_chunks", 0), ("contextual_text", "contextual_text", ""), ("parent_id", "parent_id", ""), ("parent_chunk_count", "parent_chunk_count", 0), )
 
 
@@ -286,10 +308,14 @@ def _chunk_value(chunk, key, default=""):
     return chunk.get(key, default)
 
 
-def chunk_payload(chunk, build_id, lexicon_id):
+def chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint=None):
     payload = {f: _chunk_value(chunk, k, d) for f, k, d in _PAYLOAD_SPEC}
     payload[INDEX_BUILD_ID_FIELD] = build_id
     payload[LEXICON_ID_FIELD] = lexicon_id
+    # 记录本索引是**哪一份分块产物**建起来的。检索侧拿它与当前切分指纹比对，等价于
+    # 词表指纹那道闸门：没有它，process 之后的旧 chunks/Qdrant 会被 serve/api 静默
+    # 继续服务（stages 报过期，但没人看），用户拿到的是无声的旧知识库。
+    payload[CHUNK_FINGERPRINT_FIELD] = chunk_fingerprint
     return payload
 RRF_K = env_int_min("RAG_RRF_K", 60, 0)
 RRF_DENSE_WEIGHT = env_float_min("RAG_RRF_DENSE_WEIGHT", 1.0, 0.0)
@@ -306,7 +332,7 @@ DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
 BM25_TEXT_OPTIONS = { "tokenizer": "word", "stemmer": {"type": "none"}, "stopwords": {}, "ascii_folding": True, }
 BM25_MODEL_NAME = "qdrant/bm25"
-_PUNCT_ONLY = set("，。！？、；：\u201c\u201d\u2018\u2019《》…—（）()[]{}<>!?,.;:'\"-·　 \n\t")
+_PUNCT_AND_WHITESPACE = set("，。！？、；：\u201c\u201d\u2018\u2019《》…—（）()[]{}<>!?,.;:'\"-·　 \n\t")
 
 
 def history_to_messages(history):
@@ -346,10 +372,20 @@ def _float16_ok(device):
 
 
 # ── 模型加载与向量化 ──
+def _require_model_dir(path, what, hint):
+    if not path or not os.path.isdir(path) or not os.listdir(path):
+        raise RuntimeError(f"{what}模型目录缺失或为空: {path!r} —— {hint}")
+    return path
+
+
 def load_embedding_model(device=None, model_path=None):
     from transformers import AutoTokenizer, AutoModel
     device = device or get_device()
-    model_path = model_path or EMBED_MODEL_PATH
+    model_path = _require_model_dir(
+        model_path or EMBED_MODEL_PATH, "嵌入",
+        "创空间看运行日志的 [entrypoint] 权重下载行（下载完成后再试）；"
+        "本地确认 RAG_EMBED_MODEL_PATH 指向可用的模型目录",
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModel.from_pretrained(model_path).to(device)
     model.eval()
@@ -361,8 +397,13 @@ def load_reranker_model(device=None):
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     device = device or get_device()
     dtype = torch.float16 if _float16_ok(device) else torch.float32
-    tokenizer = AutoTokenizer.from_pretrained(RERANK_MODEL_PATH)
-    model = AutoModelForSequenceClassification.from_pretrained( RERANK_MODEL_PATH, torch_dtype=dtype ).to(device)
+    model_path = _require_model_dir(
+        RERANK_MODEL_PATH, "重排",
+        "创空间看运行日志的 [entrypoint] 权重下载行（下载完成后再试）；"
+        "本地确认 RAG_RERANK_MODEL_PATH 指向可用的模型目录",
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForSequenceClassification.from_pretrained( model_path, torch_dtype=dtype ).to(device)
     model.eval()
     return tokenizer, model, device
 
@@ -389,7 +430,11 @@ def embed(texts, tokenizer, model, device, is_query=False, autocast=False):
 
 # ── 分块：归一、分句、父子打包 ──
 SENTENCE_TERMINATORS = "。！？．…!?"
-_PARAGRAPH_GAP_RE = re.compile(r"\r?\n[ \t\r]*\r?\n")
+# 段落硬边界判据：只认**真正空行**（两个连续换行，允许 \r）。句内单个 \n 是软折行，
+# 属合法排版；而"行内只含空格/TAB 的空行"（\n[ \t]*\n）sentencex 并不当边界 ——
+# 旧正则把它也算作硬边界，于是"空行带尾随空格、空行后紧跟闭引号（”）"这类合法 txt
+# 会在这里直接抛错，把 process 整体打崩（与 D1 同类：报错还把原因误指成 sentencex 变了）。
+_PARAGRAPH_GAP_RE = re.compile(r"\r?\n\r?\n")
 _SOFT_WRAP_RE = re.compile(r"\s*\r?\n\s*")
 NORMALIZE_QUOTES = env_bool("NORMALIZE_QUOTES", True)
 
@@ -600,11 +645,15 @@ def _encode_sentences(sentences):
     return torch.cat(vecs).cpu().numpy()
 
 
-def _semantic_split(text, tokenizer, threshold=SEMANTIC_THRESHOLD):
+def _semantic_split(text, threshold=SEMANTIC_THRESHOLD):
     """语义分块：在语义边界处切分，并保证每块不小于 SEMANTIC_MIN_CHARS 字符。
 
     最小长度下限是必需的：叙事文本相邻句余弦相似度天然偏低（常低于 0.6），
     只看阈值会把每 1~2 句切成一块（实测平均 30 字），等于没有分块。
+
+    不收 tokenizer：语义定界只用句级小批量嵌入（_encode_sentences 内部自取模型），
+    逐句 token 上限兜底在下游 _split_by_tokens / _split_into_children 里做。旧签名
+    收下它却从不使用，是死参数。
     """
     sentences = _split_sentences(text)
     if len(sentences) <= 1:
@@ -675,7 +724,7 @@ def _hierarchical_split(text, tokenizer):
     再长则先切父块、每个父块内部再切子块。
     """
     results = []
-    for chunk in _semantic_split(text, tokenizer):
+    for chunk in _semantic_split(text):
         chunk_tokens = len(tokenizer.encode(chunk, add_special_tokens=False))
 
         if chunk_tokens <= CHILD_MAX_TOKENS:
@@ -1079,13 +1128,17 @@ def build_chunks():
         dropped = len(pairs) - len(kept)
         if dropped:
             log(f"    ⚠️  丢弃 {dropped} 个纯空白块（不含任何文字）")
+        if not kept:
+            raise ValueError(f"文档 {source_name} 分块后无有效内容（所有块均为空白），请检查源文件或调整分块参数")
         parent_ids = {}
         for _, parent_text in kept:
             if parent_text not in parent_ids:
                 parent_ids[parent_text] = f"{source_name}_p{len(parent_ids)}"
         doc_chunks = []
         for chunk_idx, (child_text, parent_text) in enumerate(kept):
-            doc_chunks.append({ "child_text": child_text, "parent_text": parent_text, "source": source_name, "chunk_index": chunk_idx, "total_chunks": len(kept), "parent_id": parent_ids[parent_text], "parent_chunk_count": 0, "contextual_text": child_text, "id": f"{source_name}_{chunk_idx}", })
+            chunk_dict = { "child_text": child_text, "parent_text": parent_text, "chunk_index": chunk_idx, "total_chunks": len(kept), "parent_id": parent_ids[parent_text], "parent_chunk_count": 0, "contextual_text": child_text, "id": f"{source_name}_{chunk_idx}", }
+            chunk_dict[SOURCE_FIELD] = source_name
+            doc_chunks.append(chunk_dict)
         _save_doc_chunks(source_name, sha, fingerprint, doc_chunks)
         all_chunks.extend(doc_chunks)
     _gc_doc_chunks(names_now)
@@ -1269,6 +1322,9 @@ def lexicon_fingerprint():
                 parts.append(hashlib.sha256(f.read()).hexdigest())
         except OSError:
             parts.append("missing")
+    # 显式加入解析后的运行时配置值，防止环境变量变更但文件内容相同时指纹不变
+    parts.append(f"ALIASES_FILE={ALIASES_FILE}")
+    parts.append(f"STOPWORDS_FILE={STOPWORDS_FILE}")
     parts.append(f"aliases={int(ALIASES_ENABLED)},stopwords={int(STOPWORDS_ENABLED)}")
     try:
         from importlib.metadata import version
@@ -1279,7 +1335,7 @@ def lexicon_fingerprint():
     # BM25 模型名、分词标点集与解析/归一链路源码同样决定稀疏词空间：漏掉会让换编码后
     # 指纹不变、stages 误报 C 新鲜，稀疏索引静默错配。
     parts.append("bm25_model=" + BM25_MODEL_NAME)
-    parts.append("punct=" + "".join(sorted(_PUNCT_ONLY)))
+    parts.append("punct=" + "".join(sorted(_PUNCT_AND_WHITESPACE)))
     import inspect
     for name in ("parse_aliases", "parse_stopwords", "_read_aliases", "_read_stopwords", "load_lexicon", "normalize_aliases", "bm25_tokenize", "sparse_encode"):
         fn = globals().get(name)
@@ -1307,7 +1363,7 @@ def bm25_tokenize(text):
     tokens = []
     for token in jieba.cut_for_search(text):
         token = token.strip()
-        if not token or all(ch in _PUNCT_ONLY for ch in token):
+        if not token or all(ch in _PUNCT_AND_WHITESPACE for ch in token):
             continue
         if stopwords and token in stopwords:
             continue
@@ -1315,9 +1371,45 @@ def bm25_tokenize(text):
     return " ".join(tokens)
 
 
+_EMPTY_SPARSE_TEXT = "\u200b"  # bm25_tokenize 为空时 sparse_encode 的占位（见下）
+
+
 def sparse_encode(text):
     from qdrant_client import models
-    return models.Document( text=bm25_tokenize(text), model=BM25_MODEL_NAME, options=BM25_TEXT_OPTIONS, )
+    tokenized = bm25_tokenize(text)
+    if not tokenized:
+        tokenized = _EMPTY_SPARSE_TEXT  # 零宽空格，避免空文档导致 BM25 静默失败
+    return models.Document(text=tokenized, model=BM25_MODEL_NAME, options=BM25_TEXT_OPTIONS)
+
+
+def sparse_terms_of(text):
+    """文本在稀疏通道里的**真实** term 列表（已滤掉停用词与纯标点）。
+
+    为什么不能看 `sparse_encode` 返回的 `Document.text` 判空：空分词会被替换成零宽空格
+    哨兵 `_EMPTY_SPARSE_TEXT`，而 Python 的 `str.strip()` 不认为 U+200B 是空白，于是
+    哨兵让"是否为空"永远为真 —— 稀疏通道在整句命中停用词时既不产出召回、也不报错、
+    也不留任何痕迹（"静默"失效原型）。这里与 sparse_encode 共用 bm25_tokenize，
+    使"这个查询在稀疏通道有没有词"只有一个判据。
+    """
+    return bm25_tokenize(text).split()
+
+
+def _index_text(rec):
+    """**入库文本的唯一来源**：稠密向量、稀疏向量、稠密缓存键都取这一个字段。
+
+    为什么必须是同一份：`contextual_text` 与 `child_text` 是两个字段（`_PAYLOAD_SPEC`
+    各存一份），旧代码稠密取前者、稀疏取后者、stages 的缓存键又写成
+    `contextual_text or child_text` 的兜底 —— 三份规则。两者今天逐字相同，所以差异
+    一直被掩盖；一旦分叉，**同一个点的稠密与稀疏向量就描述了不同文本**，检索静默
+    变差且无处可查。这里把规则收敛成一份，缺字段直接报错而不是悄悄换字段。
+    """
+    text = rec.get("contextual_text")
+    if not isinstance(text, str):
+        raise RuntimeError(
+            f"分块记录缺 contextual_text（id={rec.get('id')!r}）——"
+            "稠密/稀疏/缓存键都取它，请重跑 process"
+        )
+    return text
 
 
 def _embed_cache_key(text):
@@ -1412,7 +1504,11 @@ def build_index():
     log(f"加载分块数据: {len(all_chunks)} 条（{meta.get('total_parents', '?')} 个父块）")
     build_id = uuid.uuid4().hex
     lexicon_id = lexicon_fingerprint()
+    # 记进 payload 的是**产物自己的**指纹（verify_chunks_freshness 刚核对过与当前一致），
+    # 检索侧拿它与当前指纹比对，process 后忘了重跑 index 就会当场报错而不是静默用旧库。
+    chunk_fingerprint = meta.get("fingerprint")
     log(f"索引建造标识: {build_id}")
+    log(f"分块指纹: {chunk_fingerprint}（检索侧据此判断分块是否过期）")
     log(f"词表指纹: {lexicon_id}（别名 {ALIASES_ENABLED} / 停用词 {STOPWORDS_ENABLED}）")
     device = INDEX_DEVICE or get_device()
     use_gpu = device in ("mps", "cuda")
@@ -1425,23 +1521,28 @@ def build_index():
             log(f"    ⚠️  {device.upper()} 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
             tokenizer, model, use_gpu = None, None, False
     if use_gpu:
-        batch_size = 128
+        batch_size = EMBED_BATCH_SIZE
         cool_down_sleep = 0.1
         precision = "fp16"
         log(f"Embedding 设备: {device} (fp16, batch_size={batch_size})")
     else:
         tokenizer, model, device = load_embedding_model(device="cpu")
         torch.set_num_threads(6)
-        batch_size = 128
+        batch_size = EMBED_BATCH_SIZE
         cool_down_sleep = 0.05
         precision = "fp32"
         log(f"Embedding 设备: cpu (6线程, batch_size={batch_size})")
     total = len(all_chunks)
     t0 = time.time()
-    texts = [c["contextual_text"] for c in all_chunks]
+    texts = [_index_text(c) for c in all_chunks]
     keys = [_embed_cache_key(t) for t in texts]
     cache_path = _embed_cache_file(precision)
     expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
+    if expected_dim is None:
+        # 回退：用一次前向传播推断维度，避免缓存维度校验被绕过
+        test_vec = embed([texts[0]], tokenizer, model, device, is_query=False, autocast=use_gpu)
+        expected_dim = test_vec.shape[-1]
+        log(f"  推断嵌入维度: {expected_dim}")
     cache = (_load_embed_cache(cache_path, expected_dim=expected_dim) if EMBED_CACHE_ENABLED else {})
     missing = [i for i, k in enumerate(keys) if k not in cache]
     log(f"批量生成 Embedding... 命中缓存 {total - len(missing)}/{total} 条，需计算 {len(missing)} 条")
@@ -1474,7 +1575,7 @@ def build_index():
     del model, tokenizer
     if device == "mps":
         _mps_empty_cache()
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
     alias_ok = USE_COLLECTION_ALIAS
     if alias_ok:
         try:
@@ -1502,30 +1603,59 @@ def build_index():
         batch_embeddings = embeddings[i:i + write_batch]
         points = []
         for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
-            doc_text = chunk.get("child_text", "")
-            points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(doc_text), }, payload=chunk_payload(chunk, build_id, lexicon_id), ))
+            # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
+            points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))
         client.upsert(collection_name=target_collection, points=points)
         done = min(i + write_batch, total)
         if (i // write_batch) % 5 == 0 or done >= total:
             log(f"  Qdrant 写入进度: {done}/{total}")
     info = client.get_collection(collection_name=target_collection)
-    log(f"  Qdrant 写入完成: {client.count(collection_name=target_collection).count} 条")
+    # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages/health 事后发现：
+    # 非别名路径下 delete_collection 被 except: pass 吞掉时，旧集合点数多于本次 total
+    # 会留下 id >= total 的残留点（写入只覆盖 0..total-1），而它们永远不会被检索命中。
+    written = client.count(collection_name=target_collection, exact=True).count
+    log(f"  Qdrant 写入完成: {written} 条")
+    if written != total:
+        raise RuntimeError(
+            f"集合 {target_collection} 点数 {written} != 分块记录数 {total}："
+            "非别名模式下旧集合可能未被删净（残留 id 检索不到）；"
+            "请删掉该集合后重跑 index，或启用 RAG_USE_COLLECTION_ALIAS"
+        )
     coll_dense_size = next(iter(info.config.params.vectors.values())).size
     assert coll_dense_size == embeddings.shape[1], f"集合稠密维度 {coll_dense_size} 与本次编码维度 {embeddings.shape[1]} 不一致（集合名 {target_collection}）"
     log(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} (size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")
     log("  索引构建完成: 稠密向量 + 稀疏向量（jieba 分词 + Qdrant 内置 BM25 打分）")
     if alias_ok:
-        try:
-            old_collection = next( (a.collection_name for a in client.get_aliases().aliases if a.alias_name == COLLECTION_ALIAS), None, )
-            # 空别名冷启动不能对不存在的 alias 提交 Delete（部分 Qdrant 版本整批失败）；有旧别名才删，Create 恒提交。
-            ops = []
-            if old_collection is not None:
-                ops.append(DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION_ALIAS)))
-            ops.append(CreateAliasOperation(create_alias=CreateAlias( collection_name=target_collection, alias_name=COLLECTION_ALIAS)))
-            client.update_collection_aliases(change_aliases_operations=ops)
-            log(f"  别名已切换: {COLLECTION_ALIAS} → {target_collection}" + (f"（原 {old_collection}）" if old_collection else "（冷启动，无旧别名）"))
-        except Exception as exc:
-            raise RuntimeError(f"别名切换失败：新集合 {target_collection} 已建好但检索端仍指向旧集合，请检查 Qdrant 别名支持: {exc}") from exc
+        # 别名切换存在竞态窗口：get_aliases 到 update_collection_aliases 间其他进程可能修改别名。
+        # 采用重试 + 验证策略：最多重试 3 次，每次切换后验证别名确实指向新集合。
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                old_collection = next(
+                    (a.collection_name for a in client.get_aliases().aliases if a.alias_name == COLLECTION_ALIAS),
+                    None,
+                )
+                # 空别名冷启动不能对不存在的 alias 提交 Delete（部分 Qdrant 版本整批失败）；有旧别名才删，Create 恒提交。
+                ops = []
+                if old_collection is not None:
+                    ops.append(DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION_ALIAS)))
+                ops.append(CreateAliasOperation(create_alias=CreateAlias(collection_name=target_collection, alias_name=COLLECTION_ALIAS)))
+                client.update_collection_aliases(change_aliases_operations=ops)
+                # 验证别名切换成功
+                aliases_after = client.get_aliases().aliases
+                new_target = next((a.collection_name for a in aliases_after if a.alias_name == COLLECTION_ALIAS), None)
+                if new_target == target_collection:
+                    log(f"  别名已切换: {COLLECTION_ALIAS} → {target_collection}" + (f"（原 {old_collection}）" if old_collection else "（冷启动，无旧别名）"))
+                    break
+                else:
+                    log(f"  ⚠️  别名切换验证失败（尝试 {attempt + 1}/{max_retries}）：别名指向 {new_target}，期望 {target_collection}，重试中...")
+                    if attempt == max_retries - 1:
+                        raise RuntimeError(f"别名切换失败：重试 {max_retries} 次后别名仍指向 {new_target}，期望 {target_collection}")
+            except Exception as exc:
+                log(f"  ⚠️  别名切换异常（尝试 {attempt + 1}/{max_retries}）：{exc}，重试中...")
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"别名切换失败：新集合 {target_collection} 已建好但检索端仍指向旧集合，请检查 Qdrant 别名支持: {exc}") from exc
+                time.sleep(0.5 * (attempt + 1))
         if old_collection and old_collection != target_collection:
             try:
                 client.delete_collection(collection_name=old_collection)
@@ -1599,7 +1729,8 @@ def dual_channel_recall(client, collection, dense_query, sparse_query, limit, qu
     except Exception as exc:
         if not tolerate_sparse_error:
             raise
-        note = f"稀疏通道召回失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；分词 {len((sparse_query.text or '').split())} 个 term ({(sparse_query.text or '')[:60]})"
+        term_count = len((sparse_query.text or '').split())
+        note = f"稀疏通道召回失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；分词 {term_count} 个 term"
         return dense_hits, [], note
     return dense_hits, sparse_hits, ""
 
@@ -1691,7 +1822,7 @@ _DOMAIN_LINE = f"你是一个面向「{DOMAIN_NAME}」的知识库助手。"
 if DOMAIN_DESCRIPTION:
     _DOMAIN_LINE += f"领域说明：{DOMAIN_DESCRIPTION}。"
 SYSTEM_RULES_PROMPT = ""
-CONTEXT_ROLE = env_choice("RAG_CONTEXT_ROLE", "user", ("user", "tool", "system"))
+CONTEXT_ROLE = env_choice("RAG_CONTEXT_ROLE", "user", ("user", "system"))  # 见 build_generation_messages：system 档并入首条 system；tool 档无 tool_call_id 配对，恒为孤儿消息，故不接受
 RAG_USE_CONTEXT = env_bool("RAG_USE_CONTEXT", True)
 
 
@@ -1734,7 +1865,8 @@ def _truncate_history_to_budget(msgs, budget):
 
     只做整条丢弃 + 最旧一条按剩余额度截断正文；截断/丢弃后若首条是 assistant
     （其对应提问已被整条丢弃），继续整条丢弃，保证历史首条恒为 user —— 否则模型
-    会收到一条没有对应提问的"孤儿回答"。就地修改 msgs（调用方已持有副本）。
+    会收到一条没有对应提问的"孤儿回答"。若截断后仅剩截断标记，视为无效并整条丢弃。
+    就地修改 msgs（调用方已持有副本）。
     返回 (丢弃条数, 是否截断, 被截断的是否 user)。
     """
     total = message_tokens(msgs)
@@ -1751,9 +1883,17 @@ def _truncate_history_to_budget(msgs, budget):
         first["content"] = _cut_to_tokens(first.get("content") or "", cost - excess)
         truncated, truncated_user = True, first.get("role") != "assistant"
         total = message_tokens(msgs)
+    # 截断后若首条仅含截断标记（或为空），视为无效内容并整条丢弃
     while msgs and msgs[0].get("role") != "user":
         msgs.pop(0)
         dropped += 1
+    while msgs and (not msgs[0].get("content") or msgs[0]["content"] == _TRUNCATION_MARK):
+        msgs.pop(0)
+        dropped += 1
+        # 继续确保首条为 user
+        while msgs and msgs[0].get("role") != "user":
+            msgs.pop(0)
+            dropped += 1
     return dropped, truncated, truncated_user
 
 
@@ -1771,9 +1911,16 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
     dropped_messages, truncated, truncated_user = _truncate_history_to_budget(msgs, budget)
     context = context or ""
     ctx_tokens = estimate_tokens(context) if context else 0
-    out = [{"role": "system", "content": system}] if system else []
+    out = []
+    # 资料走 system 档时必须落在首条 system：chat template 普遍只认开头的 system，
+    # 排在历史之后的 system 消息会被静默丢弃（项目最忌的静默失效）。合并而非新增一条，
+    # 避免同一角色出现两次。历史与本轮提问在两个分支里都原样保留。
+    if context and role == "system":
+        out.append({"role": "system", "content": "\n\n".join(p for p in (system, context) if p)})
+    elif system:
+        out.append({"role": "system", "content": system})
     out += msgs
-    if context:
+    if context and role != "system":
         out.append({"role": role, "content": context})
     out.append({"role": "user", "content": query})
     return { "messages": out, "dropped_messages": dropped_messages, "used_tokens": message_tokens(msgs), "context_tokens": ctx_tokens, "budget": budget, "truncated": truncated, "truncated_user": truncated_user, }
@@ -1813,7 +1960,7 @@ def plan_generation(results, history, query, num_ctx, num_predict, use_context=T
     gen["query_tokens"], gen["over_window"] = q_tokens, over_window
     if over_window:
         log("⚠️  本轮提问+资料超出可用窗口（历史已全部让位仍不足）：本轮提问未截断，超出部分可能被服务端截断")
-    return { "system": system, "context": context, "messages": gen["messages"], "stats": gen, "trace": (plan_trace(results, gen) if trace else {}), }
+    return { "system": system, "context": context, "messages": gen["messages"], "stats": gen, "trace": (plan_trace(results, gen, use_context=use_context) if trace else {}), }
 
 
 STEP_BLANK_QUERY = "空查询"
@@ -1835,8 +1982,11 @@ TRACE_NOTES = {
 }
 
 
-def plan_trace(results, gen):
-    trace = { STEP_CONTEXT: { "context": format_context(results), "sources": context_sources(results), "messages": [{"role": m["role"], "chars": len(m["content"])} for m in gen["messages"]], } }
+def plan_trace(results, gen, use_context=True):
+    # use_context 关闭时不许报告资料正文：steps 是对外诊断（/search 直接把它返回给
+    # 客户端），报一份从未发出的原文等于让诊断与实际请求相反，且与同一条响应里的
+    # context_tokens=0 自相矛盾。
+    trace = { STEP_CONTEXT: { "use_context": bool(use_context), "context": (format_context(results) if use_context else ""), "sources": context_sources(results), "messages": [{"role": m["role"], "chars": len(m["content"])} for m in gen["messages"]], } }
     if gen["dropped_messages"] or gen["truncated"] or gen.get("over_window"):
         note = "历史超出上下文预算，已从最旧一侧整条丢弃/截断，截断后首条历史恒为 user；system、检索资料与本轮提问始终保留"
         if gen.get("over_window"):
@@ -1876,6 +2026,7 @@ class RAGEngine:
         self._client = client
         self._collection_name = COLLECTION_NAME
         self._lexicon_checked = False
+        self._chunk_fp_checked = False
         self._empty_warned = False
         self._model_lock = threading.Lock()
     @property
@@ -1884,7 +2035,7 @@ class RAGEngine:
     def _get_client(self):
         from qdrant_client import QdrantClient
         if self._client is None:
-            self._client = QdrantClient( host=QDRANT_HOST, port=QDRANT_PORT, timeout=60, )
+            self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=60, )
         return self._client
     def _resolve_collection(self):
         self._collection_name = resolve_collection_name(self._get_client())
@@ -1905,6 +2056,25 @@ class RAGEngine:
             if self._rerank is None:
                 self._rerank = load_reranker_model()
             return self._rerank
+    def _inference_lock(self):
+        return self._model_lock
+    def _check_chunk_freshness(self, index_fp):
+        """分块新鲜度闸门（与词表闸门对称）：process 之后未重跑 index 时，检索会静默
+        继续吃旧分块——stages 报过期但没人看，用户拿到的是无声的旧知识库。"""
+        if index_fp is None or self._chunk_fp_checked:
+            return
+        self._chunk_fp_checked = True  # 只查一次：产物不在运行期热加载
+        try:
+            current, _ = _chunking_config_fingerprint()
+        except Exception as exc:
+            log(f"⚠️  无法计算当前切分指纹，跳过分块新鲜度检查: {type(exc).__name__}: {exc}")
+            return
+        if index_fp == current:
+            return
+        logger.error(
+            "分块产物与索引不一致：索引 %s / 当前 %s。检索在用过期分块，请运行 `python chatbot.py process && python chatbot.py index`。",
+            index_fp, current,
+        )
     def _check_lexicon_consistency(self, index_lexicon_id):
         if index_lexicon_id is None or self._lexicon_checked:
             return
@@ -1913,26 +2083,33 @@ class RAGEngine:
         if index_lexicon_id == current:
             return
         logger.error( "词表与索引不一致：索引 %s / 当前 %s。稀疏通道词空间已错配，召回会静默下降。请运行 `python chatbot.py reindex-sparse`。", index_lexicon_id, current, )
-    def _fetch_chunks(self, point_ids):
+    def _fetch_chunks(self, point_ids, collection=None):
         """按命中 id 逐次回取 payload（按 id 精确检索，不全量滚动 2 万条）。
 
         每次调用都向 Qdrant 取，进程内不留分块表：既不占常驻内存，也不存在"索引重建后
         旧缓存失步"这个状态点。按 id retrieve 结构性做不到部分加载——缺失的 id 由调用方
         显式计数告警，完整性由 Qdrant 本身保证。
+
+        collection 必须由调用方传入（本轮召回用的那个集合）。这里再解析一次别名，可能撞上
+        index 的原子切换而换成另一个集合：点 id 是位置整数（0..N-1），另一集合**同样存在**
+        这些 id，于是 retrieve 不缺、不报错，却取回完全不相干的正文（静默错配，判据恒真）。
         """
         if not point_ids:
             return {}
-        self._resolve_collection()
-        points = self._get_client().retrieve( collection_name=self._collection_name, ids=list(point_ids), with_payload=True, with_vectors=False, )
+        if collection is None:
+            self._resolve_collection()
+            collection = self._collection_name
+        points = self._get_client().retrieve( collection_name=collection, ids=list(point_ids), with_payload=True, with_vectors=False, )
         if not points:
             # 命中 id 回取为空：集合为空或索引正在重建。不再用 id=0 探针判断——id 0 缺失时
             # 旧写法会把非空集合误判为空并静默丢掉全部命中。
             if not self._empty_warned:
-                log(f"⚠️  集合 {self._collection_name} 按命中 id 回取为空，请确认已运行: python chatbot.py index")
+                log(f"⚠️  集合 {collection} 按命中 id 回取为空，请确认已运行: python chatbot.py index")
                 self._empty_warned = True
             return {}
         self._empty_warned = False
         self._check_lexicon_consistency((points[0].payload or {}).get(LEXICON_ID_FIELD))
+        self._check_chunk_freshness((points[0].payload or {}).get(CHUNK_FINGERPRINT_FIELD))
         return {p.id: chunk_from_payload(p.payload, p.id) for p in points}
     def _source_filter(self, source):
         if not source:
@@ -1950,14 +2127,27 @@ class RAGEngine:
         client = self._get_client()
         collection = self._collection_name
         query_filter = self._source_filter(source)
-        tokenizer, model, device = self._get_embed()
-        # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
-        q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
+        # 稠密查询向量只在稠密通道权重非零时才计算：权重为 0 时通道整体退出（health 的
+        # 口径），若这里仍无条件加载并前向嵌入模型，模型目录缺失/损坏会让本可由稀疏通道
+        # 独立服务的检索整体失败，还会白白付一次冷加载。
+        dense_query = None
+        if RRF_DENSE_WEIGHT:
+            tokenizer, model, device = self._get_embed()
+            # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
+            q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
+            dense_query = q_emb[0].tolist()
         sparse_query = sparse_encode(query)
+        # 判空走 sparse_terms_of：sparse_query.text 里的零宽空格是占位哨兵，不是词
+        _sparse_terms = sparse_terms_of(query)
         if steps is not None:
-            steps[STEP_SPARSE_TERMS] = sparse_query.text.split()
+            steps[STEP_SPARSE_TERMS] = _sparse_terms
+        # 稀疏通道"存在但不产出"原来完全静默：query 全是停用词/纯标点时
+        # bm25_tokenize 返回空串，dual_channel_recall 既不抛异常也不召回 → 没有降级标记，
+        # 分数概览也不体现，结果看起来是正常双通道融合，实际是纯稠密。必须点名。
+        if bool(RRF_SPARSE_WEIGHT) and not _sparse_terms:
+            _degraded(steps, "稀疏通道：查询分词后为空（整句命中停用词或纯标点），本次退化为纯稠密检索")
         # 两种检索：稠密 + 稀疏各召回一次，随后统一加权 RRF 融合。
-        dense_hits, sparse_hits, note = dual_channel_recall( client, collection, q_emb[0].tolist(), sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=bool(RRF_SPARSE_WEIGHT), )
+        dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=bool(RRF_SPARSE_WEIGHT), )
         if note:
             _degraded(steps, note)
         rankings = channel_rankings(dense_hits, sparse_hits)
@@ -1966,7 +2156,7 @@ class RAGEngine:
         n_channels = max(1, len(rankings))
         fuse_limit = RERANK_TOP_K * n_channels if DEDUP_BY_PARENT else RERANK_TOP_K
         fused = weighted_rrf(rankings, k=RRF_K, limit=fuse_limit)
-        chunks = self._fetch_chunks([point_id for point_id, _score, _res in fused]) if fused else {}
+        chunks = self._fetch_chunks([point_id for point_id, _score, _res in fused], collection) if fused else {}
         if steps is not None:
             steps[STEP_RRF] = [ { "resource": resources, "score": float(score), "id": (chunks.get(point_id) or {}).get("id", str(point_id)), "text": (chunks.get(point_id) or {}).get("child_text", ""), } for point_id, score, resources in fused ]
         candidates = []
@@ -1985,11 +2175,17 @@ class RAGEngine:
         if steps is not None:
             steps[STEP_CANDIDATES] = [[c["point_id"], c["id"]] for c in candidates]
         folded = []
+        pre_dedup = len(candidates)
         if DEDUP_BY_PARENT:
             candidates, folded = dedup_candidates_by_parent(candidates)
+        # 候选池上限的截断与父块折叠分开计数：旧写法把两者合成一个 folded，被池上限
+        # 吃掉的候选既不在 kept 也不在 folded，诊断上无法区分"折叠"与"截断"。
+        pool_trimmed = 0
+        if len(candidates) > RERANK_TOP_K:
+            pool_trimmed = len(candidates) - RERANK_TOP_K
             candidates = candidates[:RERANK_TOP_K]
         if steps is not None:
-            steps[STEP_DEDUP] = { "kept": len(candidates), "folded": len(folded), "folded_ids": [c["id"] for c in folded], "说明": TRACE_NOTES["去重"], }
+            steps[STEP_DEDUP] = { "enabled": DEDUP_BY_PARENT, "去重前候选": pre_dedup, "kept": len(candidates), "folded": len(folded) if DEDUP_BY_PARENT else 0, "folded_ids": [c["id"] for c in folded], "被候选池上限截断": pool_trimmed, "说明": (TRACE_NOTES["去重"] if DEDUP_BY_PARENT else "RAG_DEDUP_BY_PARENT=0：未做父块去重，同父兄弟子块会原样进入重排"), }
         if not candidates:
             return _empty_search_result(steps)
         if top_k > RERANK_TOP_K:
@@ -1997,15 +2193,21 @@ class RAGEngine:
         rr_tok, rr_model, rr_dev = self._get_rerank()
         cand_texts = [rerank_text_for(c) for c in candidates]
         rr_k = min(top_k, len(candidates))
-        reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
+        with self._inference_lock():
+            reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
         if steps is not None:
             rr_query_tokens = len(rr_tok.encode(query))
-            rr_doc_budget = max(0, RERANK_MAX_LENGTH - rr_query_tokens - 3)
+            # 使用 tokenizer 实际的特殊 token 数，而非硬编码
+            special_tokens = rr_tok.num_special_tokens_to_add(pair=True)
+            rr_doc_budget = max(0, RERANK_MAX_LENGTH - rr_query_tokens - special_tokens)
             rr_rows = []
             for idx, score in reranked:
                 text = cand_texts[idx]
                 full_tokens = len(rr_tok.encode(text))
-                row = { "id": candidates[idx]["id"], "fused_rank": candidate_fused_rank.get(candidates[idx]["id"]), "score": float(score), "tokens": full_tokens, "text": candidates[idx]["child_text"] }
+                # text 必须是**送进 rerank 的那段**（cand_texts[idx]），不是 child_text：
+                # RERANK_ON=parent 时两者不同，旧写法展示 child_text 却用 parent_text 算
+                # tokens/被截断，对外 steps 自相矛盾。scored_field 说明这段来自哪个字段。
+                row = { "id": candidates[idx]["id"], "fused_rank": candidate_fused_rank.get(candidates[idx]["id"]), "score": float(score), "tokens": full_tokens, "text": text, "scored_field": ("parent_text" if RERANK_ON == "parent" else "contextual_text") }
                 row["送入上限"] = rr_doc_budget
                 row["被截断"] = full_tokens > rr_doc_budget
                 rr_rows.append(row)
@@ -2059,10 +2261,6 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     use_context = RAG_USE_CONTEXT if use_context is None else use_context
     num_ctx = NUM_CTX if num_ctx is None else num_ctx
     num_predict = NUM_PREDICT if num_predict is None else num_predict
-    # 入口统一剥一次：调用方漏剥 [:-1] 时本轮提问不进历史（也不进裁剪），一个闸口管整轮。
-    history, _leaked = strip_current_turn(history, query)
-    if _leaked:
-        log("⚠️  history 末尾是本轮提问（调用方漏剥），已在 run_turn 入口剥除")
     started = time.time()
     if trace:
         results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source )
@@ -2118,7 +2316,7 @@ def _streamlit_pids():
 def _qdrant_gate():
     """serve/api 共用的启动门禁：连不上或集合为空则报错退出，返回 (client, coll, count)。"""
     from qdrant_client import QdrantClient
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
     coll = resolve_collection_name(client)
     try:
         count = 0 if not client.collection_exists(coll) else client.count(collection_name=coll).count
@@ -2154,7 +2352,9 @@ def cmd_serve():
     log("启动 Streamlit 服务...")
     log("服务地址: http://localhost:8501  （按 Ctrl+C 停止）")
     log("")
-    os.execv(sys.executable, [ sys.executable, "-m", "streamlit", "run", __file__, "--server.address", "::", "--server.port", "8501", "--server.headless", "true", ])
+    # 必须与 .streamlit/config.toml 的 address = "127.0.0.1" 一致。CLI 优先级高于该文件，
+    # 传 "::" 会把只监听回环的配置静默改写成监听全部网卡（含公网 v6），与配置文件意图相反。
+    os.execv(sys.executable, [ sys.executable, "-m", "streamlit", "run", __file__, "--server.address", "127.0.0.1", "--server.port", "8501", "--server.headless", "true", ])
 
 
 # ── 交互入口：Streamlit 主界面 ──
@@ -2169,6 +2369,25 @@ def _render_stored_message(msg):
             st.markdown(msg["content"])
         elif msg["role"] == "assistant" and msg.get("error"):
             st.error(msg["error"])
+
+
+def _gen_failure_hint(gen_error):
+    """按错误文本给下一步动作：本地与创空间共用同一套判据，只说该错误本身指向的事实。
+
+    顺序即优先级：具体判据在前、泛化判据在后。旧顺序把 "connection" 排在 "http 500"
+    之前，含 connection 字样的 500 会被误报成"连不上生成服务"；同时整表漏掉了 404 ——
+    而 entrypoint 故意把模型拉取放后台，"模型不在本地"是冷启动期最可能的一类错误。
+    """
+    low = (gen_error or "").lower()
+    if "http 404" in low or ("not found" in low and "model" in low):
+        return "生成模型不在 Ollama 里：看运行日志的 [entrypoint] 拉取行（后台拉取期间问答都会失败，拉完自动恢复）"
+    if "signal: killed" in low or "out of memory" in low:
+        return "生成进程被系统杀掉（内存超限）：看运行日志的 [entrypoint] [mem] 观测行，必要时调小 RAG_NUM_CTX"
+    if "http 500" in low:
+        return "生成服务返回 500：模型未就绪或进程已被杀，看运行日志的 [entrypoint] 与 /tmp/ollama.log"
+    if "econnrefused" in low or "connection" in low or "timed out" in low:
+        return "连不上生成服务：确认 ollama serve 已启动、OLLAMA_BASE_URL 可达"
+    return None
 
 
 def _stream_reply(events):
@@ -2188,6 +2407,9 @@ def _stream_reply(events):
     )
     if gen_error:
         answer_ph.error(gen_error)
+        hint = _gen_failure_hint(gen_error)
+        if hint:
+            st.caption(hint)
     elif not answer:
         answer_ph.markdown("⚠️")
     if think_status is not None:
@@ -2207,11 +2429,23 @@ def _run_assistant_turn(engine, prompt, history):
         next(events)  # 首事件恒为 retrieval，不在页面上渲染
         thinking, answer, gen_error, done = _stream_reply(events)
     except Exception as exc:
+        # 只打「类型: 消息」无法定位（stat(None) 这类消息看不出是哪一行）：完整调用栈必须落盘，
+        # 页面上同时给出最后一帧（file:line），部署环境读不到 rag.log 时也能直接定位。
         log(f"⚠️  本轮执行异常: {type(exc).__name__}: {exc}")
-        st.error(f"本轮执行异常: {type(exc).__name__}: {exc}")
+        log(traceback.format_exc().rstrip())
+        frames = traceback.extract_tb(exc.__traceback__)
+        own = [f for f in frames if os.path.basename(f.filename) == os.path.basename(__file__)]
+        hit = own[-1] if own else (frames[-1] if frames else None)
+        where = f"{hit.filename}:{hit.lineno} {hit.name}" if hit else "未知"
+        st.error(
+            f"本轮执行异常: {type(exc).__name__}: {exc}\n"
+            f"出错位置: {where}\n"
+            f"完整调用栈: {os.getenv('RAG_LOG_FILE', 'rag.log')}"
+        )
         return
-    # 生成失败（stream_chat 只产出 error、不产出 done，与 API 侧同判据）或空答案：不入历史。
-    if not done or not answer or not answer.strip():
+    # 生成失败或空答案：不入历史。gen_error 也进判据（不只依赖"error 必不产出 done"
+    # 这个上游契约）——一旦生产侧违约，残缺答案也不会被当成完整回复留下。
+    if gen_error or not done or not answer or not answer.strip():
         if gen_error:
             log(f"⚠️  生成失败，本轮回复未写入历史: {gen_error[:300]}")
         elif not done:
@@ -2244,7 +2478,8 @@ def run_streamlit():
         st.stop()
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    for msg in st.session_state.messages:
+    # 复制消息列表避免迭代时修改导致的竞态（Streamlit 重跑机制下虽偶然正确，但显式复制更稳健）
+    for msg in list(st.session_state.messages):
         _render_stored_message(msg)
     if prompt := st.chat_input(""):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -2270,7 +2505,13 @@ def _warm_engine(engine):
             load_lexicon()
             engine._get_embed()
             engine._get_rerank()
-            requests.post( API_URL, json={ "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": False, "think": False, "options": {"num_predict": 1}, }, timeout=180, )
+            # 必须看状态码：对未拉取的模型 Ollama 返回 404 而 requests 不抛异常，
+            # 旧写法丢弃返回值、直接打印"预热完成"。而 entrypoint 正是把生成模型拉取
+            # 放在后台的，冷启动窗口内这次预热必然落在 404 上 —— 唯一的"已预热"信号
+            # 成了假信号，首个真故障要等用户提问时的 500 才暴露。
+            r = requests.post( API_URL, json={ "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": False, "think": THINK, "options": {"num_predict": 1}, }, timeout=180, )
+            if r.status_code != 200:
+                raise RuntimeError(f"生成模型预热失败 HTTP {r.status_code}: {r.text[:200]}")
             log("模型预热完成（嵌入/重排/生成）")
         except Exception as exc:
             log(f"⚠️  预热未完成（不影响服务，首次查询冷加载）: {type(exc).__name__}: {exc}")
@@ -2342,7 +2583,12 @@ def _search_params(data):
     query = data.get("query")
     if not isinstance(query, str) or not query.strip():
         raise ValueError("参数 query 必填，且必须是非空字符串")
-    top_k = data.get("top_k", TOP_K)
+    # data.get(key, 默认) 只在**键缺失**时用默认；键存在且值为 JSON null 时拿到 None。
+    # top_k 与 history/source 一样是可选字段，显式 null 应当等同"不传"（与下面三处
+    # 对 None 的处理保持一致），否则 {"query":"x","top_k":null} 会莫名 400。
+    top_k = data.get("top_k")
+    if top_k is None:
+        top_k = TOP_K
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
         raise ValueError("参数 top_k 必须是正整数")
     source = data.get("source")
@@ -2377,8 +2623,20 @@ def _result_json(r):
 class Handler(BaseHTTPRequestHandler):
     server_version = "RAGKnowledgeBase/1.0"
     protocol_version = "HTTP/1.1"
-    timeout = 60
+    # socketserver 会把 timeout 设到 socket 上，**读和写都受管**。/ask 是 NDJSON 流式
+    # 回答，单轮生成最长可到 OLLAMA_TIMEOUT（默认 180s），写端若沿用 60s 会在客户端
+    # 读得慢（浏览器后台标签）时中途 socket.timeout 把流截断。故按生成超时留余量。
+    timeout = int(TIMEOUT) + 120
     _body_consumed = False  # _read_json 成功排空 Content-Length 后置真，_reject 不得再读
+
+    def handle_one_request(self):
+        # handle() 在 keep-alive 连接上用**同一个实例**反复调用本方法
+        # （BaseHTTPRequestHandler 的既定行为），所以每请求状态必须在这里复位：
+        # 第一个成功 POST 置起的 _body_consumed 会一直为真，此后该连接上所有 _reject
+        # 都跳过 _drain_body，残留 body 留在缓冲区，被下一个请求当成请求行读走。
+        self._body_consumed = False
+        super().handle_one_request()
+
     def log_message(self, fmt, *args):
         logger.info("API %s - %s", self.address_string(), fmt % args)
     def _reject(self, status, message):
@@ -2413,7 +2671,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/search":
             self._handle_search(query, top_k, source, history_stripped)
         else:
-            self._handle_ask(query, top_k, source, history, data, history_stripped)
+            self._handle_ask(query, top_k, source, history, history_stripped)
     def _handle_search(self, query, top_k, source, history_stripped=False):
         try:
             with _REQUEST_LOCK:
@@ -2424,7 +2682,7 @@ class Handler(BaseHTTPRequestHandler):
             _json_response(self, 500, {"error": f"检索失败: {type(exc).__name__}: {exc}"})
             return
         _json_response(self, 200, { "query": query, "source": source, "source_field": SOURCE_FIELD, "elapsed": round(time.time() - t0, 3), "confidence": steps.get(STEP_CONFIDENCE), "history_stripped": history_stripped, "results": [_result_json(r) for r in results], "steps": steps, })
-    def _handle_ask(self, query, top_k, source, history, data, history_stripped=False):
+    def _handle_ask(self, query, top_k, source, history, history_stripped=False):
         headers_sent = False
         t0 = time.time()
         try:
@@ -2456,12 +2714,26 @@ class Handler(BaseHTTPRequestHandler):
             # 生成失败时 stream_chat 只产出 error、不产出 done，故必须判空
             if done:
                 emit({ "type": "done", "done_reason": done.get("done_reason"), "eval_count": done.get("eval_count"), "prompt_eval_count": done.get("prompt_eval_count"), "answer_chars": done.get("answer_chars"), "search_s": round(done["elapsed"], 3), "gen_s": round(time.time() - t0 - done["elapsed"], 3), })
+            else:
+                # 流没走到 done：显式补一个终止 error。旧写法只发 error 就结束连接，NDJSON
+                # 客户端只能靠"连接被关"判断本轮结束，无法与"正常收尾"区分。事件词表不新增
+                # 类型，error 本就是异常终止的既有词；terminal 字段标明这是收尾而非增量。
+                emit({ "type": "error", "terminal": True, "error": _error or "生成未正常结束（无 done 事件）" })
         except Exception as exc:
+            # 头已发出后的失败（Ollama 中途断流、客户端断开、wfile broken pipe、socket 超时）
+            # 必须落盘：旧写法只往一个已经坏掉的 socket 写再 pass，rag.log 里什么都没有，
+            # "流断了一半"与"服务端崩了"在日志上完全无法区分。
+            log(f"⚠️  /ask 流中断（响应头已发出）: {type(exc).__name__}: {exc}")
+            log(traceback.format_exc().rstrip())
             if not headers_sent:
+                if not self._body_consumed:
+                    _drain_body(self)
                 _json_response(self, 500, { "error": f"检索/装配失败: {type(exc).__name__}: {exc}"}, close=True)
                 return
             try:
-                self.wfile.write((json.dumps( {"type": "error", "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False) + "\n").encode("utf-8"))
+                if not self._body_consumed:
+                    _drain_body(self)
+                self.wfile.write((json.dumps( {"type": "error", "terminal": True, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False) + "\n").encode("utf-8"))
                 self.wfile.flush()
             except Exception:
                 pass
@@ -2515,14 +2787,28 @@ def cmd_health():
     fail = 0
     log("RAG 健康检查")
     log("\n[1] 配置")
-    if not EMBED_MODEL_PATH or not os.path.isdir(EMBED_MODEL_PATH):
-        fail += bad(f"Embedding 模型目录缺失: {EMBED_MODEL_PATH}")
+    # 模型目录判据只有一份：直接问 _require_model_dir（load_embedding_model /
+    # load_reranker_model 用的同一个），避免"health 说 ✅、查询却抛 RuntimeError"。
+    for _path, _what, _hint in (
+        (EMBED_MODEL_PATH, "嵌入", "确认 RAG_EMBED_MODEL_PATH 指向可用的模型目录"),
+        (RERANK_MODEL_PATH, "重排", "确认 RAG_RERANK_MODEL_PATH 指向可用的模型目录"),
+    ):
+        try:
+            _require_model_dir(_path, _what, _hint)
+            ok(f"{_what}模型: {_path}")
+        except RuntimeError as exc:
+            fail += bad(str(exc))
+    # MPS 水印由 torch 读取（不是应用配置，故不进 env_declared_but_unread），但它们是
+    # 本机唯一防 MPS 冻结的安全阀：只设 HIGH 不设 LOW 会让"任何触碰 MPS 的调用"抛
+    # invalid low watermark ratio。删掉 .env 里任意一行都必须在这里被点名。
+    _mps_hi = os.getenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO")
+    _mps_lo = os.getenv("PYTORCH_MPS_LOW_WATERMARK_RATIO")
+    if _mps_hi is not None and _mps_lo is None:
+        log("  ⚠️  设了 PYTORCH_MPS_HIGH_WATERMARK_RATIO 却没有 PYTORCH_MPS_LOW_WATERMARK_RATIO："
+            "PyTorch 的 LOW 默认 1.4 > HIGH，任何触碰 MPS 的调用都会抛 "
+            "invalid low watermark ratio（连 torch.mps.empty_cache() 也会炸）")
     else:
-        ok(f"Embedding 模型: {EMBED_MODEL_PATH}")
-    if not os.path.isdir(RERANK_MODEL_PATH):
-        fail += bad(f"Reranker 模型目录缺失: {RERANK_MODEL_PATH}")
-    else:
-        ok(f"Reranker 模型: {RERANK_MODEL_PATH}")
+        ok(f"MPS 水印: HIGH={_mps_hi or '默认'} LOW={_mps_lo or '默认'}（torch 读取，非应用配置）")
     ok(f"生成模型: {MODEL}  @  {OLLAMA_BASE_URL}")
     # 思维链开关的生效值回读：模型侧与页面/API 侧共用一个值，这里只报这一个值。
     if THINK:
@@ -2536,6 +2822,21 @@ def cmd_health():
         ok(f"上下文注入: 纯资料消息(role={CONTEXT_ROLE}，只含检索 parent_text) + 本轮提问；system={sys_note}")
     if RERANK_ON == "parent" and RERANK_MAX_LENGTH < PARENT_MAX_TOKENS:
         log(f"  \u26a0\ufe0f  RERANK_ON=parent 但 RERANK_MAX_LENGTH={RERANK_MAX_LENGTH} < 父块上限 {PARENT_MAX_TOKENS}：父块尾部会被静默截掉")
+    # 校验 rerank 模型实际最大长度
+    try:
+        from transformers import AutoTokenizer
+        rr_tok = AutoTokenizer.from_pretrained(RERANK_MODEL_PATH)
+        model_max_len = getattr(rr_tok, "model_max_length", None)
+        if model_max_len and model_max_len < 1000000:  # 忽略超大默认值（如 10^9）
+            effective_max = min(RERANK_MAX_LENGTH, model_max_len)
+            if RERANK_ON == "parent" and effective_max < PARENT_MAX_TOKENS:
+                log(f"  \u26a0\ufe0f  Rerank 模型最大长度 {model_max_len} 导致有效上限 {effective_max} < 父块上限 {PARENT_MAX_TOKENS}：父块尾部会被静默截掉")
+            elif RERANK_ON == "child" and effective_max < CHILD_MAX_TOKENS:
+                log(f"  \u26a0\ufe0f  Rerank 模型最大长度 {model_max_len} 导致有效上限 {effective_max} < 子块上限 {CHILD_MAX_TOKENS}：子块可能被静默截掉")
+            elif RERANK_MAX_LENGTH > model_max_len:
+                log(f"  \u2139\ufe0f  RERANK_MAX_LENGTH={RERANK_MAX_LENGTH} 超过模型最大长度 {model_max_len}，实际将被截断至 {model_max_len}")
+    except Exception as exc:
+        log(f"  \u26a0\ufe0f  无法校验 rerank 模型最大长度: {type(exc).__name__}: {exc}")
     if not RRF_DENSE_WEIGHT:
         log("  \u2139\ufe0f  RRF_DENSE_WEIGHT=0：稠密通道整体退出")
     if not RRF_SPARSE_WEIGHT:
@@ -2560,7 +2861,7 @@ def cmd_health():
     client = None
     coll = None
     try:
-        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=60)
+        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=60)
         coll = resolve_collection_name(client)
         if not client.collection_exists(coll):
             fail += bad( f"集合 {coll} 不存在（索引未构建），请运行: python chatbot.py index" )
@@ -2604,6 +2905,19 @@ def cmd_health():
                         fail += bad(f"词表与索引不一致（索引 {idx_lex} / 当前 {cur_lex}）—— 请运行: python chatbot.py reindex-sparse")
                 except Exception as e:
                     fail += bad(f"词表一致性检查失败: {e}")
+                # 分块新鲜度：与 stages 的 A 阶段同一判据，在检索侧提前暴露
+                try:
+                    pts, _ = client.scroll(collection_name=coll, limit=1, with_payload=True, with_vectors=False)
+                    idx_fp = ((pts[0].payload or {}).get(CHUNK_FINGERPRINT_FIELD) if pts else None)
+                    cur_fp, _ = _chunking_config_fingerprint()
+                    if idx_fp is None:
+                        log("  ⏭  索引未记录分块指纹（旧索引），跳过分块新鲜度检查")
+                    elif idx_fp == cur_fp:
+                        ok(f"分块指纹一致: {cur_fp}")
+                    else:
+                        fail += bad(f"分块产物与索引不一致（索引 {idx_fp} / 当前 {cur_fp}）—— 检索在用过期分块，请运行: python chatbot.py process && python chatbot.py index")
+                except Exception as e:
+                    fail += bad(f"分块新鲜度检查失败: {e}")
             else:
                 fail += bad(f"{coll} 为空，请运行: python chatbot.py index")
     except Exception as e:
@@ -2644,14 +2958,20 @@ def cmd_health():
             if r.status_code == 200:
                 models = [m["name"] for m in r.json().get("models", [])]
                 ok(f"Ollama 可达，已装模型: {models}")
-                if MODEL not in models:
+                # Ollama 的 /api/tags 恒返回 name:tag（无 tag 补 latest），而 MODEL 允许写成
+                # 不带 tag（llama3）。末段含 ":" 才是显式 tag；否则按前缀补 latest 比对，
+                # 否则明明已装也报"未安装"，把 health 引到一次根本不需要的 pull 上。
+                _installed = MODEL in models
+                if ":" not in MODEL.rsplit("/", 1)[-1]:
+                    _installed = _installed or any(m.rsplit(":", 1)[0] == MODEL for m in models)
+                if not _installed:
                     fail += bad(f"MODEL={MODEL} 未安装，请: ollama pull {MODEL}")
             else:
                 fail += bad(f"Ollama /api/tags 返回 HTTP {r.status_code}")
         except Exception as e:
             fail += bad(f"Ollama 不可达: {e}")
-        log("\n[6] 生成模型应答（think:false 简短问答）")
-        payload = { "model": MODEL, "messages": [{"role": "user", "content": HEALTH_PROBE_QUESTION}], "stream": False, "think": False, "options": {"num_predict": 64}, }
+        log(f"\n[6] 生成模型应答（think:{str(THINK).lower()} 简短问答）")
+        payload = { "model": MODEL, "messages": [{"role": "user", "content": HEALTH_PROBE_QUESTION}], "stream": False, "think": THINK, "options": {"num_predict": 64}, }
         t0 = time.time()
         try:
             r = requests.post(API_URL, json=payload, timeout=args.timeout)
@@ -2781,7 +3101,7 @@ BATCH = 1000
 
 def cmd_reindex_sparse():
     from qdrant_client import QdrantClient, models
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=120)
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=120)
     COLL = resolve_collection_name(client)
     info = client.get_collection(COLL)
     total = info.points_count
@@ -2794,11 +3114,12 @@ def cmd_reindex_sparse():
     lexicon_id = lexicon_fingerprint()
     offset = None
     while True:
-        pts, offset = client.scroll( COLL, limit=BATCH, offset=offset, with_payload=True, with_vectors=False)
+        pts, offset = client.scroll( COLL, limit=BATCH, offset=offset, with_payload=True, with_vectors=False, timeout=60 )
         if not pts:
             break
         ids = [p.id for p in pts]
-        points = [ models.PointVectors( id=p.id, vector={SPARSE_VECTOR_NAME: sparse_encode(p.payload.get("child_text", ""))}, ) for p in pts ]
+        # 与 build_index 同一份文本（_index_text），否则重算的稀疏向量与稠密侧错配
+        points = [ models.PointVectors( id=p.id, vector={SPARSE_VECTOR_NAME: sparse_encode(_index_text(p.payload or {}))}, ) for p in pts ]
         client.update_vectors(COLL, points=points)
         client.set_payload(collection_name=COLL, payload={LEXICON_ID_FIELD: lexicon_id}, points=ids)
         done += len(pts)
@@ -2809,7 +3130,7 @@ def cmd_reindex_sparse():
     if done != total:
         log(f"❌ 只更新了 {done}/{total} 条，请重跑")
         return 1
-    sample, _ = client.scroll(COLL, limit=5, with_vectors=True)
+    sample, _ = client.scroll(COLL, limit=5, with_vectors=True, timeout=30)
     for p in sample:
         sp = p.vector.get(SPARSE_VECTOR_NAME)
         log(f"  校验 point {p.id}: 稠密 {len(p.vector.get(DENSE_VECTOR_NAME, []))} 维, 稀疏 {len(sp.indices) if sp else 0} terms")
@@ -3074,18 +3395,25 @@ def cmd_verify_lexicon():
     out("      错误：%s" % normalize(demo, identity_canonical=False))
     if normalize(demo) == normalize(demo, identity_canonical=False):
         warnings.append("参考实现的正/反例输出相同，说明该样例没覆盖到子串陷阱")
-    mismatch = []
-    for s in sample[:2]:
-        got, want = normalize(s), normalize_aliases(s)
-        if got != want:
-            i = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]), min(len(got), len(want)))
-            mismatch.append((got[max(0, i - 12):i + 12], want[max(0, i - 12):i + 12]))
-    if mismatch:
-        for a, b in mismatch[:2]:
-            out("    与线上实现不一致：%r (本文件参照实现) vs %r (normalize_aliases)" % (a, b))
-        problems.append( "参照实现与 normalize_aliases 输出不一致 —— 两份实现已分叉，自检结论不可信")
+    # 对拍只在"校验的正是线上加载的那张表"时才有意义：normalize_aliases 读的是模块级
+    # ALIASES_FILE/_LEXICON，传入自定义路径时线上实现根本没换表，硬比只会报假"分叉"。
+    same_table = os.path.abspath(alias_path) == os.path.abspath(ALIASES_FILE)
+    if not same_table or not ALIASES_ENABLED:
+        out("与线上实现对拍：跳过（校验 %s；线上加载 %s，别名开关 %s）" % (
+            alias_path, ALIASES_FILE, "开" if ALIASES_ENABLED else "关"))
     else:
-        out("与线上实现对拍：通过 —— normalize_aliases 输出逐字相同")
+        mismatch = []
+        for s in sample[:2]:
+            got, want = normalize(s), normalize_aliases(s)
+            if got != want:
+                i = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]), min(len(got), len(want)))
+                mismatch.append((got[max(0, i - 12):i + 12], want[max(0, i - 12):i + 12]))
+        if mismatch:
+            for a, b in mismatch[:2]:
+                out("    与线上实现不一致：%r (本文件参照实现) vs %r (normalize_aliases)" % (a, b))
+            problems.append( "参照实现与 normalize_aliases 输出不一致 —— 两份实现已分叉，自检结论不可信")
+        else:
+            out("与线上实现对拍：通过 —— normalize_aliases 输出逐字相同")
     out("")
     out("-" * 78)
     out("[4] 停用词表: %s" % stop_path)
@@ -3144,6 +3472,7 @@ def cmd_stages():
     A 分块（语料/切分变 → process） B 稠密（换模型/新内容 → index 增量）
     C 稀疏（词表/BM25/编码变 → reindex-sparse） D 入库（集合缺失/点数不符 → index）"""
     stale = []
+    cd_unknown = False
 
     log("[A] 分块产物")
     if not os.path.exists(CHUNKS_META_JSON):
@@ -3183,15 +3512,21 @@ def cmd_stages():
                 cache = _load_embed_cache(preferred)
                 with open(CHUNKS_JSON, encoding="utf-8") as f:
                     chunks = json.load(f)
-                need = sum(1 for c in chunks if _embed_cache_key(c.get("contextual_text") or c.get("child_text", "")) not in cache)
-                log(f"  ✅ 缓存 {os.path.basename(preferred)}（{precision}）：{len(cache)} 条；当前产物 {need}/{len(chunks)} 条需重算（增量）")
+                need = sum(1 for c in chunks if _embed_cache_key(_index_text(c)) not in cache)
+                if need:
+                    # 缓存里缺条目 = index 仍要重算 need 条：不标 B 会让 A/C/D 全新鲜时
+                    # 打出"无需重跑"，与上面这行自相矛盾（同一轮日志两个结论）。
+                    stale.append("B")
+                    log(f"  ⚠️  缓存 {os.path.basename(preferred)}（{precision}）：{len(cache)} 条，缺 {need}/{len(chunks)} 条（增量）→ 需要: python chatbot.py index")
+                else:
+                    log(f"  ✅ 缓存 {os.path.basename(preferred)}（{precision}）：{len(cache)} 条；当前产物 0/{len(chunks)} 条需重算")
             except Exception as exc:
                 log(f"  ⚠️  缓存检查失败（不影响 A/C/D 判定）: {type(exc).__name__}: {exc}")
 
     log("[C] 稀疏向量（词表/BM25）与 [D] 入库（Qdrant）")
     try:
         from qdrant_client import QdrantClient
-        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
+        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=30)
         coll = resolve_collection_name(client)
         if not client.collection_exists(coll):
             stale.append("D"); log("  [D] ❌ 集合不存在 -> 需要: python chatbot.py index")
@@ -3215,10 +3550,11 @@ def cmd_stages():
             else:
                 log(f"  [D] ✅ 集合 {coll} 共 {qd_count} 条")
     except Exception as exc:
-        log(f"  ⏭  连不上 Qdrant（{type(exc).__name__}: {exc}），跳过 C/D")
+        log(f"  ⏭  连不上 Qdrant（{type(exc).__name__}: {exc}）→ C/D 未验证（不算新鲜）")
+        cd_unknown = True
 
     log("")
-    if not stale:
+    if not stale and not cd_unknown:
         log("全部阶段新鲜，无需重跑。")
     elif "A" in stale:
         log("最小重跑: python chatbot.py process && python chatbot.py index")
@@ -3226,6 +3562,9 @@ def cmd_stages():
         log("最小重跑: python chatbot.py index（稠密走缓存增量）")
     elif "C" in stale:
         log("最小重跑: python chatbot.py reindex-sparse")
+    else:
+        # stale 为空但 Qdrant 没连上：C/D 没验过，绝不能落到上面的"全部新鲜"。
+        log("C/D 未能验证（Qdrant 不可达）→ 恢复后重跑: python chatbot.py stages")
     return 0
 
 

@@ -1,6 +1,12 @@
 # 构建上下文瘦身。
 # 进镜像：.env / artifacts / qdrant_storage / corpus / lexicon（本地数据，开箱即用）
 # 不进镜像：models/ —— 嵌入/重排权重可由服务器下载，entrypoint 启动时按需拉取（省 ~1.5G）
+#
+# 例外：artifacts/embeddings/ 单独排除。稠密缓存文件名是
+#   {sha256(abspath(EMBED_MODEL_PATH))[:12]}_{代码指纹}_{精度}.npz
+# 宿主上 abspath 是 /…/chatbot/models/…，容器里是 /app/models/…，哈希必然不同 →
+# 打进镜像的这 70MB 在容器里**永远命中不了**（容器会算自己的 fp16 缓存），纯死重。
+# 本地那份仍是有效缓存，别删。
 .git
 .gitignore
 .gitattributes
@@ -18,3 +24,4 @@ bak/
 .DS_Store
 snapshots/
 models/
+artifacts/embeddings/

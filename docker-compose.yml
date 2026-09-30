@@ -2,7 +2,10 @@ version: '3.8'
 
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    # 必须与 Dockerfile 的 ARG QDRANT_VERSION 保持同一版本：两者共用 ./qdrant_storage，
+    # 而 Qdrant 存储**不支持降级** —— latest 一旦拉到新版写过数据，镜像里的固定版本就
+    # 打不开该目录（entrypoint 会在"60 秒未就绪"处退出）。
+    image: qdrant/qdrant:v1.19.1
     container_name: qdrant
     restart: always
     ports:

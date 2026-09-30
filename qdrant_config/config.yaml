@@ -5,8 +5,15 @@ log_level: INFO
 
 storage:
   storage_path: /qdrant/storage
-  optimizations:
-    memmap_threshold_kb: 20000
+  # 键名两处都必须对，否则整块被 serde 静默丢弃（qdrant 不用 deny_unknown_fields，
+  # 连警告都没有，两个阈值退回内置默认）：
+  #   optimizations → optimizers    Qdrant 1.x 的字段名，拼错不报错、只是不生效
+  #   memmap_threshold_kb → memmap_threshold   1.x 已改名，值仍是 KB
+  # 语义（官方 config/config.yaml 注释）：memmap_threshold 是"单 segment 内嵌向量的
+  # 上限 KB，超过就落成只读 memmap 文件"；indexing_threshold 是"单 segment 未索引点数
+  # 超过它就建 HNSW"。
+  optimizers:
+    memmap_threshold: 20000
     indexing_threshold_kb: 20000
 
 service:
