@@ -412,7 +412,7 @@ QDRANT_PORT = env_int_any(6333, "QDRANT_PORT", "RAG_QDRANT_PORT")
 # docker-compose.yml 的 QDRANT__SERVICE__API_KEY 取的就是它：不接这条通路，一旦设置了
 # key，应用侧每个 Qdrant 请求都会 401，且日志里没有任何地方能填 key（失效原型：静默）。
 QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("RAG_QDRANT_API_KEY") or "").strip() or None
-# Qdrant 客户端超时（秒）：普通查询走它，批量重建（reindex-sparse）在调用点给 2 倍。
+# Qdrant 客户端超时（秒）：普通查询走它，批量重建（sparse）在调用点给 2 倍。
 # 0 之前由各调用点各自写死 60/30/120 —— 有的默认、有的没设，故障表现既不透明也不一致。
 QDRANT_TIMEOUT = env_int_min("RAG_QDRANT_TIMEOUT", 60, 1)
 COLLECTION_BASE = os.getenv("RAG_COLLECTION_BASE", "rag_documents_v1")
@@ -1565,7 +1565,7 @@ def _distinct_lexicon_ids(client, collection, page_size=1000):
     """滚动全量收集集合里出现过的 lexicon_id（只带这一个 payload 键），返回
     [(指纹, 点数), ...]，集合为空返回 []；点数用于混合态时把残留规模打出来。
 
-    必须全量而非抽首点：reindex-sparse 逐页原地更新，中断/跳页留下"已更新前缀 +
+    必须全量而非抽首点：sparse 逐页原地更新，中断/跳页留下"已更新前缀 +
     旧指纹后缀"，而 scroll 首点恒属已更新前缀 —— 抽 1 个点必过，旧稀疏向量就
     静默参与融合（判据恒真的抽样形态）。单次进程只取这一个键，23 页滚动开销可忽略。
     """
@@ -1585,7 +1585,7 @@ def _distinct_lexicon_ids(client, collection, page_size=1000):
 
 
 def lexicon_fingerprint():
-    """词表与稀疏编码器指纹；任一变 → 只需 reindex-sparse，不牵连稠密与分块。"""
+    """词表与稀疏编码器指纹；任一变 → 只需 sparse，不牵连稠密与分块。"""
     parts = []
     for path in (ALIASES_FILE, STOPWORDS_FILE):
         try:
@@ -2735,7 +2735,7 @@ class RAGEngine:
             # 与分块指纹同理：无记录 ≠ 一致，旧索引的稀疏词空间无从判断。
             raise RuntimeError(
                 "索引未记录词表指纹（旧索引）：稀疏通道新旧无从判断，"
-                "请运行 `python chatbot.py reindex-sparse` 重建后再检索。"
+                "请运行 `python chatbot.py sparse` 重建后再检索。"
             )
         try:
             current = lexicon_fingerprint()
@@ -2748,7 +2748,7 @@ class RAGEngine:
         raise RuntimeError(
             f"词表与索引不一致（索引 {index_lexicon_id} / 当前 {current}）："
             f"稀疏通道词空间已错配，召回会静默下降，"
-            f"请运行 `python chatbot.py reindex-sparse` 重建后再检索。"
+            f"请运行 `python chatbot.py sparse` 重建后再检索。"
         )
     def _gate_check_collection_fingerprint(self, client, collection):
         """检索开跑前的指纹闸门：分块指纹取一条 payload 核对，词表指纹全量滚动核对。
@@ -2765,7 +2765,7 @@ class RAGEngine:
             return
         payload = pts[0].payload or {}
         # 分块指纹抽首点成立：一个集合只由一次 index 写成（新集合 + 原子切别名），
-        # 集合内恒一。词表指纹不成立 —— reindex-sparse 原地更新会留下混合态，
+        # 集合内恒一。词表指纹不成立 —— sparse 原地更新会留下混合态，
         # 首点恒属已更新前缀（见 _distinct_lexicon_ids），必须全量滚动。
         self._check_chunk_freshness(payload.get(CHUNK_FINGERPRINT_FIELD))
         try:
@@ -2777,10 +2777,10 @@ class RAGEngine:
             return
         if len(lex_ids) > 1:
             # 混合态 = 判定不一致（读取本身成功）：fail-closed，且不置位 —— 重试到
-            # reindex-sparse 重建对齐为止，与 _check_* 的"通过才置位"同规则。
+            # sparse 重建对齐为止，与 _check_* 的"通过才置位"同规则。
             raise RuntimeError(
-                f"集合 {collection} 内词表指纹混合（{dict(lex_ids)}），reindex-sparse 中断/跳页残留，"
-                f"新旧稀疏向量正在混同参与融合，请运行 `python chatbot.py reindex-sparse` 重建后再检索。"
+                f"集合 {collection} 内词表指纹混合（{dict(lex_ids)}），sparse 中断/跳页残留，"
+                f"新旧稀疏向量正在混同参与融合，请运行 `python chatbot.py sparse` 重建后再检索。"
             )
         self._check_lexicon_consistency(lex_ids[0][0])
     def _fetch_chunks(self, point_ids, collection=None):
@@ -3722,7 +3722,7 @@ def cmd_compare_chunks(args=None):
 
 
 # ── 工具：稀疏向量重建 ──
-def cmd_reindex_sparse(args=None):
+def cmd_sparse(args=None):
     from qdrant_client import QdrantClient, models
     # 批量重建会话较长：客户端给普通查询 2 倍超时，逐页 scroll 沿用 QDRANT_TIMEOUT。
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
@@ -4116,7 +4116,7 @@ def cmd_verify_lexicon(args=None):
 def cmd_stages(args=None):
     """逐阶段比对指纹，给出最小重跑命令。
     A 分块（语料/切分变 → process） B 稠密（换模型/新内容 → index 增量）
-    C 稀疏（词表/BM25/编码变 → reindex-sparse） D 入库（集合缺失/点数不符 → index）"""
+    C 稀疏（词表/BM25/编码变 → sparse） D 入库（集合缺失/点数不符 → index）"""
     stale = []
     cd_unknown = False
 
@@ -4203,19 +4203,19 @@ def cmd_stages(args=None):
                 # D 段已给出 index；词表指纹也随下次 index 一并写入）。
                 log("  [C] ⏭ 集合为空，词表指纹无从比对（随 D/入库一并写入）")
             else:
-                # 全量滚动而非抽首点：reindex-sparse 逐页原地更新，中断/跳页留下
+                # 全量滚动而非抽首点：sparse 逐页原地更新，中断/跳页留下
                 # "已更新前缀 + 旧指纹后缀"，scroll 首点恒属前缀 —— 抽样必过、
                 # 旧稀疏向量静默参与融合（闸门侧同款缺陷，共用 _distinct_lexicon_ids）。
                 lex_ids = _distinct_lexicon_ids(client, coll)
                 if len(lex_ids) > 1:
                     stale.append("C")
-                    log(f"  [C] ❌ 集合内词表指纹混合（{dict(lex_ids)}，reindex-sparse 中断/跳页残留）-> 需要: reindex-sparse")
+                    log(f"  [C] ❌ 集合内词表指纹混合（{dict(lex_ids)}，sparse 中断/跳页残留）-> 需要: sparse")
                 elif lex_ids[0][0] is None:
                     stale.append("C")
-                    log("  [C] ❌ 索引未记录词表指纹（旧索引）-> 需要: reindex-sparse")
+                    log("  [C] ❌ 索引未记录词表指纹（旧索引）-> 需要: sparse")
                 elif lex_ids[0][0] != lex_now:
                     stale.append("C")
-                    log(f"  [C] ❌ 词表/稀疏编码指纹不一致（索引 {lex_ids[0][0]} / 当前 {lex_now}）-> 需要: reindex-sparse")
+                    log(f"  [C] ❌ 词表/稀疏编码指纹不一致（索引 {lex_ids[0][0]} / 当前 {lex_now}）-> 需要: sparse")
                 else:
                     log("  [C] ✅ 新鲜（稠密向量不受影响）")
             if n_chunks is None:
@@ -4239,7 +4239,7 @@ def cmd_stages(args=None):
     elif "B" in stale or "D" in stale:
         log("最小重跑: python chatbot.py index（稠密走缓存增量）")
     elif "C" in stale:
-        log("最小重跑: python chatbot.py reindex-sparse")
+        log("最小重跑: python chatbot.py sparse")
     else:
         # stale 为空但有阶段没验过：绝不能落到上面的"全部新鲜"。
         log("有阶段未能完成验证（原因见上）→ 恢复后重跑: python chatbot.py stages")
@@ -4249,7 +4249,7 @@ def cmd_stages(args=None):
 
 
 # ── 命令分发 ──
-COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "api": cmd_api, "reindex-sparse": cmd_reindex_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
+COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "api": cmd_api, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
 
 
 def _build_parser():
