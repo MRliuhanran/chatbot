@@ -18,3 +18,8 @@ corsAllowedOrigins = [
 # 可选值：auto / developer / viewer / minimal
 toolbarMode = "minimal"
 showErrorDetails = "none"
+
+[browser]
+# 关掉遥测：headless 部署里默认会去打 metrics.streamlit.io —— 无外网时是后台反复失败的
+# 噪音，有外网时是不必要的出网。
+gatherUsageStats = false

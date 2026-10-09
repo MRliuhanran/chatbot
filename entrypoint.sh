@@ -10,10 +10,12 @@ _log() { printf '[entrypoint] %s\n' "$*"; }
 # ── 0.1 进程存活判据（唯一一份）─────────────────────────────────────────────
 # `kill -0` 对**僵尸**返回 0：exec 之后 Streamlit 是 PID 1、没人 wait，qdrant/ollama
 # 运行期崩溃只会变成僵尸，于是 `! kill -0` 恒为假 —— 存活哨兵一次都不会喊（判据恒假，
-# 正是它声称要捕获的静默故障）。故必须显式排除 Z 状态。ps 不可用时退回 kill -0。
+# 正是它声称要捕获的静默故障）。故必须显式排除 Z 状态。ps 不可用时退回 kill -0
+# —— 这一支必须 return 0：ps 缺失时按"判死"处理会让下面的启动检查把正常进程杀掉。
 _pid_alive() {
     local _pid="$1" _st
     kill -0 "${_pid}" 2>/dev/null || return 1
+    command -v ps >/dev/null 2>&1 || return 0
     _st="$(ps -o stat= -p "${_pid}" 2>/dev/null | head -n1 | tr -d '[:space:]')"
     [ -n "${_st}" ] || return 1
     case "${_st}" in
@@ -54,9 +56,11 @@ _load_dotenv() {
         eval "[ -n \"\${${_k}+x}\" ]" && continue
         _v="${_line#*=}"
         _v="$(printf '%s' "${_v}" | sed -e 's/^[[:space:]]*//')"
+        # 引号值要按**首个闭合引号**截断，不能只看首尾字符：`KEY="v" # 注释` 的首尾
+        # 不是一对引号，旧写法会漏掉引号剥离、把引号带进变量（python-dotenv 不会）。
         case "${_v}" in
-            \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
-            \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+            \"*) _v="${_v#\"}"; _v="${_v%%\"*}" ;;
+            \'*) _v="${_v#\'}"; _v="${_v%%\'*}" ;;
             *) _v="$(printf '%s' "${_v}" | sed -e 's/[[:space:]]\{1,\}#.*$//' -e 's/[[:space:]]*$//')" ;;
         esac
         export "${_k}=${_v}"
@@ -225,6 +229,10 @@ _download_model() {
         # "模型目录缺失或为空"——而下面这行已经把缺哪个文件写清楚了。
         rm -rf "${_tmp}"
         _log "❌ 权重下载失败: ${_name}（缺:${_miss:-?}；已清理暂存，保留既有 ${_dir} 不动，重启容器重试；嵌入/重排不可用）"
+        # 必须 return 1：_log 是 printf（退出码 0），不显式返回非 0 时本函数"下载失败"
+        # 却返回 0 → 调用方 _dl_fail 不置位 → /tmp/model-download.status 写成 ok、
+        # ❌ 汇总行永不出现 —— 权重恰恰缺失时状态通道报"一切正常"，违反上面的契约。
+        return 1
     fi
 }
 
@@ -244,7 +252,7 @@ _download_models() {
         _log "嵌入/重排权重检查结束"
     else
         printf 'failed\n' > /tmp/model-download.status
-        _log "❌ 嵌入/重排权重检查结束（有失败项，见上方日志）→ 嵌入或重排不可用，health 会点名；状态 /tmp/model-download.status"
+        _log "❌ 嵌入/重排权重检查结束（有失败项，见上方日志）→ 嵌入或重排不可用，检索会失败；状态 /tmp/model-download.status"
     fi
 }
 _download_models &
@@ -295,6 +303,8 @@ fi
 ) &
 
 # ── 5. Streamlit：前台运行（容器主进程），端口按创空间要求固定 7860 ────────────
+# 0.0.0.0 是**容器语境的正确值**（容器内直连 127.0.0.1 拿不到宿主端口映射）；不要照搬
+# 到裸机 —— 裸机上 Streamlit 默认绑 localhost，对外暴露需自己显式选 --server.address。
 _log "Streamlit 启动: http://0.0.0.0:${RAG_HTTP_PORT:-7860}"
 exec python -m streamlit run chatbot.py \
     --server.address 0.0.0.0 \

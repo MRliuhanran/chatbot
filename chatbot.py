@@ -1,7 +1,7 @@
 # ── 基础设施：环境配置与日志 ──
 from __future__ import annotations
+
 import argparse
-from collections import Counter, defaultdict
 import datetime
 import glob
 import hashlib
@@ -15,22 +15,25 @@ import time
 import traceback
 import unicodedata
 import warnings
+from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from sentencex import segment
-import requests
+from logging.handlers import RotatingFileHandler
+from typing import Any
+
 try:
     from dotenv import load_dotenv
 except ImportError as exc:
     raise ImportError("缺少依赖 python-dotenv（配置会静默退到代码默认值），安装: pip install python-dotenv") from exc
-# 记录 load_dotenv 之前的环境变量：health 的 env_declared_but_unread 只点名「写进 .env 但代码
-# 从不读取」的变量，避免把本机为 Ollama 服务进程准备的 OLLAMA_* 等 shell 变量误报成应用配置。
-_ENV_KEYS_BEFORE_DOTENV = frozenset(os.environ)
 load_dotenv()
 
 # ── 启动副作用 ──
 # 本地 Ollama/Qdrant 不走系统代理（否则 requests 可能被劫持而超时）。
-_loopback = ",".join(p for p in (os.environ.get("NO_PROXY", ""), "127.0.0.1", "localhost", "::1") if p)
+# 幂等：重复 import（reload/测试）时把历史已写入的 NO_PROXY 一并拼进来去重，
+# 不会因为再跑一次就把旧值再包一层。
+_proxy_parts = [p.strip() for p in os.environ.get("NO_PROXY", "").replace(",", " ").split()]
+_loopback = ",".join(dict.fromkeys(p for p in _proxy_parts + ["127.0.0.1", "localhost", "::1"] if p))
 os.environ["NO_PROXY"] = os.environ["no_proxy"] = _loopback
+del _proxy_parts, _loopback
 warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum")
 
 
@@ -85,23 +88,16 @@ def env_choice(name, default, allowed):
     return val
 
 
-_ENV_NAME_RE = re.compile( r"""(?:os\.getenv|os\.environ\.get)\(\s*[\"']([A-Za-z0-9_]+)[\"']""" r"""|env_(?:int|float|bool|choice|int_min|float_min)\(\s*[\"']([A-Za-z0-9_]+)[\"']""" )
-_ENV_FAMILIES = ("RAG_", "OLLAMA_", "QDRANT_", "SEMANTIC_", "INDEX_")
-_ENV_STANDALONE = ("MODEL", "NORMALIZE_QUOTES")
-_ENV_READ_SOURCE = None
+def env_int_any(default, *names):
+    """按顺序取第一个已设置且非空的名字（等价旧代码的 os.getenv(a) or os.getenv(b) 链），
+    但解析失败时报出**具体那个**名字 —— 裸 int() 只抛 "invalid literal"，指不到变量。"""
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and raw.strip():
+            return env_int(name, default)
+    return default
 
 
-def env_declared_but_unread():
-    global _ENV_READ_SOURCE
-    if _ENV_READ_SOURCE is None:
-        import inspect
-        try:
-            src = inspect.getsource(sys.modules[__name__])
-        except (OSError, TypeError, KeyError):
-            src = ""
-        _ENV_READ_SOURCE = {m[0] or m[1] for m in _ENV_NAME_RE.findall(src)}
-    declared = { k for k in os.environ if k not in _ENV_KEYS_BEFORE_DOTENV and (k.startswith(_ENV_FAMILIES) or k in _ENV_STANDALONE) }
-    return sorted(declared - _ENV_READ_SOURCE)
 
 
 class _StdoutHandler(logging.StreamHandler):
@@ -113,16 +109,50 @@ class _StdoutHandler(logging.StreamHandler):
             self.handleError(record)
 
 
+class _LockedRotatingFileHandler(RotatingFileHandler):
+    """多进程安全的轮转：flock 把「查大小→轮转→写入」整段串起来。
+
+    CLI（process/index/…）与常驻服务（api/serve）可能同时写同一份 rag.log：两个进程
+    同时进 doRollover 会互相覆盖 *.log.N，日志丢行甚至把轮转中的文件写坏。fcntl 不可用
+    的平台退回基类行为（单进程安全，多进程轮转尽力而为，不让日志把主流程带崩）。
+    """
+
+    def emit(self, record):
+        try:
+            import fcntl
+        except ImportError:
+            super().emit(record)
+            return
+        try:
+            fd = os.open(self.baseFilename + ".lock", os.O_CREAT | os.O_WRONLY, 0o644)
+        except OSError:
+            super().emit(record)
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            super().emit(record)
+        finally:
+            os.close(fd)  # close 即释放 flock
+
+
 _LOG_FILE = None
+# 日志文件默认名的单一定义处：文件 handler 与 Streamlit 报错提示（指向 rag.log）共用，
+# 避免两处各写一个默认字符串，以后改默认名只改这一行。
+DEFAULT_LOG_FILE = "rag.log"
 
 
 def _file_handler():
-    """共享日志文件（RAG_LOG_FILE，默认 rag.log）；打开失败退回仅控制台。"""
+    """共享日志文件（RAG_LOG_FILE，默认 rag.log）；打开失败退回仅控制台。
+
+    必须轮转：固定 FileHandler 会无限增长，长跑几个月吃满容器可写层，届时"Qdrant 写不进"
+    的根因被磁盘满掩盖，而运维是被指到这里来看根因的。轮转产生的 rag.log.N 不匹配
+    .gitignore 的 *.log，故 .gitignore 里另有 *.log.* 一条。
+    """
     global _LOG_FILE
     if _LOG_FILE is None:
-        path = os.getenv("RAG_LOG_FILE", "rag.log")
+        path = os.getenv("RAG_LOG_FILE", DEFAULT_LOG_FILE)
         try:
-            h = logging.FileHandler(path, encoding="utf-8")
+            h = _LockedRotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
             h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         except Exception:
             h = None
@@ -146,15 +176,91 @@ logger = get_logger("rag_engine")
 
 def log(*parts):
     console.info(" ".join(str(part) for part in parts))
+
+
+# ── 运行态单例（模块级缓存/锁的统一定义处）──
+# 会话、tokenizer、词表、别名解析结果都属于"每个进程只应有一份、且懒加载要加锁"的状态。
+# 集中放一个 _RuntimeState：多线程（预热线程/API 请求）与 Streamlit 多次 rerun 之间不会
+# 出现"同一载荷两份缓存"的分叉；__init__ 里析构即可。属性全部在模块级初始化，保证任何
+# 线程首个访问者拿到的都只这一份（_state_ref 双检锁）。
+class _RuntimeState:
+    def __init__(self):
+        self.ollama_session = None
+        self.ollama_session_lock = threading.Lock()
+        self.lexicon = None
+        self.lexicon_lock = threading.Lock()
+        self.gen_tokenizer = None
+        self.gen_tokenizer_tried = False
+        self.gen_tokenizer_lock = threading.Lock()
+        self.alias_resolved = {}
+        self.alias_degraded = False
+
+
+_STATE = None
+_STATE_LOCK = threading.Lock()
+
+
+def _state_ref():
+    """模块级运行态单例（双检锁）：任何线程首访问只构造一份，之后全部复用。"""
+    global _STATE
+    if _STATE is None:
+        with _STATE_LOCK:
+            if _STATE is None:
+                _STATE = _RuntimeState()
+    return _STATE
+
+
+def _streamlit_runtime_state():
+    """Streamlit 侧取同一份运行态：cache_resource 保证会话内复用，指向的就是模块单例。
+    必须在 run_streamlit 里先于 engine 构建调用，让预热/首查询线程与脚本线程共用一份。"""
+    import streamlit as st
+    return st.cache_resource(show_spinner=False)(_state_ref)()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 API_URL = f"{OLLAMA_BASE_URL}/api/chat"
 MODEL = os.getenv("MODEL", "qwen3.5:2b-q4_K_M")
 # 思维链唯一开关：模型/页面/API/会话共用（默认关）；开启时只当场展示、永不进入生成上下文。
 THINK = env_bool("RAG_THINK", False)
 # num_ctx / num_predict 与思维链开关解耦：固定预算，不随开关浮动。
-NUM_CTX = int(os.getenv("RAG_NUM_CTX", "8192"))
-NUM_PREDICT = int(os.getenv("RAG_NUM_PREDICT", "4096"))
-TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "180"))
+# 解析必须走 env_int（具名报错）；下限在 GEN_INPUT_RESERVE 定义处与它交叉校验。
+NUM_CTX = env_int("RAG_NUM_CTX", 8192)
+NUM_PREDICT = env_int("RAG_NUM_PREDICT", 4096)
+TIMEOUT = env_float_min("OLLAMA_TIMEOUT", 180, 1.0)
+# 采样温度：0=贪心（问答类检索场景的默认）；改它走 RAG_TEMPERATURE，不改代码。
+TEMPERATURE = env_float("RAG_TEMPERATURE", 0.0)
+# 惩罚回看窗口：repeat/presence/frequency 三类惩罚共用同一历史窗口（llama.cpp 采样链）。
+# 64=Ollama 内置默认；128 拉长一倍去挡间隔更大的原文复读（思考链循环式复核）。
+REPEAT_LAST_N = env_int_min("RAG_REPEAT_LAST_N", 64, 1)
+# 输入窗口上限 = RAG_NUM_CTX - RAG_INPUT_RESERVE（token 度量）：窗口**全部给输入，不做输出
+# 预留**。生成空间由服务端上下文移位腾出 —— 生成超窗时从最前面按 token 遗忘（先丢输入前文
+# /历史，见 plan_generation）。RAG_NUM_PREDICT ≤ 0 时请求发 num_predict=-1，输出不限长。
+# ── 采样/惩罚（Ollama options；单一来源见 _chat_options）──
+# 截断类：temperature=0（贪心）时 top_p/top_k/min_p 全都不参与 argmax，设了也不影响输出；
+# 保留它们，是为了温度>0 做 A/B 时有可复现的截断参数。`RAG_TOP_K` 已被「检索返回条数」
+# 占用，采样侧统一加 gen_ 前缀。0 表示该截断不生效。
+GEN_TOP_K = env_int_min("RAG_GEN_TOP_K", 20, 0)
+GEN_TOP_P = env_float_min("RAG_GEN_TOP_P", 0.9, 0.0)
+GEN_MIN_P = env_float_min("RAG_GEN_MIN_P", 0.0, 0.0)
+# 惩罚类：直接改 logits，贪心下依然生效。模型自带 presence_penalty=1.5（`ollama show`），
+# 对资料/提问里出现过的每个字词都减 1.5，会压制人名、术语的**正常复现** —— 默认显式归零
+# 覆盖模型默认；要复现旧行为把 RAG_GEN_PRESENCE_PENALTY 写回 1.5。
+GEN_PRESENCE_PENALTY = env_float("RAG_GEN_PRESENCE_PENALTY", 0.0)
+GEN_FREQUENCY_PENALTY = env_float("RAG_GEN_FREQUENCY_PENALTY", 0.0)
+GEN_REPEAT_PENALTY = env_float_min("RAG_GEN_REPEAT_PENALTY", 1.1, 0.0)
+# 随机种子：-1=每次随机（temperature=0 下无影响）；固定正整数用于可复现采样。
+GEN_SEED = env_int("RAG_GEN_SEED", -1)
+# 生成侧**不设任何长度/时间闸、也不重试**：窗口（RAG_NUM_CTX，token 度量）是唯一上限；超窗
+# 由服务端上下文移位从最前面按 token 丢续写；空答/截断/报错原样交给上层。
+
+
+def _ollama_session():
+    """Ollama HTTP 连接复用：单例 Session 走 keep-alive，省每请求的 TCP 握手。"""
+    state = _state_ref()
+    with state.ollama_session_lock:
+        if state.ollama_session is None:
+            import requests
+            state.ollama_session = requests.Session()
+        return state.ollama_session
+
 
 
 # ── 生成客户端：Ollama 流式对话 ──
@@ -166,11 +272,50 @@ EVENT_ERROR = "error"
 EVENT_DONE = "done"
 
 
-def stream_chat(messages, temperature=0.0):
+def _chat_options(temperature=None, num_ctx=None, num_predict=None):
+    """Ollama 生成参数的单一定义处：生成请求与预热都从这里取。
+
+    只显式列出应用要**钉死**的项；没列出的才交给模型自带默认。模型默认里
+    `presence_penalty=1.5` 对本 RAG 场景偏强，已在此显式覆盖，避免"静默继承一个
+    没人注意到的高惩罚"。
+    """
+    _predict = int(NUM_PREDICT if num_predict is None else num_predict)
+    return {
+        "temperature": TEMPERATURE if temperature is None else temperature,
+        "num_ctx": int(NUM_CTX if num_ctx is None else num_ctx),
+        # ≤0 = 不限长，映射到 Ollama 的 -1（默认即无限）；正数才是硬上限。
+        "num_predict": _predict if _predict > 0 else -1,
+        "top_k": int(GEN_TOP_K),
+        "top_p": float(GEN_TOP_P),
+        "min_p": float(GEN_MIN_P),
+        "repeat_last_n": int(REPEAT_LAST_N),
+        "repeat_penalty": float(GEN_REPEAT_PENALTY),
+        "presence_penalty": float(GEN_PRESENCE_PENALTY),
+        "frequency_penalty": float(GEN_FREQUENCY_PENALTY),
+        "seed": int(GEN_SEED),
+    }
+
+
+def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, think=None):
+    """temperature/num_ctx/num_predict 缺省取全局生效值；显式传入即覆盖。
+
+    run_turn 的同名参数就是经此生效的 —— 若它只把参数传给 plan_generation（算预算）
+    而请求仍用全局值，就会出现"预算按 A 算、请求按 B 发"的静默分叉。
+    调用方自定义的 chat 可调用对象必须接受 run_turn 实际传入的关键字参数
+    （num_ctx / num_predict；temperature 未传时取全局生效值）。
+
+    think=None 取全局 RAG_THINK；显式传入即覆盖。
+    本函数**不设长度/时间闸、也不重试**：输出与思考都不限长，窗口（num_ctx）是唯一上限，
+    超窗由服务端上下文移位从最前面按 token 遗忘续写；空答/截断/报错原样交给上层。
+    """
+    options = _chat_options(temperature, num_ctx, num_predict)
+    use_think = THINK if think is None else bool(think)
     r = None
     dropped_thinking = 0
     try:
-        r = requests.post( API_URL, json={ "model": MODEL, "messages": messages, "stream": True, "think": THINK, "options": { "temperature": temperature, "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT, }, }, stream=True, timeout=TIMEOUT, )
+        # try 内发起请求：requests 缺失/连接失败要走 EVENT_ERROR，而不是从生成器里
+        # 抛出去砸消费侧（requests 由 _ollama_session 惰性 import，失败同样落在这层）。
+        r = _ollama_session().post( API_URL, json={ "model": MODEL, "messages": messages, "stream": True, "think": use_think, "options": options, }, stream=True, timeout=TIMEOUT, )
         if r.status_code != 200:
             yield EVENT_ERROR, f"HTTP {r.status_code} {r.text[:300]}"
             return
@@ -189,7 +334,7 @@ def stream_chat(messages, temperature=0.0):
             message = chunk.get("message") or {}
             # 生产端唯一闸门：关着时事件流里不存在 EVENT_THINKING。
             if message.get("thinking"):
-                if THINK:
+                if use_think:
                     yield EVENT_THINKING, message["thinking"]
                 else:
                     # 开关关着却收到思维链 = 模型侧没听 think=false；按开关丢弃并告警一次。
@@ -221,13 +366,13 @@ def _has_searchable_content(text):
 
 # ── 领域与检索侧配置 ──
 # 全部可配置；默认值面向通用垂直领域，核心代码不假设语料形态、文件名或来源字段。
+# RAG_BOOKS_DIR 是 RAG_DATA_DIR 的遗留别名（仍生效，老部署迁移用；新配置只写 RAG_DATA_DIR）
 DATA_DIR = os.getenv("RAG_DATA_DIR") or os.getenv("RAG_BOOKS_DIR") or "corpus"
 DOC_GLOB = os.getenv("RAG_DOC_GLOB", "*.txt")
 DOMAIN_NAME = os.getenv("RAG_DOMAIN_NAME", "垂直领域知识库")
 DOMAIN_DESCRIPTION = os.getenv("RAG_DOMAIN_DESCRIPTION", "")
 SOURCE_FIELD = (os.getenv("RAG_SOURCE_FIELD") or "source").strip() or "source"
 SOURCE_LABEL = os.getenv("RAG_SOURCE_LABEL", "来源")
-HEALTH_PROBE_QUESTION = os.getenv("RAG_HEALTH_PROBE", "请用一句话说明你能回答哪个领域的问题。")
 _RESERVED_SOURCE_FIELDS = {
     "chunk_id", "id", "child_text", "parent_text", "chunk_index", "total_chunks",
     "contextual_text", "parent_id", "parent_chunk_count", "build_id", "lexicon_id",
@@ -263,10 +408,13 @@ EMBED_BATCH_SIZE = env_int("RAG_EMBED_BATCH_SIZE", 64)
 SEMANTIC_EMBED_DEVICE = os.getenv("SEMANTIC_EMBED_DEVICE", "")  # 空=自动选设备（MPS 优先），见 get_device()
 INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
 QDRANT_HOST = os.getenv("QDRANT_HOST") or os.getenv("RAG_QDRANT_HOST") or "localhost"
-QDRANT_PORT = int(os.getenv("QDRANT_PORT") or os.getenv("RAG_QDRANT_PORT") or "6333")
+QDRANT_PORT = env_int_any(6333, "QDRANT_PORT", "RAG_QDRANT_PORT")
 # docker-compose.yml 的 QDRANT__SERVICE__API_KEY 取的就是它：不接这条通路，一旦设置了
 # key，应用侧每个 Qdrant 请求都会 401，且日志里没有任何地方能填 key（失效原型：静默）。
 QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("RAG_QDRANT_API_KEY") or "").strip() or None
+# Qdrant 客户端超时（秒）：普通查询走它，批量重建（reindex-sparse）在调用点给 2 倍。
+# 0 之前由各调用点各自写死 60/30/120 —— 有的默认、有的没设，故障表现既不透明也不一致。
+QDRANT_TIMEOUT = env_int_min("RAG_QDRANT_TIMEOUT", 60, 1)
 COLLECTION_BASE = os.getenv("RAG_COLLECTION_BASE", "rag_documents_v1")
 COLLECTION_NAME = COLLECTION_BASE
 COLLECTION_ALIAS = os.getenv("RAG_COLLECTION_ALIAS", "rag_current")
@@ -283,11 +431,14 @@ EMBED_CACHE_DIR = os.path.join(_ARTIFACTS_DIR, "embeddings")
 EMBED_CACHE_ENABLED = env_bool("RAG_EMBED_CACHE", True)
 DOC_CHUNK_DIR = os.path.join(_ARTIFACTS_DIR, "docs")  # 单文档分块缓存：只重分块增/改的文档
 LEXICON_DIR = os.getenv("RAG_LEXICON_DIR", "./lexicon")
-SCROLL_PAGE_SIZE = 1000
+WRITE_BATCH = 1000
 INDEX_BUILD_ID_FIELD = "build_id"
 LEXICON_ID_FIELD = "lexicon_id"
 CHUNK_FINGERPRINT_FIELD = "chunk_fingerprint"
 _PAYLOAD_SPEC = ( ("chunk_id", "id", ""), ("child_text", "child_text", ""), ("parent_text", "parent_text", ""), (SOURCE_FIELD, "source", ""), ("chunk_index", "chunk_index", 0), ("total_chunks", "total_chunks", 0), ("contextual_text", "contextual_text", ""), ("parent_id", "parent_id", ""), ("parent_chunk_count", "parent_chunk_count", 0), )
+# chunks.json 的记录字段：除来源字段用 payload 键（=RAG_SOURCE_FIELD）外，其余都用规范键 k。
+# 不能直接用 _PAYLOAD_SPEC 的 f：chunk_id 的 payload 键是 "chunk_id"、记录键却是 "id"。
+_RECORD_FIELDS = {k for _f, k, _d in _PAYLOAD_SPEC if k != "source"} | {SOURCE_FIELD}
 
 
 def _source_of(record):
@@ -308,13 +459,14 @@ def _chunk_value(chunk, key, default=""):
     return chunk.get(key, default)
 
 
-def chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint=None):
+def chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint):
     payload = {f: _chunk_value(chunk, k, d) for f, k, d in _PAYLOAD_SPEC}
     payload[INDEX_BUILD_ID_FIELD] = build_id
     payload[LEXICON_ID_FIELD] = lexicon_id
     # 记录本索引是**哪一份分块产物**建起来的。检索侧拿它与当前切分指纹比对，等价于
     # 词表指纹那道闸门：没有它，process 之后的旧 chunks/Qdrant 会被 serve/api 静默
-    # 继续服务（stages 报过期，但没人看），用户拿到的是无声的旧知识库。
+    # 继续服务（stages 报过期，但没人看），用户拿到的是无声的旧知识库。必填：不填 =
+    # 新档没建指纹却能静默入库（失效原型：静默）。唯一调用点 build_index 已传。
     payload[CHUNK_FINGERPRINT_FIELD] = chunk_fingerprint
     return payload
 RRF_K = env_int_min("RAG_RRF_K", 60, 0)
@@ -327,7 +479,8 @@ if _RECALL_LIMIT_RAW < 0:
     raise ValueError(f"环境变量 RAG_RECALL_LIMIT={_RECALL_LIMIT_RAW!r} 不能为负数（0 表示跟随 RAG_RERANK_TOP_K，当前 {RERANK_TOP_K}）")
 RECALL_LIMIT = _RECALL_LIMIT_RAW or RERANK_TOP_K
 DEDUP_BY_PARENT = env_bool("RAG_DEDUP_BY_PARENT", True)
-BGE_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
+# 原值"为这个句子生成表示以用于检索相关文章："（bge 官方查询指令）；按全裸 prompt 配置置空走裸查询嵌入。
+BGE_QUERY_INSTRUCTION = os.getenv("RAG_EMBED_QUERY_INSTRUCTION", "")
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
 BM25_TEXT_OPTIONS = { "tokenizer": "word", "stemmer": {"type": "none"}, "stopwords": {}, "ascii_folding": True, }
@@ -344,7 +497,9 @@ def history_to_messages(history):
         content = m.get("content")
         if not content or not str(content).strip():
             continue
-        out.append({"role": m.get("role") or "user", "content": content})
+        # 非字符串统一 str()：原样 append 会把 int/对象等非 str 内容直接送进 JSON 请求体，
+        # Ollama 侧要么 400 要么静默 ToString，两种都与"发出去的是这段原文"的预期不符。
+        out.append({"role": m.get("role") or "user", "content": str(content)})
     return out
 
 
@@ -379,7 +534,7 @@ def _require_model_dir(path, what, hint):
 
 
 def load_embedding_model(device=None, model_path=None):
-    from transformers import AutoTokenizer, AutoModel
+    from transformers import AutoModel, AutoTokenizer
     device = device or get_device()
     model_path = _require_model_dir(
         model_path or EMBED_MODEL_PATH, "嵌入",
@@ -394,7 +549,7 @@ def load_embedding_model(device=None, model_path=None):
 
 def load_reranker_model(device=None):
     import torch
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
     device = device or get_device()
     dtype = torch.float16 if _float16_ok(device) else torch.float32
     model_path = _require_model_dir(
@@ -430,6 +585,9 @@ def embed(texts, tokenizer, model, device, is_query=False, autocast=False):
 
 # ── 分块：归一、分句、父子打包 ──
 SENTENCE_TERMINATORS = "。！？．…!?"
+# 分句器语言码（sentencex 的 lang 参数）。默认 zh；换非中文语料时按 sentencex 支持的语言码
+# 改这里。它进切分指纹，改它会触发重分块（这是有意的）。
+SENTENCE_LANG = (os.getenv("RAG_SENTENCE_LANG") or "zh").strip() or "zh"
 # 段落硬边界判据：只认**真正空行**（两个连续换行，允许 \r）。句内单个 \n 是软折行，
 # 属合法排版；而"行内只含空格/TAB 的空行"（\n[ \t]*\n）sentencex 并不当边界 ——
 # 旧正则把它也算作硬边界，于是"空行带尾随空格、空行后紧跟闭引号（”）"这类合法 txt
@@ -505,6 +663,18 @@ def _split_keep(text, terminators):
     return [p for p in parts if p.strip()]
 
 
+def segment(lang, text):
+    """sentencex 的惰性转发壳：首次真正分句时才加载分句器。
+
+    必须留在模块级、且不要把 import 下推进 _split_sentences 的函数体 —— 那会让源码
+    逐字进切分指纹（_CHUNKING_CODE_UNITS）而与分句逻辑无关。语言码走 SENTENCE_LANG
+    （默认 zh）；换语言码会改指纹并触发重分块，这是有意的。
+    代价：改这个壳子的行为不进指纹（调用点与壳子分离），分句器版本变化靠 config 指纹兜。
+    """
+    from sentencex import segment as _segment
+    return _segment(lang, text)
+
+
 def _split_sentences(s, tokenizer=None, max_tokens=None):
     """分句：sentencex 单层分句 → （可选）token 上限兜底。
 
@@ -518,7 +688,7 @@ def _split_sentences(s, tokenizer=None, max_tokens=None):
     整段无标点的长文（单句最长可达 700 余字），
     纯分句器对它们无能为力，不兜底就会撑破 CHILD_MAX_TOKENS。
     """
-    parts = [p.strip() for p in segment("zh", s) if p.strip()]
+    parts = [p.strip() for p in segment(SENTENCE_LANG, s) if p.strip()]
 
     # 段落硬边界的守护断言。sentencex 保证引语不可切分、不跨段；一旦这里失败，
     # 说明分句器行为变了（换版本/换库），必须重新评估分块，不能静默继续。
@@ -529,7 +699,7 @@ def _split_sentences(s, tokenizer=None, max_tokens=None):
     # ValueError，于是新增这类文档会让 `python chatbot.py process` 整个崩掉，
     # 报错还把原因误指成"sentencex 行为可能已变"。现有语料恰好没有句内换行
     # （实测句内残留换行 = 0），所以这个缺陷一直被掩盖着。
-    # 注意只在 token 兜底之前断言：兜底会按 "\n" 等终止符切开长句，可能产生带换行的碎片。
+    # 注意只在 token 兜底之前断言：兜底会按句末标点等终止符切开长句，可能产生跨句碎片。
     bad = next((p for p in parts if _PARAGRAPH_GAP_RE.search(p)), None)
     if bad is not None:
         raise ValueError(
@@ -537,7 +707,7 @@ def _split_sentences(s, tokenizer=None, max_tokens=None):
         )
 
     # 句内软换行归一成空格。它不影响语义，但会让"一个句子"在子块文本里分裂成
-    # 视觉上的两行，也会让下游按 "\n" 分级的 token 兜底把句子切碎。
+    # 视觉上的两行，也会让下游的 token 兜底把句子切碎。
     parts = [_SOFT_WRAP_RE.sub(" ", p) for p in parts]
 
     if tokenizer is not None and max_tokens:
@@ -591,7 +761,7 @@ def _hard_split_by_tokens(text, tokenizer, max_tokens):
 def _enforce_token_limit(text, tokenizer, max_tokens, depth=0):
     """保证返回的每个片段都不超过 max_tokens。
 
-    逐级降级：句末标点 → 换行 → 分号 → 逗号/顿号 → 硬切。
+    逐级降级：句末标点 → 分号 → 逗号/顿号 → 硬切（换行在 _split_sentences 里已先归一）。
     depth 与 len(parts)>1 双重判断是必需的：若唯一终止符恰好落在句尾，
     _split_keep 会切出一个与输入等长的片段，不加判断就会无限自递归。
     """
@@ -599,7 +769,7 @@ def _enforce_token_limit(text, tokenizer, max_tokens, depth=0):
     if len(tokenizer.encode(text, add_special_tokens=False)) <= max_tokens:
         return [text]
     if depth < 32:
-        for terminators in (SENTENCE_TERMINATORS, "\n", "；", "，、"):
+        for terminators in (SENTENCE_TERMINATORS, "；", "，、"):
             if not any(t in text for t in terminators):
                 continue
             parts = _split_keep(text, terminators)
@@ -788,8 +958,9 @@ def _enforce_group_cap(groups, tok, max_tokens):
     与 rerank 都按它截断），而下限只是质量偏好。两者会互相拉扯 ——
     "合并小块"可能顶破上限，"遵守上限"可能留下小块。这里的取舍是明确的：
     **上限优先**。小块只是上下文略少，超限则是静默截断，后者更糟。
-    分组本身若只有一句且超限，说明它没经过逐句兜底（不该发生），此时原样保留
-    而不是死循环 —— 那种情况应当由上游的 `_split_sentences` 兜底负责。
+    两分不出合法切点（需要三分以上）时退回逐句贪心打包；只有单句本身就超限
+    （没经过逐句兜底，不该发生）才原样保留，由上游 `_split_sentences` 负责。
+    （旧实现只试两分，[117,141,28,194]/上限207 这类输入会被原样放过 = 上限被破坏。）
     """
     queue = [list(g) for g in groups]
     out = []
@@ -798,7 +969,9 @@ def _enforce_group_cap(groups, tok, max_tokens):
         g = queue.pop(0)
         guard += 1
         if guard > 10 * len(groups) + 1000:
-            # 防御极端输入下的死循环；真发生说明切分逻辑不收敛
+            # 防御极端输入下的死循环；真发生说明切分逻辑不收敛 —— 剩余组原样保留
+            # 可能超上限，必须留痕（静默破硬上限 = embedding/rerank 端静默截断）。
+            log(f"⚠️  _enforce_group_cap 迭代上限触发（{guard} 次），剩余 {len(queue) + 1} 组未再切分，可能出现超过 {max_tokens} token 的块")
             out.extend(queue + [g])
             break
         if _group_tokens(g, tok) <= max_tokens or len(g) <= 1:
@@ -806,7 +979,24 @@ def _enforce_group_cap(groups, tok, max_tokens):
             continue
         head, tail = _split_two(g, tok, max_tokens)
         if not tail:
-            out.append(g)
+            # _split_two 只做两分：需要三分以上、且不存在「两半都不超限」的切点时它返回空。
+            # 逐句贪心打包兜底 —— 契约是每个元素都 ≤ 上限，顺序装填一定得到合法子组。
+            if len(g) > 1 and all(tok[i] <= max_tokens for i in g):
+                packed, cur, cur_tokens = [], [], 0
+                for i in g:
+                    if cur and cur_tokens + tok[i] > max_tokens:
+                        packed.append(cur)
+                        cur, cur_tokens = [], 0
+                    cur.append(i)
+                    cur_tokens += tok[i]
+                if cur:
+                    packed.append(cur)
+                out.extend(packed)
+            else:
+                # 单句本身就超限（没经过逐句兜底，不该发生）：原样保留，由上游负责。
+                # 保留可以，静默不行 —— 超限块到 embedding/rerank 端会被静默截断。
+                log(f"⚠️  _enforce_group_cap: 组内存在超过 {max_tokens} token 的单句，原样保留（组 {sum(tok[i] for i in g)} tokens）")
+                out.append(g)
             continue
         queue = [head, tail] + queue
     return out
@@ -979,7 +1169,7 @@ def read_book_text(filepath):
 read_document_text = read_book_text  # 通用别名；保留 read_book_text 以兼容分块指纹
 # 语义定界依赖句子嵌入（_encode_sentences→_embed_batch），必须纳入指纹：改嵌入代码会改变
 # 切分边界，漏掉就会让"切分产物过期"不被发现（_semantic_split 源码本身不含这些函数的实现）。
-_CHUNKING_CODE_UNITS = ( "fix_quotes", "_split_keep", "_split_sentences", "_enforce_token_limit", "_hard_split_by_tokens", "_semantic_split", "_merge_small_texts", "_hierarchical_split", "_balanced_pack_groups", "_group_tokens", "_split_two", "_merge_small_groups", "_enforce_group_cap", "_split_by_tokens", "_split_into_children", "read_book_text", "_encode_sentences", "_embed_batch", "_get_embed_model", )
+_CHUNKING_CODE_UNITS = ( "fix_quotes", "_split_keep", "_split_sentences", "_enforce_token_limit", "_hard_split_by_tokens", "_semantic_split", "_merge_small_texts", "_hierarchical_split", "_balanced_pack_groups", "_group_tokens", "_split_two", "_merge_small_groups", "_enforce_group_cap", "_split_by_tokens", "_split_into_children", "read_book_text", "_encode_sentences", "_embed_batch", "_get_embed_model", "load_embedding_model", )
 
 
 def _package_version(name):
@@ -996,24 +1186,35 @@ def _chunking_code_fingerprint():
     for name in _CHUNKING_CODE_UNITS:
         fn = globals().get(name)
         try:
-            parts.append(f"{name}:{inspect.getsource(fn)}")
+            parts.append(f"{name}:{inspect.getsource(fn)}")  # type: ignore[arg-type]
         except (OSError, TypeError):
             parts.append(f"{name}:<unavailable>")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def _chunking_config_fingerprint():
-    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "child_min_tokens": CHILD_MIN_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "semantic_threshold": SEMANTIC_THRESHOLD, "semantic_min_chars": SEMANTIC_MIN_CHARS, "normalize_quotes": NORMALIZE_QUOTES, "embed_model": EMBED_MODEL_PATH, "sentencex": _package_version("sentencex"), "chunking_code": _chunking_code_fingerprint(), "sentence_terminators": SENTENCE_TERMINATORS, "paragraph_gap_re": _PARAGRAPH_GAP_RE.pattern, "soft_wrap_re": _SOFT_WRAP_RE.pattern, }
+    # embed_model_content：语义定界用的是**权重算出的句向量**，同路径换权重必须触发重分块。
+    # 只存路径 = 静默沿用旧分块（稠密缓存 _embed_cache_file 已修同款洞，分块侧同步补上）。
+    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "child_min_tokens": CHILD_MIN_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "semantic_threshold": SEMANTIC_THRESHOLD, "semantic_min_chars": SEMANTIC_MIN_CHARS, "normalize_quotes": NORMALIZE_QUOTES, "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content_fingerprint(), "sentencex": _package_version("sentencex"), "sentence_lang": SENTENCE_LANG, "chunking_code": _chunking_code_fingerprint(), "sentence_terminators": SENTENCE_TERMINATORS, "paragraph_gap_re": _PARAGRAPH_GAP_RE.pattern, "soft_wrap_re": _SOFT_WRAP_RE.pattern, }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16], payload
 
 
 def _sources_fingerprint(paths):
+    """每份源文档的 sha 指纹（1MB 流式读：源文件很大时不必一次性载入内存）。
+
+    只供"语料有没有变"判断，语义不变：流式分块哈希与整文件一次哈希结果一致。
+    """
     out = {}
     for path in paths:
         with open(path, "rb") as f:
-            key = os.path.relpath(path, DATA_DIR)
-            out[key] = hashlib.sha256(f.read()).hexdigest()[:16]
+            h = hashlib.sha256()
+            while True:
+                block = f.read(1024 * 1024)
+                if not block:
+                    break
+                h.update(block)
+            out[os.path.relpath(path, DATA_DIR)] = h.hexdigest()[:16]
     return out
 
 
@@ -1062,8 +1263,7 @@ def _load_doc_chunks(source_name, sha, fingerprint):
         chunks = cached.get("chunks")
         if not isinstance(chunks, list):
             return None
-        spec = {k for _f, k, _d in _PAYLOAD_SPEC}
-        if chunks and set(chunks[0]) != spec:
+        if chunks and set(chunks[0]) != _RECORD_FIELDS:
             return None
         return chunks
     except Exception as exc:
@@ -1081,26 +1281,46 @@ def _save_doc_chunks(source_name, sha, fingerprint, chunks):
         os.replace(tmp, path)
     except Exception as exc:
         log(f"    ⚠️  文档缓存写入失败（本次分块不受影响）: {type(exc).__name__}: {exc}")
+        try:
+            os.remove(tmp)  # 失败留下的半截 tmp 由 _gc_doc_chunks 兜底，这里先就地清
+        except (OSError, UnboundLocalError):
+            pass
 
 
 def _gc_doc_chunks(keep_names):
-    """删除已不存在文档的分块缓存（增删改里的「删」）；失败不影响分块。"""
+    """删除已不存在文档的分块缓存（增删改里的「删」）；顺带清掉中断遗留的 .tmp。
+    失败不影响分块。"""
     try:
         if not os.path.isdir(DOC_CHUNK_DIR):
             return
         removed = 0
+        tmp_removed = 0
         for name in os.listdir(DOC_CHUNK_DIR):
-            if name.endswith(".json") and name[:-5] not in keep_names:
-                os.remove(os.path.join(DOC_CHUNK_DIR, name))
+            path = os.path.join(DOC_CHUNK_DIR, name)
+            if name.endswith(".json.tmp"):
+                # 写入中断遗留的半截文件：不属于任何文档缓存，旧逻辑匹配不到后缀永不清理
+                os.remove(path)
+                tmp_removed += 1
+            elif name.endswith(".json") and name[:-5] not in keep_names:
+                os.remove(path)
                 removed += 1
         if removed:
             log(f"清理 {removed} 个已删除文档的分块缓存")
+        if tmp_removed:
+            log(f"清理 {tmp_removed} 个中断遗留的分块缓存临时文件")
     except Exception as exc:
         log(f"    ⚠️  文档缓存清理失败（不影响本次分块）: {type(exc).__name__}: {exc}")
 
 
 # ── 分块产物与门禁 ──
 def build_chunks():
+    # 上次 process 中断留下的半截 tmp（原子写靠 os.replace 收尾）：进到这里说明本轮
+    # 没有别的 writer 在跑（process 单进程串行），直接清掉，不让孤儿 tmp 永久占盘。
+    for _stale_tmp in (CHUNKS_JSON + ".tmp", CHUNKS_META_JSON + ".tmp"):
+        try:
+            os.remove(_stale_tmp)
+        except OSError:
+            pass
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
     paths = _document_paths()
@@ -1110,59 +1330,84 @@ def build_chunks():
     log(f"找到 {len(paths)} 个文档: {', '.join(os.path.basename(p) for p in paths)}")
     all_chunks = []
     reused = 0
+    failures: list = []
     for i, filepath in enumerate(paths):
         source_name = _document_name(filepath)
-        sha = sources_now[os.path.relpath(filepath, DATA_DIR)]
-        cached = _load_doc_chunks(source_name, sha, fingerprint)
-        if cached is not None:
-            all_chunks.extend(cached)
-            reused += 1
-            log(f"[{i + 1}/{len(paths)}] 复用未变文档: {source_name}（{len(cached)} 块）")
-            continue
-        log(f"[{i + 1}/{len(paths)}] 处理: {source_name} ...")
-        text = read_document_text(filepath)
-        pairs = []
-        for child_text, parent_text in _hierarchical_split(text, tokenizer):
-            pairs.append((child_text, parent_text))
-        kept = [(c, p) for c, p in pairs if c.strip()]
-        dropped = len(pairs) - len(kept)
-        if dropped:
-            log(f"    ⚠️  丢弃 {dropped} 个纯空白块（不含任何文字）")
-        if not kept:
-            raise ValueError(f"文档 {source_name} 分块后无有效内容（所有块均为空白），请检查源文件或调整分块参数")
-        parent_ids = {}
-        for _, parent_text in kept:
-            if parent_text not in parent_ids:
-                parent_ids[parent_text] = f"{source_name}_p{len(parent_ids)}"
-        doc_chunks = []
-        for chunk_idx, (child_text, parent_text) in enumerate(kept):
-            chunk_dict = { "child_text": child_text, "parent_text": parent_text, "chunk_index": chunk_idx, "total_chunks": len(kept), "parent_id": parent_ids[parent_text], "parent_chunk_count": 0, "contextual_text": child_text, "id": f"{source_name}_{chunk_idx}", }
-            chunk_dict[SOURCE_FIELD] = source_name
-            doc_chunks.append(chunk_dict)
-        _save_doc_chunks(source_name, sha, fingerprint, doc_chunks)
-        all_chunks.extend(doc_chunks)
+        # 逐文档兜底：单篇坏数据/异常不再拖垮整个 process。失败的只跳过自己、
+        # 其余照算；末尾因 failures 短路返回，不覆盖 chunks.json —— 残缺产物一旦
+        # 入库，索引就会静默少文档。语料/指纹变化仍会让 stages A 报 stale，不会假新鲜。
+        try:
+            sha = sources_now[os.path.relpath(filepath, DATA_DIR)]
+            cached = _load_doc_chunks(source_name, sha, fingerprint)
+            if cached is not None:
+                all_chunks.extend(cached)
+                reused += 1
+                log(f"[{i + 1}/{len(paths)}] 复用未变文档: {source_name}（{len(cached)} 块）")
+                continue
+            log(f"[{i + 1}/{len(paths)}] 处理: {source_name} ...")
+            text = read_document_text(filepath)
+            pairs = []
+            for child_text, parent_text in _hierarchical_split(text, tokenizer):
+                pairs.append((child_text, parent_text))
+            kept = [(c, p) for c, p in pairs if c.strip()]
+            dropped = len(pairs) - len(kept)
+            if dropped:
+                log(f"    ⚠️  丢弃 {dropped} 个纯空白块（不含任何文字）")
+            if not kept:
+                raise ValueError(f"文档 {source_name} 分块后无有效内容（所有块均为空白），请检查源文件或调整分块参数")
+            # pairs 是整篇的 (child, parent) 文本对，kept 是它的子集 —— 两者并存就是
+            # 这篇文档的文本在峰值里翻倍。kept 起不再需要 pairs。
+            del pairs
+            parent_ids: dict = {}
+            for _, parent_text in kept:
+                if parent_text not in parent_ids:
+                    parent_ids[parent_text] = f"{source_name}_p{len(parent_ids)}"
+            doc_chunks = []
+            for chunk_idx, (child_text, parent_text) in enumerate(kept):
+                chunk_dict = { "child_text": child_text, "parent_text": parent_text, "chunk_index": chunk_idx, "total_chunks": len(kept), "parent_id": parent_ids[parent_text], "parent_chunk_count": 0, "contextual_text": child_text, "id": f"{source_name}_{chunk_idx}", }
+                chunk_dict[SOURCE_FIELD] = source_name
+                doc_chunks.append(chunk_dict)
+            _save_doc_chunks(source_name, sha, fingerprint, doc_chunks)
+            all_chunks.extend(doc_chunks)
+        except Exception as exc:
+            log(f"[{i + 1}/{len(paths)}] ❌ {source_name} 分块失败，继续下一篇: {type(exc).__name__}: {exc}")
+            failures.append((source_name, f"{type(exc).__name__}: {exc}"))
     _gc_doc_chunks(names_now)
     if reused:
         log(f"增量：复用 {reused}/{len(paths)} 个未变文档，只重算了 {len(paths) - reused} 个")
-    spec_keys = {k for _f, k, _d in _PAYLOAD_SPEC}
-    if all_chunks and set(all_chunks[0]) != spec_keys:
-        raise RuntimeError(f"分块记录字段与 _PAYLOAD_SPEC 不一致：多 {sorted(set(all_chunks[0]) - spec_keys)}、少 {sorted(spec_keys - set(all_chunks[0]))}，必须同步")
+    if failures:
+        log("")
+        log(f"❌ {len(failures)}/{len(paths)} 个文档分块失败（其余已处理）:")
+        for fail_name, fail_err in failures:
+            log(f"   - {fail_name}: {fail_err}")
+        log("chunks.json 与 meta 保持上一版（残缺产物不入库），失败文档未写缓存；修复后重跑 process 即可增量续算。")
+        return 1
+    if all_chunks and set(all_chunks[0]) != _RECORD_FIELDS:
+        raise RuntimeError(f"分块记录字段与 _PAYLOAD_SPEC 不一致：多 {sorted(set(all_chunks[0]) - _RECORD_FIELDS)}、少 {sorted(_RECORD_FIELDS - set(all_chunks[0]))}，必须同步")
     parent_counts = Counter(c["parent_id"] for c in all_chunks)
     for c in all_chunks:
         c["parent_chunk_count"] = parent_counts[c["parent_id"]]
     os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
-    with open(CHUNKS_JSON, "w", encoding="utf-8") as f:
+    # 原子写（tmp + rename，与文档缓存/向量缓存同款）：直写时进程被杀会留下半截
+    # chunks.json，下次 json.load 当场崩且无法自愈。先写齐两份 tmp 再依次 rename：
+    # 任一步崩溃都只剩「新 chunks + 旧 meta」或整份旧产物，verify_chunks_freshness
+    # 的指纹/语料比对都能拦下重跑，不会出现能通过校验的撕裂产物。
+    chunks_tmp = CHUNKS_JSON + ".tmp"
+    meta_tmp = CHUNKS_META_JSON + ".tmp"
+    with open(chunks_tmp, "w", encoding="utf-8") as f:
         json.dump(all_chunks, f, ensure_ascii=False, indent=2)
     meta = { "meta_version": CHUNKS_META_VERSION, "fingerprint": fingerprint, "chunking_config": config_snapshot, "sources": sources_now, "total_chunks": len(all_chunks), "total_parents": len(parent_counts), "reused_documents": reused, "build_time": datetime.datetime.now().isoformat(timespec="seconds"), }
-    with open(CHUNKS_META_JSON, "w", encoding="utf-8") as f:
+    with open(meta_tmp, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+    os.replace(chunks_tmp, CHUNKS_JSON)
+    os.replace(meta_tmp, CHUNKS_META_JSON)
     log("分块统计:")
-    for b, cnt in sorted(Counter(c["source"] for c in all_chunks).items()):
+    for b, cnt in sorted(Counter(_source_of(c) or "?" for c in all_chunks).items()):
         log(f"  {b}: {cnt} 条")
     log(f"  总计: {len(all_chunks)} 条，父块 {len(parent_counts)} 个")
     log(f"已保存: {CHUNKS_JSON}")
     log(f"元信息: {CHUNKS_META_JSON}（指纹 {fingerprint}）")
-    return all_chunks
+    return 0
 
 
 def verify_chunks_freshness():
@@ -1197,33 +1442,35 @@ STOPWORDS_FILE = os.getenv("RAG_STOPWORDS_FILE") or os.path.join(LEXICON_DIR, "s
 if not os.path.exists(STOPWORDS_FILE):
     _legacy_stopwords = os.path.join(LEXICON_DIR, "stopwords_classical.txt")
     if os.path.exists(_legacy_stopwords):
+        log("⚠️  %s 不存在，回退使用旧文件名 stopwords_classical.txt"
+            % STOPWORDS_FILE)
         STOPWORDS_FILE = _legacy_stopwords
-_LEXICON = None
-
-
 def load_lexicon():
-    global _LEXICON
-    if _LEXICON is not None:
-        return _LEXICON
-    alias_map, stopwords = {}, set()
-    if ALIASES_ENABLED:
-        alias_map = _read_aliases(ALIASES_FILE)
-    if STOPWORDS_ENABLED:
-        stopwords = _read_stopwords(STOPWORDS_FILE)
-    if alias_map:
-        surfaces = sorted(alias_map, key=len, reverse=True)
-        alias_re = re.compile("|".join(re.escape(s) for s in surfaces))
-    else:
-        alias_re = None
-    _LEXICON = (alias_map, alias_re, stopwords)
-    return _LEXICON
+    """词表（别名归一 + 停用词）单例：懒加载 + 加锁。重复并发（预热线程/首查询）
+    只构造一份；同一进程内保持同一份解析结果，避免"一次走 A 词表一次走 B 词表"。"""
+    state = _state_ref()
+    with state.lexicon_lock:
+        if state.lexicon is not None:
+            return state.lexicon
+        alias_map, stopwords = {}, set()
+        if ALIASES_ENABLED:
+            alias_map = _read_aliases(ALIASES_FILE)
+        if STOPWORDS_ENABLED:
+            stopwords = _read_stopwords(STOPWORDS_FILE)
+        if alias_map:
+            surfaces = sorted(alias_map, key=len, reverse=True)
+            alias_re = re.compile("|".join(re.escape(s) for s in surfaces))
+        else:
+            alias_re = None
+        state.lexicon = (alias_map, alias_re, stopwords)
+        return state.lexicon
 
 
 def parse_aliases(path):
-    groups, problems, warnings = [], [], []
+    groups, problems = [], []
     if not os.path.exists(path):
         problems.append("文件不存在：%s" % path)
-        return groups, problems, warnings
+        return groups, problems
     with open(path, encoding="utf-8") as fh:
         for lineno, raw in enumerate(fh, 1):
             body = raw.split("#", 1)[0]
@@ -1261,11 +1508,12 @@ def parse_aliases(path):
             problems.append( "词面 %s 同时归属多个规范名 %s —— 归一目标冲突" % (surface, uniq) )
         elif len(owners) > 1:
             problems.append("词面 %s 在同一组内重复出现" % surface)
-    return groups, problems, warnings
+    return groups, problems
 
 
 def parse_stopwords(path):
-    words, problems = [], []
+    words: list = []
+    problems: list = []
     if not os.path.exists(path):
         problems.append("文件不存在：%s" % path)
         return words, problems
@@ -1286,10 +1534,10 @@ def parse_stopwords(path):
 
 def _read_aliases(path):
     """运行时词表加载：委托 parse_aliases，与校验器同一套格式。"""
-    groups, problems, _warnings = parse_aliases(path)
+    groups, problems = parse_aliases(path)
     for problem in problems:
         log(f"⚠️  别名表 {problem}")
-    mapping = {}
+    mapping: dict = {}
     for group in groups:
         for surface in [group["canonical"]] + group["aliases"]:
             mapping.setdefault(surface, group["canonical"])
@@ -1311,6 +1559,29 @@ def _read_stopwords(path):
         return set()
     log(f"停用词表加载完成: {len(words)} 个词")
     return words
+
+
+def _distinct_lexicon_ids(client, collection, page_size=1000):
+    """滚动全量收集集合里出现过的 lexicon_id（只带这一个 payload 键），返回
+    [(指纹, 点数), ...]，集合为空返回 []；点数用于混合态时把残留规模打出来。
+
+    必须全量而非抽首点：reindex-sparse 逐页原地更新，中断/跳页留下"已更新前缀 +
+    旧指纹后缀"，而 scroll 首点恒属已更新前缀 —— 抽 1 个点必过，旧稀疏向量就
+    静默参与融合（判据恒真的抽样形态）。单次进程只取这一个键，23 页滚动开销可忽略。
+    """
+    seen: dict = {}
+    offset = None
+    while True:
+        pts, offset = client.scroll(
+            collection_name=collection, limit=page_size, offset=offset,
+            with_payload=[LEXICON_ID_FIELD], with_vectors=False,
+        )
+        for p in pts:
+            lid = (p.payload or {}).get(LEXICON_ID_FIELD)
+            seen[lid] = seen.get(lid, 0) + 1
+        if offset is None:
+            break
+    return sorted(seen.items(), key=lambda kv: str(kv[0]))
 
 
 def lexicon_fingerprint():
@@ -1340,7 +1611,7 @@ def lexicon_fingerprint():
     for name in ("parse_aliases", "parse_stopwords", "_read_aliases", "_read_stopwords", "load_lexicon", "normalize_aliases", "bm25_tokenize", "sparse_encode"):
         fn = globals().get(name)
         try:
-            parts.append(f"{name}:" + inspect.getsource(fn))
+            parts.append(f"{name}:" + inspect.getsource(fn))  # type: ignore[arg-type]
         except (OSError, TypeError):
             parts.append(f"{name}:<unavailable>")
     blob = "|".join(parts)
@@ -1428,30 +1699,100 @@ def _embed_code_fingerprint():
     if _EMBED_CODE_FINGERPRINT is None:
         import inspect
         parts = []
-        for name in ("_embed_batch", "embed"):
+        for name in ("_embed_batch", "embed", "load_embedding_model"):
             fn = globals().get(name)
             try:
-                parts.append(f"{name}:" + inspect.getsource(fn))
+                parts.append(f"{name}:" + inspect.getsource(fn))  # type: ignore[arg-type]
             except (OSError, TypeError):
                 parts.append(f"{name}:<unavailable>")
         _EMBED_CODE_FINGERPRINT = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
     return _EMBED_CODE_FINGERPRINT
 
 
+def _model_content_fingerprint():
+    """嵌入模型目录内容指纹（相对路径 + 大小 + mtime）。
+
+    只按 abspath 命名缓存时，**在同一路径原地替换同维度权重**会静默复用旧向量：
+    _expected_embed_dim 只校验维度，抓不到同维替换。这里把目录清单的 stat 打进缓存名
+    —— 不读权重字节，index/stages 每次调用都可承受；文件被替换/增删即换缓存名。
+    """
+    parts = []
+    try:
+        for root, dirs, files in os.walk(EMBED_MODEL_PATH):
+            dirs.sort()
+            for fn in sorted(files):
+                path = os.path.join(root, fn)
+                rel = os.path.relpath(path, EMBED_MODEL_PATH)
+                try:
+                    st = os.stat(path)
+                    parts.append(f"{rel}:{st.st_size}:{st.st_mtime_ns}")
+                except OSError:
+                    parts.append(f"{rel}:missing")
+    except OSError:
+        pass
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
 def _embed_cache_file(precision):
     model_key = hashlib.sha256( os.path.abspath(EMBED_MODEL_PATH).encode("utf-8") ).hexdigest()[:12]
+    content_key = _model_content_fingerprint()
     code_key = _embed_code_fingerprint()
-    return os.path.join(EMBED_CACHE_DIR, f"{model_key}_{code_key}_{precision}.npz")
+    return os.path.join(EMBED_CACHE_DIR, f"{model_key}_{content_key}_{code_key}_{precision}.npz")
 
 
-def _index_cache_precision():
-    """与 build_index 相同的缓存精度选择：INDEX_DEVICE 显式指定优先，否则按设备自动。
+def _expected_embed_dim():
+    """嵌入维度的无模型读法：直接读模型目录的 config.json。
 
-    注意 build_index 在 MPS/CUDA 初始化失败时会回退 CPU/fp32，stages 无法预知这一回退，
-    只能按常规路径预测。
+    只服务"缓存命中后不必加载模型"的路径 —— 那条路拿不到 model.config.hidden_size，
+    而维度交叉校验不能因此消失：同路径换了个不同维度的模型时，少了这道校验就会静默
+    复用旧向量。正常加载路径仍以已加载模型的 config 为准；这里读不到就返回 None，
+    由 _load_embed_cache 跳过该项校验（config.json 都缺的模型目录本身已是异常）。
     """
-    device = INDEX_DEVICE or get_device()
-    return "fp16" if device in ("mps", "cuda") else "fp32"
+    try:
+        with open(os.path.join(EMBED_MODEL_PATH, "config.json"), encoding="utf-8") as f:
+            dim = json.load(f).get("hidden_size")
+        return int(dim) if dim else None
+    except Exception:
+        return None
+
+
+# 固定优先级，与设备无关：完整命中时向量全部来自同一份文件，精度只决定"读哪份"，
+# 不混用就不出错。顺序写死成常量，避免两处各自排序导致跨次运行读到不同那份。
+_EMBED_CACHE_PRECEDENCE = ("fp16", "fp32")
+
+
+def _inspect_embed_caches(keys):
+    """逐份检查候选稠密缓存，返回 [(precision, path, cache, missing), ...]。
+
+    只含磁盘上存在且读得出来的那份，按 _EMBED_CACHE_PRECEDENCE 排序；没有任何候选
+    返回空列表。**这是 index 与 stages 共用的唯一一份缓存选择规则** —— 两处各写一份
+    必然分叉，正是"stages 说新鲜 / index 却重算"这类同轮日志两个结论的来源。
+
+    维度校验走 _expected_embed_dim()（不加载模型），missing 是相对传入 keys 的缺口。
+    """
+    out = []
+    for precision in _EMBED_CACHE_PRECEDENCE:
+        path = _embed_cache_file(precision)
+        if not os.path.exists(path):
+            continue
+        cache = _load_embed_cache(path, expected_dim=_expected_embed_dim())
+        if not cache:
+            continue
+        missing = [i for i, k in enumerate(keys) if k not in cache]
+        out.append((precision, path, cache, missing))
+        # 优先级排第一的已完整覆盖：后面的候选不可能再提供任何东西了（只会把缺失列表
+        # 排得更长），提前收工省一次全量字典遍历。
+        if not missing:
+            break
+    return out
+
+
+def _full_embed_cache(cands):
+    """候选里第一个**完整覆盖 keys** 的（按固定优先级），没有则 None。
+
+    完整命中 = 一条向量都不用算 = 不需要知道设备、不需要加载 torch 与嵌入模型。
+    """
+    return next((c for c in cands if not c[3]), None)
 
 
 def _load_embed_cache(path, expected_dim=None):
@@ -1479,23 +1820,71 @@ def _load_embed_cache(path, expected_dim=None):
 
 def _save_embed_cache(path, keys, matrix):
     import numpy as np
+    tmp = path + ".tmp.npz"
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp.npz"
         np.savez(tmp, keys=np.array(keys, dtype="U64"), vectors=matrix)
         os.replace(tmp, path)
     except Exception as exc:
         log(f"    ⚠️  向量缓存写入失败（本次索引不受影响）: {type(exc).__name__}: {exc}")
+        try:
+            os.remove(tmp)  # 失败留下的半截 tmp 别占盘
+        except OSError:
+            pass
+
+
+def _gc_embed_cache_tmp():
+    """清掉写入中断遗留的 *.tmp.npz（正常缓存名恒以 _fp16.npz/_fp32.npz 结尾，
+    .tmp.npz 只可能来自被杀掉的那次 index）。"""
+    try:
+        if not os.path.isdir(EMBED_CACHE_DIR):
+            return
+        removed = 0
+        for name in os.listdir(EMBED_CACHE_DIR):
+            if name.endswith(".tmp.npz"):
+                os.remove(os.path.join(EMBED_CACHE_DIR, name))
+                removed += 1
+        if removed:
+            log(f"清理 {removed} 个中断遗留的向量缓存临时文件")
+    except Exception as exc:
+        log(f"    ⚠️  向量缓存临时文件清理失败（不影响本次索引）: {type(exc).__name__}: {exc}")
 
 
 # ── 索引构建 ──
+def _upsert_batch_with_retry(client: Any, collection_name: str, points: list, retries: int = 1, delay: float = 2.0) -> str | None:
+    """单批 upsert：瞬时故障重试 retries 次；仍失败返回错误串，由调用方记账后继续写其余批。
+    继续写只为更快暴露完整失败面 —— 末尾 write_failures 非空一律 raise、不切别名，旧集合继续服务。"""
+    last: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            client.upsert(collection_name=collection_name, points=points)
+            return None
+        except Exception as exc:
+            last = exc
+            if attempt < retries:
+                log(f"    ⚠️  upsert 失败，{delay:.0f}s 后重试（{attempt + 1}/{retries}）: {type(exc).__name__}: {exc}")
+                time.sleep(delay)
+    return f"{type(last).__name__}: {last}"
+
+
 def build_index():
     import time
     import uuid
+
     import numpy as np
-    import torch
     from qdrant_client import QdrantClient
-    from qdrant_client.models import ( VectorParams, Distance, PointStruct, SparseVectorParams, Modifier, PayloadSchemaType, CreateAlias, CreateAliasOperation, DeleteAlias, DeleteAliasOperation, )
+    from qdrant_client.models import (
+        CreateAlias,
+        CreateAliasOperation,
+        DeleteAlias,
+        DeleteAliasOperation,
+        Distance,
+        Modifier,
+        PayloadSchemaType,
+        PointStruct,
+        SparseVectorParams,
+        VectorParams,
+    )
     meta = verify_chunks_freshness()
     with open(CHUNKS_JSON, encoding="utf-8") as f:
         all_chunks = json.load(f)
@@ -1510,47 +1899,70 @@ def build_index():
     log(f"索引建造标识: {build_id}")
     log(f"分块指纹: {chunk_fingerprint}（检索侧据此判断分块是否过期）")
     log(f"词表指纹: {lexicon_id}（别名 {ALIASES_ENABLED} / 停用词 {STOPWORDS_ENABLED}）")
-    device = INDEX_DEVICE or get_device()
-    use_gpu = device in ("mps", "cuda")
-    tokenizer = model = None
-    if use_gpu:
-        try:
-            tokenizer, model, _ = load_embedding_model(device=device)
-            model = model.half()
-        except Exception as exc:
-            log(f"    ⚠️  {device.upper()} 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
-            tokenizer, model, use_gpu = None, None, False
-    if use_gpu:
-        batch_size = EMBED_BATCH_SIZE
-        cool_down_sleep = 0.1
-        precision = "fp16"
-        log(f"Embedding 设备: {device} (fp16, batch_size={batch_size})")
-    else:
-        tokenizer, model, device = load_embedding_model(device="cpu")
-        torch.set_num_threads(6)
-        batch_size = EMBED_BATCH_SIZE
-        cool_down_sleep = 0.05
-        precision = "fp32"
-        log(f"Embedding 设备: cpu (6线程, batch_size={batch_size})")
     total = len(all_chunks)
     t0 = time.time()
-    texts = [_index_text(c) for c in all_chunks]
-    keys = [_embed_cache_key(t) for t in texts]
-    cache_path = _embed_cache_file(precision)
-    expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
-    if expected_dim is None:
-        # 回退：用一次前向传播推断维度，避免缓存维度校验被绕过
-        test_vec = embed([texts[0]], tokenizer, model, device, is_query=False, autocast=use_gpu)
-        expected_dim = test_vec.shape[-1]
-        log(f"  推断嵌入维度: {expected_dim}")
-    cache = (_load_embed_cache(cache_path, expected_dim=expected_dim) if EMBED_CACHE_ENABLED else {})
-    missing = [i for i, k in enumerate(keys) if k not in cache]
+    # 不保留全量 texts：那是一份 ~35MB 的中间 list，而它的两次用途（算 key、逐批取文）
+    # 都能按需重取 _index_text（纯读字段+校验）。命中路径下调用次数不变，缺失路径每条
+    # 多算一次 —— 换峰值里少背 35MB。
+    keys = [_embed_cache_key(_index_text(c)) for c in all_chunks]
+    _gc_embed_cache_tmp()  # 写入端顺手清中断遗留（*.tmp.npz 不匹配任何正常缓存名）
+    # 先按磁盘事实看有没有一份缓存能完整覆盖 keys：完整命中就一条向量都不用算，于是
+    # 不必知道设备、不必加载 torch 与嵌入模型（约 600MB 峰值，原本只为猜"读哪个精度
+    # 的文件名"和拿 hidden_size 而付）。cands 同时供下面的增量路径复用，同一份文件
+    # 不会读两遍。
+    cands = _inspect_embed_caches(keys) if EMBED_CACHE_ENABLED else []
+    hit = _full_embed_cache(cands)
+    if hit is not None:
+        precision, cache_path, cache, missing = hit
+        device = None
+        use_gpu = False
+        tokenizer = model = None
+        log(f"稠密缓存完整命中: {os.path.basename(cache_path)}（{precision}）{len(keys)} 条 → 跳过设备选择与模型加载")
+    else:
+        device = INDEX_DEVICE or get_device()
+        use_gpu = device in ("mps", "cuda")
+        tokenizer = model = None
+        if use_gpu:
+            try:
+                tokenizer, model, _ = load_embedding_model(device=device)
+                model = model.half()
+            except Exception as exc:
+                log(f"    ⚠️  {device.upper()} 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
+                tokenizer, model, use_gpu = None, None, False
+        if use_gpu:
+            batch_size = EMBED_BATCH_SIZE
+            cool_down_sleep = 0.1
+            precision = "fp16"
+            log(f"Embedding 设备: {device} (fp16, batch_size={batch_size})")
+        else:
+            import torch
+            tokenizer, model, device = load_embedding_model(device="cpu")
+            torch.set_num_threads(6)
+            batch_size = EMBED_BATCH_SIZE
+            cool_down_sleep = 0.05
+            precision = "fp32"
+            log(f"Embedding 设备: cpu (6线程, batch_size={batch_size})")
+        cache_path = _embed_cache_file(precision)
+        expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
+        if expected_dim is None:
+            # 回退：用一次前向传播推断维度，避免缓存维度校验被绕过
+            test_vec = embed([_index_text(all_chunks[0])], tokenizer, model, device, is_query=False, autocast=use_gpu)
+            expected_dim = test_vec.shape[-1]
+            log(f"  推断嵌入维度: {expected_dim}")
+        # 该精度的缓存刚被 _inspect_embed_caches 读过（含维度校验），复用它的结论；
+        # 没这份文件或它读坏了 → 全量待算，与旧写法 cache={} 等价。
+        reuse = next((c for c in cands if c[0] == precision), None)
+        cache, missing = (reuse[2], reuse[3]) if reuse else ({}, list(range(total)))
+    # 先记条数再 del cache：后面"要不要重写缓存"的判据要用它，而缓存 dict 本身
+    # （22019 个条目 ≈ 12MB）在 embeddings 取完值之后就不该再占着峰值。
+    cache_entries = len(cache)
     log(f"批量生成 Embedding... 命中缓存 {total - len(missing)}/{total} 条，需计算 {len(missing)} 条")
     embeddings = [cache.get(k) for k in keys] if cache else [None] * total
+    del cache
     if missing:
         batches = [missing[i:i + batch_size] for i in range(0, len(missing), batch_size)]
         for bi, idxs in enumerate(batches):
-            batch_texts = [texts[i] for i in idxs]
+            batch_texts = [_index_text(all_chunks[i]) for i in idxs]
             vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_gpu)
             if device == "mps":
                 _mps_empty_cache()
@@ -1567,12 +1979,21 @@ def build_index():
     dims = {int(np.asarray(e).shape[-1]) for e in embeddings}
     if len(dims) != 1:
         raise RuntimeError(f"向量维度不一致: {sorted(dims)} —— 通常意味着缓存里混入了别的模型的向量，请删掉 {cache_path} 后重跑或设 RAG_EMBED_CACHE=0")
-    embeddings = np.vstack([np.asarray(e, dtype="float32") for e in embeddings])
-    assert embeddings.shape[0] == total, f"向量条数 {embeddings.shape[0]} 与分块数 {total} 不一致"
+    # 1710: 上方 embeddings 是 list[ndarray|None]（槽位填充），从这里起是整块矩阵 —— 同名两义正是类型报错根源，矩阵一侧改名 matrix。
+    matrix = np.vstack([np.asarray(e, dtype="float32") for e in embeddings])
+    # 显式 raise 而非 assert：`python -O` 会剥离 assert，不变量静默消失
+    if matrix.shape[0] != total:
+        raise RuntimeError(f"向量条数 {matrix.shape[0]} 与分块数 {total} 不一致")
     if EMBED_CACHE_ENABLED:
-        _save_embed_cache(cache_path, keys, embeddings)
-        log(f"向量缓存已更新: {cache_path}")
-    del model, tokenizer
+        # 命中且无冗余时整份重写是纯浪费：np.savez 在峰值里再摊一份 zip 缓冲，
+        # 磁盘上 73MB 也原地重写一遍。判据要两条一起看才严 —— missing==0 保证每个
+        # key 都在缓存里，条数相等才排除"缓存里残留已删文档的旧条目"（那种仍需重写清理）。
+        if missing or cache_entries != len(keys):
+            _save_embed_cache(cache_path, keys, matrix)
+            log(f"向量缓存已更新: {cache_path}（重算 {len(missing)} 条）")
+        else:
+            log(f"向量缓存无需更新（{len(keys)} 条全部命中且无冗余）: {cache_path}")
+    del keys, model, tokenizer
     if device == "mps":
         _mps_empty_cache()
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
@@ -1591,26 +2012,52 @@ def build_index():
         except Exception:
             pass
     log(f"写入 Qdrant (稠密+稀疏混合) → 集合 {target_collection}")
-    client.create_collection( collection_name=target_collection, vectors_config={ DENSE_VECTOR_NAME: VectorParams( size=embeddings.shape[1], distance=Distance.COSINE, ) }, sparse_vectors_config={ SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF) }, )
+    client.create_collection( collection_name=target_collection, vectors_config={ DENSE_VECTOR_NAME: VectorParams( size=matrix.shape[1], distance=Distance.COSINE, ) }, sparse_vectors_config={ SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF) }, )
     for field, schema in ( (SOURCE_FIELD, PayloadSchemaType.KEYWORD), ("parent_id", PayloadSchemaType.KEYWORD), ):
         try:
             client.create_payload_index( collection_name=target_collection, field_name=field, field_schema=schema )
         except Exception as exc:
             log(f"    ⚠️  payload 索引 {field} 创建失败（过滤会退化为扫描）: {exc}")
-    write_batch = 1000
-    for i in range(0, total, write_batch):
-        batch_chunks = all_chunks[i:i + write_batch]
-        batch_embeddings = embeddings[i:i + write_batch]
+    write_failures: list = []
+    for i in range(0, total, WRITE_BATCH):
+        batch_chunks = all_chunks[i:i + WRITE_BATCH]
+        batch_embeddings = embeddings[i:i + WRITE_BATCH]
         points = []
         for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
             # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
-            points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))
-        client.upsert(collection_name=target_collection, points=points)
-        done = min(i + write_batch, total)
-        if (i // write_batch) % 5 == 0 or done >= total:
+            points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))  # type: ignore[union-attr]
+        err = _upsert_batch_with_retry(client, target_collection, points)
+        if err:
+            write_failures.append((i, err))
+            log(f"    ⚠️  写入批次 [{i}, {min(i + WRITE_BATCH, total)}) 失败，继续写其余批: {err}")
+        done = min(i + WRITE_BATCH, total)
+        if (i // WRITE_BATCH) % 5 == 0 or done >= total:
             log(f"  Qdrant 写入进度: {done}/{total}")
+    if write_failures:
+        # 半截集合是本次失败留下的孤儿：别名没切、检索不读它，而下一次 index 会用新的
+        # build_id 另起集合 —— 不清理就永久占盘，且当次失败日志里连名字都不留（直到某次
+        # 成功运行的 stragglers 扫描才被发现）。能删就删，删不掉给出手动回收命令。
+        orphan_hint = ""
+        if alias_ok:
+            try:
+                client.delete_collection(collection_name=target_collection)
+                log(f"  已清理未完成的集合 {target_collection}（未切别名，重跑 index 会新建）")
+            except Exception as cleanup_exc:
+                orphan_hint = f"；孤儿集合 {target_collection} 需手动回收: curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{target_collection}（{type(cleanup_exc).__name__}: {cleanup_exc}）"
+        # 两种模式下"谁在服务"是相反的：别名模式旧集合还在并继续服务；非别名模式
+        # 上面已把旧集合删掉，残缺的目标集合就是当前服务集合 —— 报错必须说清。
+        serving = (
+            f"集合 {target_collection} 未切别名，旧集合继续服务"
+            if alias_ok
+            else f"集合 {target_collection} 是非别名模式的服务集合（旧集合已在写入前删除），当前点数残缺，检索会吃到不完整结果"
+        )
+        raise RuntimeError(
+            f"{len(write_failures)} 批写入失败（批次起始 {[fi for fi, _ in write_failures][:5]}）："
+            f"{serving}；"
+            f"失败示例 {write_failures[0][1]}{orphan_hint}。网络/Qdrant 恢复后重跑 index（稠密走缓存增量）。"
+        )
     info = client.get_collection(collection_name=target_collection)
-    # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages/health 事后发现：
+    # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages 事后发现：
     # 非别名路径下 delete_collection 被 except: pass 吞掉时，旧集合点数多于本次 total
     # 会留下 id >= total 的残留点（写入只覆盖 0..total-1），而它们永远不会被检索命中。
     written = client.count(collection_name=target_collection, exact=True).count
@@ -1621,14 +2068,16 @@ def build_index():
             "非别名模式下旧集合可能未被删净（残留 id 检索不到）；"
             "请删掉该集合后重跑 index，或启用 RAG_USE_COLLECTION_ALIAS"
         )
-    coll_dense_size = next(iter(info.config.params.vectors.values())).size
-    assert coll_dense_size == embeddings.shape[1], f"集合稠密维度 {coll_dense_size} 与本次编码维度 {embeddings.shape[1]} 不一致（集合名 {target_collection}）"
-    log(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} (size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")
+    coll_dense_size = next(iter(info.config.params.vectors.values())).size  # type: ignore[union-attr]
+    # 显式 raise 而非 assert（-O 会剥离 assert，维度错配就静默放行了）
+    if coll_dense_size != matrix.shape[1]:
+        raise RuntimeError(f"集合稠密维度 {coll_dense_size} 与本次编码维度 {matrix.shape[1]} 不一致（集合名 {target_collection}）")
+    log(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} (size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")  # type: ignore[union-attr]
     log("  索引构建完成: 稠密向量 + 稀疏向量（jieba 分词 + Qdrant 内置 BM25 打分）")
     if alias_ok:
         # 别名切换存在竞态窗口：get_aliases 到 update_collection_aliases 间其他进程可能修改别名。
-        # 采用重试 + 验证策略：最多重试 3 次，每次切换后验证别名确实指向新集合。
-        max_retries = 3
+        # 采用重试 + 验证策略：只重试一次（共 2 次尝试），每次切换后验证别名确实指向新集合。
+        max_retries = 2
         for attempt in range(max_retries):
             try:
                 old_collection = next(
@@ -1636,7 +2085,7 @@ def build_index():
                     None,
                 )
                 # 空别名冷启动不能对不存在的 alias 提交 Delete（部分 Qdrant 版本整批失败）；有旧别名才删，Create 恒提交。
-                ops = []
+                ops: list = []
                 if old_collection is not None:
                     ops.append(DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION_ALIAS)))
                 ops.append(CreateAliasOperation(create_alias=CreateAlias(collection_name=target_collection, alias_name=COLLECTION_ALIAS)))
@@ -1648,11 +2097,11 @@ def build_index():
                     log(f"  别名已切换: {COLLECTION_ALIAS} → {target_collection}" + (f"（原 {old_collection}）" if old_collection else "（冷启动，无旧别名）"))
                     break
                 else:
-                    log(f"  ⚠️  别名切换验证失败（尝试 {attempt + 1}/{max_retries}）：别名指向 {new_target}，期望 {target_collection}，重试中...")
+                    log(f"  ⚠️  别名切换验证失败（尝试 {attempt + 1}/{max_retries}）：别名指向 {new_target}，期望 {target_collection}")
                     if attempt == max_retries - 1:
-                        raise RuntimeError(f"别名切换失败：重试 {max_retries} 次后别名仍指向 {new_target}，期望 {target_collection}")
+                        raise RuntimeError(f"别名切换失败：尝试 {max_retries} 次后别名仍指向 {new_target}，期望 {target_collection}")
             except Exception as exc:
-                log(f"  ⚠️  别名切换异常（尝试 {attempt + 1}/{max_retries}）：{exc}，重试中...")
+                log(f"  ⚠️  别名切换异常（尝试 {attempt + 1}/{max_retries}）：{exc}")
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"别名切换失败：新集合 {target_collection} 已建好但检索端仍指向旧集合，请检查 Qdrant 别名支持: {exc}") from exc
                 time.sleep(0.5 * (attempt + 1))
@@ -1679,8 +2128,8 @@ def build_index():
 
 # ── 检索原语 ──
 def rerank_indices(query, documents, tokenizer, model, device, top_k=TOP_K, batch_size=RERANK_BATCH, max_length=RERANK_MAX_LENGTH):
-    import torch
     import numpy as np
+    import torch
     if not documents:
         return []
     all_scores = []
@@ -1698,7 +2147,9 @@ def rerank_indices(query, documents, tokenizer, model, device, top_k=TOP_K, batc
 
 
 def weighted_rrf(rankings, k=RRF_K, limit=None):
-    scores, resources, first_seen = {}, {}, {}
+    scores: dict = {}
+    resources: dict = {}
+    first_seen: dict = {}
     seq = 0
     for name, ids, weight in rankings:
         if not weight:
@@ -1718,20 +2169,33 @@ def weighted_rrf(rankings, k=RRF_K, limit=None):
 
 
 def dual_channel_recall(client, collection, dense_query, sparse_query, limit, query_filter=None, with_payload=False, tolerate_sparse_error=False, use_dense=True, use_sparse=True):
+    from concurrent.futures import ThreadPoolExecutor
     dense_hits = []
-    if use_dense:
-        dense_hits = client.query_points( collection_name=collection, query=dense_query, using=DENSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
+
+    def _dense():
+        return client.query_points( collection_name=collection, query=dense_query, using=DENSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
+
     if not use_sparse:
-        return dense_hits, [], ""
+        return (_dense() if use_dense else []), [], ""
     sparse_hits = []
-    try:
-        sparse_hits = client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
-    except Exception as exc:
-        if not tolerate_sparse_error:
-            raise
-        term_count = len((sparse_query.text or '').split())
-        note = f"稀疏通道召回失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；分词 {term_count} 个 term"
-        return dense_hits, [], note
+
+    def _sparse():
+        return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
+
+    # 双通道并发：两个 Qdrant 往返并行发，墙钟 = max(dense, sparse) 而非和。
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_dense = pool.submit(_dense) if use_dense else None
+        future_sparse = pool.submit(_sparse)
+        if future_dense is not None:
+            dense_hits = future_dense.result()
+        try:
+            sparse_hits = future_sparse.result()
+        except Exception as exc:
+            if not tolerate_sparse_error:
+                raise
+            term_count = len((sparse_query.text or '').split())
+            note = f"稀疏通道召回失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；分词 {term_count} 个 term"
+            return dense_hits, [], note
     return dense_hits, sparse_hits, ""
 
 
@@ -1788,21 +2252,60 @@ def results_confidence(results):
 def resolve_collection_name(client):
     if not USE_COLLECTION_ALIAS:
         return COLLECTION_NAME
+    state = _state_ref()
+    # 正缓存：别名解析成功后记住结果（缓存的是别名字符串本身，Qdrant 查询时再路由到
+    # 当前集合 —— reindex 切别名自动跟随，无旧集合坑）。只缓存成功，失败每次重试，
+    # 且把"本次处于降级"记到 state：调用方（_qdrant_gate/cmd_stages）据它对外告警，
+    # 避免"看起来正常、实际在直读旧集合"的静默状态。
+    if state.alias_resolved.get("name"):
+        return state.alias_resolved["name"]
     try:
         aliases = client.get_aliases().aliases
     except Exception as exc:
+        state.alias_degraded = True
         log(f"⚠️  读取集合别名失败，回退直接访问 {COLLECTION_NAME}: {exc}")
         return COLLECTION_NAME
     names = {a.alias_name for a in aliases}
     if COLLECTION_ALIAS in names:
+        state.alias_resolved["name"] = COLLECTION_ALIAS
+        state.alias_degraded = False
         return COLLECTION_ALIAS
+    state.alias_degraded = True
     return COLLECTION_NAME
 
 
 # ── 生成装配：上下文、预算、裁剪 ──
-def format_context(results):
-    """送进模型的资料正文：只拼检索到的 parent_text 原文，无编号、无来源标签、无说明文字。"""
-    return "\n\n".join((r.get("parent_text") or "") for r in results)
+# 资料是否带编号与来源：带编号时模型能按 [n] 引用，客户端能把 [n] 回指到来源清单
+# （context_sources[].n 与这里的 n 一一对应）；来源名还让模型能判断这条资料与提问是否
+# 同域。关掉即回到"纯 parent_text"旧行为。
+CONTEXT_LABELS = env_bool("RAG_CONTEXT_LABELS", True)
+# 资料边界标签（与编号/来源正交）：每条资料包一层 <document>…</document>。资料消息与
+# 本轮提问同为 user 角色，全裸模式（LABELS=0 且不发 system）下资料正文里的祈使句
+# （"请听我说"之类）会被模型当成对它的指令——标签是"这是数据不是指令"的唯一防线。
+# 要连标签也裸掉（回到纯拼接）设 RAG_CONTEXT_TAGS=0。
+CONTEXT_TAGS = env_bool("RAG_CONTEXT_TAGS", True)
+
+
+def context_blocks(results):
+    """按检索顺序返回每一条资料的独立块（与资料装配的拼接单元一致）。
+
+    独立成块是为了让生成侧按**整条资料**从尾部让位：截掉哪几条，sources 就只报哪几条，
+    诊断不会比模型实际看到的多。
+    """
+    if not results:
+        return []
+    if not CONTEXT_LABELS and not CONTEXT_TAGS:
+        return [(r.get("parent_text") or "") for r in results]
+    blocks = []
+    for i, r in enumerate(results, 1):
+        source = _source_of(r)
+        head = f"[{i}]" + (f"（{SOURCE_LABEL}：{source}）" if source else "")
+        text = r.get("parent_text") or ""
+        block = "\n".join(part for part in ((head if CONTEXT_LABELS else ""), text) if part)
+        if CONTEXT_TAGS:
+            block = f"<document>\n{block}\n</document>"
+        blocks.append(block)
+    return blocks
 
 
 def context_sources(results):
@@ -1816,12 +2319,26 @@ def context_sources(results):
     return out
 
 
-# 本部署刻意不给 system 提示词：发给模型的消息只有检索资料与本轮提问，全部是参数化内容。
-# _DOMAIN_LINE 仍按领域配置计算，恢复规则时把它（+规则行）赋给 SYSTEM_RULES_PROMPT 即可。
+# system 只装**行为规则**（怎么答），不装领域知识：发给模型的参数化内容仍然是检索资料与
+# 本轮提问。规则默认开启，但拒答仍由模型自己决定 —— 检索为空照常生成，代码不介入。
+# 恢复"完全不发 system"的旧行为：RAG_SYSTEM_RULES=0（或 off/false/空串）。
 _DOMAIN_LINE = f"你是一个面向「{DOMAIN_NAME}」的知识库助手。"
 if DOMAIN_DESCRIPTION:
     _DOMAIN_LINE += f"领域说明：{DOMAIN_DESCRIPTION}。"
-SYSTEM_RULES_PROMPT = ""
+_DEFAULT_SYSTEM_RULES = (
+    "回答规则：\n"
+    "1. 只依据下方「资料」中的内容作答，不要引入资料之外的知识；\n"
+    "2. 资料不足以回答时直说资料中没有相关信息，不要猜测或编造；\n"
+    "3. 用与提问相同的语言，先给结论再给依据，必要时简短引用原文；\n"
+    "4. 资料带有 [n] 编号时，在回答末尾列出所依据的编号。"
+)
+_rules_raw = os.getenv("RAG_SYSTEM_RULES")
+if _rules_raw is None:
+    SYSTEM_RULES_PROMPT = "\n\n".join(p for p in (_DOMAIN_LINE, _DEFAULT_SYSTEM_RULES) if p)
+elif _rules_raw.strip().lower() in ("", "0", "off", "false", "no"):
+    SYSTEM_RULES_PROMPT = ""
+else:
+    SYSTEM_RULES_PROMPT = _rules_raw.strip()
 CONTEXT_ROLE = env_choice("RAG_CONTEXT_ROLE", "user", ("user", "system"))  # 见 build_generation_messages：system 档并入首条 system；tool 档无 tool_call_id 配对，恒为孤儿消息，故不接受
 RAG_USE_CONTEXT = env_bool("RAG_USE_CONTEXT", True)
 
@@ -1831,20 +2348,91 @@ def build_system_prompt(use_context=True):
     return SYSTEM_RULES_PROMPT if use_context else ""
 
 
-def build_context_message(results):
-    """资料消息：没有结果就不发；正文是纯检索原文。"""
-    return format_context(results) if results else ""
 GEN_INPUT_RESERVE = env_int("RAG_INPUT_RESERVE", 256)
+# 交叉校验（启动即报错）：输入上界 I = NUM_CTX - RESERVE。I ≤ 0 时装配会把提问截成
+# 空串，最后一条 user 消息内容为空 —— 模型收到空提问，而启动时没有任何人报错。
+if NUM_CTX <= GEN_INPUT_RESERVE:
+    raise ValueError(
+        f"RAG_NUM_CTX={NUM_CTX} 必须大于 RAG_INPUT_RESERVE={GEN_INPUT_RESERVE}："
+        f"否则输入上界 ≤ 0，装配会截出空提问（请调大 RAG_NUM_CTX 或调小 RAG_INPUT_RESERVE）"
+    )
 # 生成历史的硬上限（token）：把"历史最多塞多少"从窗口余量里独立出来。
-# 0=不设上限（行为与不带该配置完全一致，只受 history_budget 的窗口余量约束）。
+# 0=不设上限（行为与不带该配置完全一致，只受窗口余量约束）。
 # 生效形式是 min(窗口余量, 本上限)：本上限只做第二道、更严的约束，永不越过窗口安全边界。
 GEN_HISTORY_MAX_TOKENS = env_int_min("RAG_GEN_HISTORY_MAX_TOKENS", 0, 0)
-_TRUNCATION_MARK = "……（已按上下文预算截断）"
+# 原值"……（已按上下文预算截断）"；按全裸 prompt 配置置空：截断无痕，空内容条照旧被整条丢弃。
+_TRUNCATION_MARK = ""
+# 生成侧精确计数：给到**生成模型自己的** tokenizer 目录时用它，否则退回保守估算。
+# Ollama 不暴露分词接口（/api/tokenize 恒 404），本机也无 gguf/llama 工具、无外网，所以
+# 想精确必须把 tokenizer 文件（HF 目录，如 Qwen 的 tokenizer.json）放到本路径。中文语料
+# 下估算按"1 字=1 token"偏高、不会越界但会少用窗口；换真 tokenizer 即吃回余量，并让硬
+# 上界从"估算保证"升级为"真 token 保证"。加载失败只降级告警，绝不中断生成。
+GEN_TOKENIZER_PATH = os.getenv("RAG_GEN_TOKENIZER_PATH", "")
+# 懒加载必须上锁：无锁时并发首请求会一个走"加载中=估算"、一个等完拿到真 tokenizer，
+# 同一次生成装配里前后两段计数各按一套口径（预算裁剪与硬上界分叉）。缓存放 _RuntimeState：
+# 预热线程/API 请求/Streamlit rerun 之间共用一个进程内的同一份。
+def _load_gen_tokenizer(path):
+    """加载生成模型 tokenizer。两条官方来源都吃：
+
+    - 文件（如 `tokenizer.json`，Qwen 仓库/GGUF 导出的标准件）→ 直接用 `tokenizers`；
+    - 目录（HF 下载目录）→ 先 transformers.AutoTokenizer，失败再退回目录里的 tokenizer.json。
+
+    都不需要模型权重，几个 MB 的文件即可；与 transformers 的完整依赖解耦。
+    """
+    if os.path.isfile(path):
+        from tokenizers import Tokenizer
+        return Tokenizer.from_file(path)
+    last = None
+    try:
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(path)
+    except Exception as exc:
+        last = exc
+    try:
+        from tokenizers import Tokenizer
+        return Tokenizer.from_file(os.path.join(path, "tokenizer.json"))
+    except Exception:
+        raise last if last is not None else RuntimeError("tokenizer 加载失败")
+
+
+def _count_tokens(tok, text):
+    """统一两种返回：transformers 的 encode → list[int]；tokenizers 的 encode → Encoding。"""
+    ids = tok.encode(text, add_special_tokens=False)
+    if isinstance(ids, (list, tuple)):
+        return len(ids)
+    return len(ids.ids)
+
+
+def _get_gen_tokenizer():
+    state = _state_ref()
+    with state.gen_tokenizer_lock:
+        if state.gen_tokenizer_tried:
+            return state.gen_tokenizer
+        state.gen_tokenizer_tried = True
+        if not GEN_TOKENIZER_PATH:
+            return None
+        try:
+            tok = _load_gen_tokenizer(GEN_TOKENIZER_PATH)
+            _count_tokens(tok, "冒烟")   # 加载即验证：编不了就当加载失败，避免每次调用静默降级
+            state.gen_tokenizer = tok
+        except Exception as exc:
+            log(f"⚠️  生成 tokenizer 加载失败（{GEN_TOKENIZER_PATH}），退回估算计数: {type(exc).__name__}: {exc}")
+            state.gen_tokenizer = None
+        return state.gen_tokenizer
 
 
 def estimate_tokens(text):
+    """生成侧 token 计数：配了生成模型 tokenizer 就用真值，否则用保守估算。
+
+    所有生成装配的预算/裁剪/硬上界都只经过这一个函数，换 tokenizer 不会出现"预算按 A
+    算、裁剪按 B 算"的分叉。真 tokenizer 对纯空白可能返回 0，无影响：空内容条本就被
+    history_to_messages 过滤。
+    """
     if not text:
         return 0
+    tok = _get_gen_tokenizer()
+    if tok is not None:
+        return _count_tokens(tok, text)
     cjk = sum(1 for ch in text if ord(ch) >= 0x2E80)
     other = len(text) - cjk
     return cjk + (other + 3) // 4
@@ -1854,50 +2442,32 @@ def message_tokens(messages):
     return sum(estimate_tokens(m.get("content") or "") for m in messages)
 
 
-def history_budget(num_ctx, num_predict, system="", reserve=None, extra=""):
-    reserve = GEN_INPUT_RESERVE if reserve is None else reserve
-    left = (int(num_ctx) - int(num_predict) - estimate_tokens(system or "") - estimate_tokens(extra or "") - int(reserve))
-    return max(0, left)
-
-
 def _truncate_history_to_budget(msgs, budget):
-    """历史超预算：从最旧一侧直接按 token 截断到预算内，保留尽可能多的近期内容。
+    """历史超预算：按**整轮**淘汰 —— 从最旧的 user 起，到下一个 user 之前，整轮**全部**丢。
 
-    只做整条丢弃 + 最旧一条按剩余额度截断正文；截断/丢弃后若首条是 assistant
-    （其对应提问已被整条丢弃），继续整条丢弃，保证历史首条恒为 user —— 否则模型
-    会收到一条没有对应提问的"孤儿回答"。若截断后仅剩截断标记，视为无效并整条丢弃。
-    就地修改 msgs（调用方已持有副本）。
-    返回 (丢弃条数, 是否截断, 被截断的是否 user)。
+    一轮 = 一条 user + 其后的所有连续 assistant（通常一条）。轮是语义最小单位：半个提问 +
+    半个回答只会给模型看残句，所以历史**不做 token 级部分截断**——要么整轮留、要么整轮走。
+    队首恒为 user（孤儿 assistant 单独清掉）。就地修改 msgs（调用方已持有副本）。
+    返回 (丢弃条数, 是否截断, 被截断的是否 user) —— 后两者恒为 False，只为统计兼容。
     """
     total = message_tokens(msgs)
-    dropped, truncated, truncated_user = 0, False, False
+    dropped = 0
     while msgs and total > budget:
-        first = msgs[0]
-        cost = estimate_tokens(first.get("content") or "")
-        excess = total - budget
-        if cost <= excess:
-            total -= cost
-            msgs.pop(0)
-            dropped += 1
-            continue
-        first["content"] = _cut_to_tokens(first.get("content") or "", cost - excess)
-        truncated, truncated_user = True, first.get("role") != "assistant"
-        total = message_tokens(msgs)
-    # 截断后若首条仅含截断标记（或为空），视为无效内容并整条丢弃
+        end = 1
+        while end < len(msgs) and msgs[end].get("role") != "user":
+            end += 1
+        for m in msgs[:end]:
+            total -= estimate_tokens(m.get("content") or "")
+        del msgs[:end]
+        dropped += end
+    # 队首恒为 user（整轮淘汰已保证；防御孤儿残留）
     while msgs and msgs[0].get("role") != "user":
         msgs.pop(0)
         dropped += 1
-    while msgs and (not msgs[0].get("content") or msgs[0]["content"] == _TRUNCATION_MARK):
-        msgs.pop(0)
-        dropped += 1
-        # 继续确保首条为 user
-        while msgs and msgs[0].get("role") != "user":
-            msgs.pop(0)
-            dropped += 1
-    return dropped, truncated, truncated_user
+    return dropped, False, False
 
 
-def build_generation_messages(system, history, query, max_history_tokens, context=None, context_role=None):
+def build_generation_messages(system, history, query, max_history_tokens, context=None, context_role=None, input_cap=None, context_blocks=None):
     budget = max(0, int(max_history_tokens))
     role = context_role or CONTEXT_ROLE
     msgs = [dict(m) for m in history_to_messages(history)]
@@ -1907,10 +2477,80 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
         msgs, dropped = strip_current_turn(msgs, query)
         if not dropped:
             break
-    # 超限整条丢弃 + 最旧一条按预算截断；截断后首条历史恒为 user。
+    # 超限整条丢弃；截断后首条历史恒为 user。
     dropped_messages, truncated, truncated_user = _truncate_history_to_budget(msgs, budget)
     context = context or ""
     ctx_tokens = estimate_tokens(context) if context else 0
+    # ── 整条 prompt 的硬上界：估算 token 恒 ≤ input_cap ──
+    # 历史按整轮淘汰（见 _truncate_history_to_budget）；锚点（system→资料→提问）才做 token
+    # 级截取。永不抛异常或整体放弃；提问只截前缀、绝不整条删掉，保证最后一条 user 消息存在。
+    cap = None if input_cap is None else max(0, int(input_cap))
+    cap_trimmed = frame_truncated = context_truncated = query_truncated = context_partial = False
+    # 供 sources 对齐：模型实际收到几条资料；None=调用方没给块信息，无法对齐
+    context_docs_kept = len(context_blocks) if context_blocks is not None else None
+    # 历史 token 无条件先计一次：返回汇总 used_tokens 要用，且下面 cap 分支复用同一
+    # 口径。只在 cap 分支内赋值会让 input_cap=None 的默认参数路径在汇总处
+    # UnboundLocalError —— 默认路径一用就崩的潜在缺陷。
+    h_tok = message_tokens(msgs)
+    if cap is not None:
+        sys_tok = estimate_tokens(system or "")
+        q_tok = estimate_tokens(query)
+        # 各段计数只算一次：预算裁剪与硬上界逐段共用同一口径，不会"这段按 A 算、那段按 B 算"。
+        # 历史是真正的滑动队列：先按"上界扣掉 system+资料+提问"的剩余额度再 FIFO 一次。
+        # 这样硬上界覆盖整条 prompt（不只是历史）——即使调用方给的 max_history_tokens
+        # 比窗口还宽，也不会越界。
+        body_cap = cap - sys_tok - ctx_tokens - q_tok
+        if h_tok > body_cap:
+            cap_trimmed = True
+            extra_dropped, extra_trunc, extra_user = _truncate_history_to_budget(msgs, max(0, body_cap))
+            h_tok = message_tokens(msgs)
+            dropped_messages += extra_dropped
+            truncated = truncated or extra_trunc
+            truncated_user = truncated_user or extra_user
+        # 历史让位后锚点（system+资料+提问）自身仍超上界：继续按 FIFO（system→资料→提问）
+        # 截取到 token 粒度。提问只截前缀，保证"有输入"。
+        over = (sys_tok + ctx_tokens + h_tok + q_tok) - cap
+        if over > 0:
+            cap_trimmed = True
+            if system:
+                new_sys = _cut_to_tokens(system, max(0, sys_tok - over))
+                over -= sys_tok - estimate_tokens(new_sys)
+                frame_truncated = True
+                system, sys_tok = new_sys, estimate_tokens(new_sys)
+            if over > 0 and context:
+                context_truncated = True
+                # 先按整条资料从尾部丢：sources 与模型实际看到的一一对应。只有单条资料
+                # 自身仍超上界时才退回 token 级前缀截取（保留 [n] 标头）。
+                kept = list(context_blocks) if context_blocks else []
+                if kept:
+                    # 逐块 token 预计算：去掉最后一块时同步扣掉它自己的 token 与间距
+                    # 分隔符，O(1) 内联递减，避免每步重复 join+估算整条。
+                    kept_toks = [estimate_tokens(b) for b in kept]
+                    sep_tok = estimate_tokens("\n\n")
+                    cur = sum(kept_toks) + (len(kept) - 1) * sep_tok
+                    k = len(kept)
+                    while k > 1:
+                        cur -= kept_toks[k - 1] + sep_tok
+                        if sys_tok + h_tok + q_tok + cur <= cap:
+                            break
+                        k -= 1
+                    kept = kept[:k]
+                    context = "\n\n".join(kept)
+                    ctx_tokens = estimate_tokens(context)
+                    allow = max(0, cap - sys_tok - h_tok - q_tok)
+                    if ctx_tokens > allow:
+                        context = _cut_to_tokens(context, allow)
+                        ctx_tokens = estimate_tokens(context)
+                        context_partial = True
+                    context_docs_kept = len(kept) if context else 0
+                else:
+                    ctx_tokens = estimate_tokens(context)
+                    context = _cut_to_tokens(context, max(0, ctx_tokens - over))
+                    ctx_tokens = estimate_tokens(context)
+                over = (sys_tok + ctx_tokens + h_tok + q_tok) - cap
+            if over > 0 and query:
+                query = _cut_to_tokens(query, max(0, q_tok - over))
+                query_truncated = True
     out = []
     # 资料走 system 档时必须落在首条 system：chat template 普遍只认开头的 system，
     # 排在历史之后的 system 消息会被静默丢弃（项目最忌的静默失效）。合并而非新增一条，
@@ -1923,7 +2563,7 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
     if context and role != "system":
         out.append({"role": role, "content": context})
     out.append({"role": "user", "content": query})
-    return { "messages": out, "dropped_messages": dropped_messages, "used_tokens": message_tokens(msgs), "context_tokens": ctx_tokens, "budget": budget, "truncated": truncated, "truncated_user": truncated_user, }
+    return { "messages": out, "system_text": system, "context_text": context, "dropped_messages": dropped_messages, "used_tokens": h_tok, "context_tokens": ctx_tokens, "budget": budget, "truncated": truncated, "truncated_user": truncated_user, "input_cap": cap, "cap_trimmed": cap_trimmed, "frame_truncated": frame_truncated, "context_truncated": context_truncated, "context_partial": context_partial, "context_docs_kept": context_docs_kept, "query_truncated": query_truncated, }
 
 
 def _cut_to_tokens(text, max_tokens, mark=_TRUNCATION_MARK):
@@ -1944,23 +2584,40 @@ def _cut_to_tokens(text, max_tokens, mark=_TRUNCATION_MARK):
     return text[:lo] + mark
 
 
-def plan_generation(results, history, query, num_ctx, num_predict, use_context=True, context_role=None, trace=True):
+def plan_generation(results, history, query, num_ctx, use_context=True, context_role=None):
     system = build_system_prompt(use_context=use_context)
-    context = (build_context_message(results) if use_context else "")
-    # 本轮提问的 token 必须占位：短问句（≤ RAG_INPUT_RESERVE）预算逐字不变，长问句历史让位。
+    # 资料正文与逐条对齐共用同一份块列表：一次构造。截到哪几条，诊断（sources/context_docs_kept）
+    # 就只报哪几条 —— 不再有第二条拼资料的路径。
+    ctx_blocks = (context_blocks(results) if use_context else [])
+    context = "\n\n".join(ctx_blocks) if ctx_blocks else ""
     q_tokens = estimate_tokens(query)
-    reserve_eff = max(GEN_INPUT_RESERVE, q_tokens)
-    budget = history_budget(num_ctx, num_predict, system, extra=context, reserve=reserve_eff)
-    # 精确算式（不看 budget<0）：历史归零也装不下才报警，避免"归零但实际没超"的假阳性。
-    over_window = (estimate_tokens(system) + estimate_tokens(context) + q_tokens > int(num_ctx) - int(num_predict))
-    # 配置只做第二道上限：更严时收紧历史预算，0 或比窗口余量宽时不改变行为。
+    # 输入窗口上限 = 模型上下文长度（token 度量）减 chat template 特殊 token 的余量。
+    # 不做输出预留：生成超窗时由服务端上下文移位从最前面按 token 遗忘（先丢输入前文/历史）；
+    # 输出不限长（num_predict ≤ 0 → 请求 -1）。
+    input_cap = max(0, int(num_ctx) - GEN_INPUT_RESERVE)
+    # 与启动期 NUM_CTX 交叉校验对称：外部调用方可以传进任意 num_ctx，这里同样拦。
+    # 不拦的后果是"看似正常发出、实则空提问"（失效原型：静默）。
+    if input_cap <= 0:
+        raise ValueError(
+            f"num_ctx={num_ctx} 扣除 RAG_INPUT_RESERVE={GEN_INPUT_RESERVE} 后输入上界 ≤ 0："
+            f"装配不出有效提问（调大 num_ctx 或调小 RAG_INPUT_RESERVE）"
+        )
+    # 历史预算单点出处：输入上界扣掉 system、资料、本轮提问后剩下的额给历史。与
+    # build_generation_messages 内的 body_cap 同式，预算先算好、装配时按同一算式兜底硬上界。
+    # 配置只做第二道上限：更严才收紧，0 或比窗口余量宽时不改变行为。
+    context_tokens = estimate_tokens(context) if context else 0
+    budget = max(0, input_cap - estimate_tokens(system or "") - context_tokens - q_tokens)
     if GEN_HISTORY_MAX_TOKENS > 0:
         budget = min(budget, GEN_HISTORY_MAX_TOKENS)
-    gen = build_generation_messages( system, history, query, context=context, max_history_tokens=budget, context_role=context_role, )
-    gen["query_tokens"], gen["over_window"] = q_tokens, over_window
+    # 精确算式（不看 budget<0）：归零仍装不下才报警，避免"归零但实际没超"的假阳性。
+    over_window = (estimate_tokens(system or "") + context_tokens + q_tokens > input_cap)
+    gen = build_generation_messages( system, history, query, context=context, context_blocks=ctx_blocks, max_history_tokens=budget, context_role=context_role, input_cap=input_cap, )
+    gen["query_tokens"], gen["over_window"] = q_tokens, bool(over_window or gen["cap_trimmed"])
     if over_window:
-        log("⚠️  本轮提问+资料超出可用窗口（历史已全部让位仍不足）：本轮提问未截断，超出部分可能被服务端截断")
-    return { "system": system, "context": context, "messages": gen["messages"], "stats": gen, "trace": (plan_trace(results, gen, use_context=use_context) if trace else {}), }
+        log("⚠️  本轮提问+资料超出输入窗口（历史已全部让位仍不足）：按 system→资料→提问 截到窗口内，提问只截前缀")
+    if message_tokens(gen["messages"]) > int(num_ctx) * 0.9:
+        log("ℹ️  输入占用窗口超过 90%：生成空间靠服务端上下文移位腾出（从最前面按 token 遗忘，先丢历史/资料前文）")
+    return { "system": gen["system_text"], "context": gen["context_text"], "messages": gen["messages"], "stats": gen }
 
 
 STEP_BLANK_QUERY = "空查询"
@@ -1973,26 +2630,11 @@ STEP_RERANK = "Rerank 重排"
 STEP_RESULTS = "检索汇总"
 STEP_RESULT_COUNT = "检索汇总条数"
 STEP_CONFIDENCE = "置信度"
-STEP_CONTEXT = "上下文装配"
-STEP_HISTORY_TRIM = "历史裁剪"
 STEP_DEGRADE = "降级"
 TRACE_NOTES = {
     "去重": "同一父块下的兄弟子块只保留融合名次最好的一个；上下文装配用的是 parent_text，不去重会让同一段父文本重复出现",
     "条数": "返回条数少于 top_k 只可能是『去重后不同父块本身不够』；不补同父子块，见 hybrid_search 末尾的说明",
 }
-
-
-def plan_trace(results, gen, use_context=True):
-    # use_context 关闭时不许报告资料正文：steps 是对外诊断（/search 直接把它返回给
-    # 客户端），报一份从未发出的原文等于让诊断与实际请求相反，且与同一条响应里的
-    # context_tokens=0 自相矛盾。
-    trace = { STEP_CONTEXT: { "use_context": bool(use_context), "context": (format_context(results) if use_context else ""), "sources": context_sources(results), "messages": [{"role": m["role"], "chars": len(m["content"])} for m in gen["messages"]], } }
-    if gen["dropped_messages"] or gen["truncated"] or gen.get("over_window"):
-        note = "历史超出上下文预算，已从最旧一侧整条丢弃/截断，截断后首条历史恒为 user；system、检索资料与本轮提问始终保留"
-        if gen.get("over_window"):
-            note += "。本轮提问+资料超出可用窗口：历史让位为 0 仍不足，本轮提问未截断，超出部分可能被服务端截断"
-        trace[STEP_HISTORY_TRIM] = { "丢弃条数": gen["dropped_messages"], "预算 token": gen["budget"], "实用 token": gen["used_tokens"], "资料 token": gen["context_tokens"], "截断": gen["truncated"], "被截断的是 user": gen["truncated_user"], "本轮提问 token": gen.get("query_tokens"), "超出可用窗口": bool(gen.get("over_window")), "说明": note, }
-    return trace
 
 
 def sample_vector_coverage(client, collection, limit=100):
@@ -2028,14 +2670,17 @@ class RAGEngine:
         self._lexicon_checked = False
         self._chunk_fp_checked = False
         self._empty_warned = False
-        self._model_lock = threading.Lock()
+        # 加载（懒初始化）与推理分开两把锁：加载慢、推理短，共用一把会拖慢并发查询。
+        # 查询侧前向/rerank 用推理锁串行（MPS 单模型不做真并行），加载持初始化锁。
+        self._model_init_lock = threading.Lock()
+        self._model_infer_lock = threading.Lock()
     @property
     def collection_name(self):
         return self._collection_name
     def _get_client(self):
         from qdrant_client import QdrantClient
         if self._client is None:
-            self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=60, )
+            self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT, )
         return self._client
     def _resolve_collection(self):
         self._collection_name = resolve_collection_name(self._get_client())
@@ -2047,42 +2692,97 @@ class RAGEngine:
             return 0
         return client.count(collection_name=self._collection_name).count
     def _get_embed(self):
-        with self._model_lock:
+        with self._model_init_lock:
             if self._embed is None:
                 self._embed = load_embedding_model()
             return self._embed
     def _get_rerank(self):
-        with self._model_lock:
+        with self._model_init_lock:
             if self._rerank is None:
                 self._rerank = load_reranker_model()
             return self._rerank
     def _inference_lock(self):
-        return self._model_lock
+        return self._model_infer_lock
     def _check_chunk_freshness(self, index_fp):
         """分块新鲜度闸门（与词表闸门对称）：process 之后未重跑 index 时，检索会静默
-        继续吃旧分块——stages 报过期但没人看，用户拿到的是无声的旧知识库。"""
-        if index_fp is None or self._chunk_fp_checked:
+        继续吃旧分块——stages 报过期但没人看，用户拿到的是无声的旧知识库。fail-closed：
+        对不上或无从判断就显式抛错，而不是"看似正常"地服务过期分块。只查一次、且**通过
+        （一致）才置位**：失败/抛错都不置位，后续每轮检索都会重试，直到重建对齐为止。"""
+        if self._chunk_fp_checked:
             return
-        self._chunk_fp_checked = True  # 只查一次：产物不在运行期热加载
+        if index_fp is None:
+            # 旧索引没记指纹：不是"一致"，是**无从判断**。静默放行 = 过期索引假新鲜。
+            raise RuntimeError(
+                "索引未记录分块指纹（旧索引），无法与当前切分指纹比对："
+                "可能在服务过期分块，请运行 `python chatbot.py index` 重建后再检索。"
+            )
         try:
             current, _ = _chunking_config_fingerprint()
         except Exception as exc:
-            log(f"⚠️  无法计算当前切分指纹，跳过分块新鲜度检查: {type(exc).__name__}: {exc}")
+            log(f"⚠️  无法计算当前切分指纹，暂缓分块新鲜度检查: {type(exc).__name__}: {exc}")
             return
         if index_fp == current:
+            self._chunk_fp_checked = True
             return
-        logger.error(
-            "分块产物与索引不一致：索引 %s / 当前 %s。检索在用过期分块，请运行 `python chatbot.py process && python chatbot.py index`。",
-            index_fp, current,
+        raise RuntimeError(
+            f"分块产物与索引不一致（索引 {index_fp} / 当前 {current}）：检索会吃到过期分块，"
+            f"请运行 `python chatbot.py process && python chatbot.py index` 重建后再检索。"
         )
     def _check_lexicon_consistency(self, index_lexicon_id):
-        if index_lexicon_id is None or self._lexicon_checked:
+        if self._lexicon_checked:
             return
-        self._lexicon_checked = True  # 一致与否都只查一次：词表文件不做运行期热加载
-        current = lexicon_fingerprint()
+        if index_lexicon_id is None:
+            # 与分块指纹同理：无记录 ≠ 一致，旧索引的稀疏词空间无从判断。
+            raise RuntimeError(
+                "索引未记录词表指纹（旧索引）：稀疏通道新旧无从判断，"
+                "请运行 `python chatbot.py reindex-sparse` 重建后再检索。"
+            )
+        try:
+            current = lexicon_fingerprint()
+        except Exception as exc:
+            log(f"⚠️  无法计算当前词表指纹，暂缓词表一致性检查: {type(exc).__name__}: {exc}")
+            return
         if index_lexicon_id == current:
+            self._lexicon_checked = True
             return
-        logger.error( "词表与索引不一致：索引 %s / 当前 %s。稀疏通道词空间已错配，召回会静默下降。请运行 `python chatbot.py reindex-sparse`。", index_lexicon_id, current, )
+        raise RuntimeError(
+            f"词表与索引不一致（索引 {index_lexicon_id} / 当前 {current}）："
+            f"稀疏通道词空间已错配，召回会静默下降，"
+            f"请运行 `python chatbot.py reindex-sparse` 重建后再检索。"
+        )
+    def _gate_check_collection_fingerprint(self, client, collection):
+        """检索开跑前的指纹闸门：分块指纹取一条 payload 核对，词表指纹全量滚动核对。
+        fail-closed——对不上或无从判断就抛错（见 _check_*）；未入库/读不到时不拦截
+        （交由检索主路径报"尚未入库"），避免把 503 误报成"指纹不一致"。"""
+        if self._chunk_fp_checked and self._lexicon_checked:
+            return
+        try:
+            pts, _ = client.scroll( collection_name=collection, limit=1, with_payload=True, with_vectors=False )
+        except Exception as exc:
+            log(f"⚠️  指纹闸门读集合 {collection} 失败，暂缓核对: {type(exc).__name__}: {exc}")
+            return
+        if not pts:
+            return
+        payload = pts[0].payload or {}
+        # 分块指纹抽首点成立：一个集合只由一次 index 写成（新集合 + 原子切别名），
+        # 集合内恒一。词表指纹不成立 —— reindex-sparse 原地更新会留下混合态，
+        # 首点恒属已更新前缀（见 _distinct_lexicon_ids），必须全量滚动。
+        self._check_chunk_freshness(payload.get(CHUNK_FINGERPRINT_FIELD))
+        try:
+            lex_ids = _distinct_lexicon_ids(client, collection)
+        except Exception as exc:
+            log(f"⚠️  指纹闸门全量读取词表指纹失败，暂缓核对: {type(exc).__name__}: {exc}")
+            return
+        if not lex_ids:
+            return
+        if len(lex_ids) > 1:
+            # 混合态 = 判定不一致（读取本身成功）：fail-closed，且不置位 —— 重试到
+            # reindex-sparse 重建对齐为止，与 _check_* 的"通过才置位"同规则。
+            raise RuntimeError(
+                f"集合 {collection} 内词表指纹混合（{dict(lex_ids)}），reindex-sparse 中断/跳页残留，"
+                f"新旧稀疏向量正在混同参与融合，请运行 `python chatbot.py reindex-sparse` 重建后再检索。"
+            )
+        self._check_lexicon_consistency(lex_ids[0][0])
     def _fetch_chunks(self, point_ids, collection=None):
         """按命中 id 逐次回取 payload（按 id 精确检索，不全量滚动 2 万条）。
 
@@ -2108,17 +2808,21 @@ class RAGEngine:
                 self._empty_warned = True
             return {}
         self._empty_warned = False
-        self._check_lexicon_consistency((points[0].payload or {}).get(LEXICON_ID_FIELD))
-        self._check_chunk_freshness((points[0].payload or {}).get(CHUNK_FINGERPRINT_FIELD))
+        # 分块/词表指纹核对由 hybrid_search 开跑前的 _gate_check_collection_fingerprint 承担
+        # （fail-closed 且只查一次）；这里只做按 id 精确回取，不再重复取号。
         return {p.id: chunk_from_payload(p.payload, p.id) for p in points}
     def _source_filter(self, source):
         if not source:
             return None
         from qdrant_client import models
-        return models.Filter(must=[ models.FieldCondition(key=SOURCE_FIELD, match=models.MatchValue(value=source)) ])
+        # 过滤键必须与读取侧 _source_of 同一套兼容面（SOURCE_PAYLOAD_FIELDS 已是这三键的
+        # 唯一来源，别再自拼一份）：旧索引 payload 里只有 book/source，只按 SOURCE_FIELD
+        # 过滤 = 命中恒空且不报错（静默空结果）。should=任一键命中即可；未建索引的旧键
+        # 走扫描，22k 点规模可接受。
+        return models.Filter(should=[ models.FieldCondition(key=k, match=models.MatchValue(value=source)) for k in SOURCE_PAYLOAD_FIELDS ])
     def hybrid_search(self, query, top_k=TOP_K, return_steps=False, source=None, book=None):
         source = source if source is not None else book
-        steps = {} if return_steps else None
+        steps: dict | None = {} if return_steps else None
         if not _has_searchable_content(query):
             if steps is not None:
                 steps[STEP_BLANK_QUERY] = f"查询 {query!r} 不含可检索内容，直接返回空结果"
@@ -2126,15 +2830,23 @@ class RAGEngine:
         self._resolve_collection()
         client = self._get_client()
         collection = self._collection_name
+        # 指纹闸门（fail-closed）：每轮检索开跑前核对分块/词表指纹，通过后只核对一次；
+        # 失败不置位、每轮重试（见 _check_chunk_freshness/_check_lexicon_consistency）。
+        self._gate_check_collection_fingerprint(client, collection)
         query_filter = self._source_filter(source)
-        # 稠密查询向量只在稠密通道权重非零时才计算：权重为 0 时通道整体退出（health 的
-        # 口径），若这里仍无条件加载并前向嵌入模型，模型目录缺失/损坏会让本可由稀疏通道
+        # 稠密查询向量只在稠密通道权重非零时才计算：权重为 0 时通道整体退出，若这里
+        # 仍无条件加载并前向嵌入模型，模型目录缺失/损坏会让本可由稀疏通道
         # 独立服务的检索整体失败，还会白白付一次冷加载。
         dense_query = None
         if RRF_DENSE_WEIGHT:
             tokenizer, model, device = self._get_embed()
-            # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
-            q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
+            # 前向与 rerank 共用同一把推理锁：加载/重排都已按它串行，唯独查询侧前向裸跑
+            # —— ThreadingHTTPServer + 多会话 Streamlit 下会真并发前向同一模型（MPS 上
+            # 争抢命令缓冲，正是 AGENTS 点名的"永久阻塞"级风险）。先取模型再进锁，避免
+            # 与 _get_embed 内部的同一把锁重入死锁。
+            with self._inference_lock():
+                # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
+                q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
             dense_query = q_emb[0].tolist()
         sparse_query = sparse_encode(query)
         # 判空走 sparse_terms_of：sparse_query.text 里的零宽空格是占位哨兵，不是词
@@ -2145,9 +2857,15 @@ class RAGEngine:
         # bm25_tokenize 返回空串，dual_channel_recall 既不抛异常也不召回 → 没有降级标记，
         # 分数概览也不体现，结果看起来是正常双通道融合，实际是纯稠密。必须点名。
         if bool(RRF_SPARSE_WEIGHT) and not _sparse_terms:
-            _degraded(steps, "稀疏通道：查询分词后为空（整句命中停用词或纯标点），本次退化为纯稠密检索")
+            if RRF_DENSE_WEIGHT:
+                _degraded(steps, "稀疏通道：查询分词后为空（整句命中停用词或纯标点），本次退化为纯稠密检索")
+            else:
+                _degraded(steps, "稀疏通道：查询分词后为空（整句命中停用词或纯标点），且稠密通道权重为 0，本次无可用召回")
+        # 无词不发稀疏查询：哨兵词会命中"同样分词为空"的入库文档（纯标点块），把垃圾召回
+        # 混进融合 —— 与上面"退化为纯稠密"的日志相反。通道开关与日志必须是同一个判据。
+        _use_sparse = bool(RRF_SPARSE_WEIGHT) and bool(_sparse_terms)
         # 两种检索：稠密 + 稀疏各召回一次，随后统一加权 RRF 融合。
-        dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=bool(RRF_SPARSE_WEIGHT), )
+        dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, )
         if note:
             _degraded(steps, note)
         rankings = channel_rankings(dense_hits, sparse_hits)
@@ -2236,7 +2954,7 @@ class RAGEngine:
 def drain_events(events, on_thinking=None, on_delta=None, on_error=None):
     """消费事件流，返回 (thinking, answer, error, done)；回调参数为 (本段, 通道累计全文)。
     词表外的 kind 直接抛错——兜底会把「词表分叉」伪装成正常结尾。"""
-    acc = {EVENT_THINKING: [], EVENT_DELTA: [], EVENT_ERROR: []}
+    acc: dict = {EVENT_THINKING: [], EVENT_DELTA: [], EVENT_ERROR: []}
     sink = {EVENT_THINKING: on_thinking, EVENT_DELTA: on_delta, EVENT_ERROR: on_error}
     done = {}
     for kind, payload in events:
@@ -2254,41 +2972,56 @@ def drain_events(events, on_thinking=None, on_delta=None, on_error=None):
     return "".join(acc[EVENT_THINKING]), "".join(acc[EVENT_DELTA]), "".join(acc[EVENT_ERROR]), done
 
 
-def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_context=None, num_ctx=None, num_predict=None, trace=True, chat=None):
+def first_retrieval(events):
+    """消费事件流的首事件（恒为 RETRIEVAL）并返回其 payload。
+
+    事件契约被任何一侧绕过（比如上游调整了顺序）都必须在消费点显式暴露：靠 next() 的
+    元组展开虽然不会崩，但会把 retrieval 误当成 thinking/delta 的下游通道。断言在此，
+    让非契约形态当场报错而不是静默错位。
+    """
+    kind, payload = next(events)
+    if kind != EVENT_RETRIEVAL:
+        raise RuntimeError(f"事件契约被绕过：首事件不是 {EVENT_RETRIEVAL!r} 而是 {kind!r}")
+    return payload
+
+
+def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_context=None, num_ctx=None, num_predict=None, chat=None):
     source = source if source is not None else book
     chat = chat or stream_chat
     top_k = TOP_K if top_k is None else top_k
     use_context = RAG_USE_CONTEXT if use_context is None else use_context
     num_ctx = NUM_CTX if num_ctx is None else num_ctx
-    num_predict = NUM_PREDICT if num_predict is None else num_predict
+    # num_predict ≤ 0 = 不限长：请求发 -1，窗口是唯一上限；输入上界与 num_predict 无关
+    # （见 plan_generation：输入窗口 = num_ctx - 模板余量，不做输出预留）。
+    _raw_predict = int(NUM_PREDICT if num_predict is None else num_predict)
+    request_predict = _raw_predict if _raw_predict > 0 else -1
     started = time.time()
-    if trace:
-        results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source )
-        confidence = steps.get(STEP_CONFIDENCE) or {}
-    else:
-        results = engine.hybrid_search( query, top_k=top_k, source=source )
-        steps = {}
-        confidence = results_confidence(results)
+    results = engine.hybrid_search(query, top_k=top_k, source=source)
+    confidence = results_confidence(results)
     elapsed = time.time() - started
-    plan = plan_generation( results, history, query, num_ctx, num_predict, use_context=use_context, trace=trace, )
-    steps.update(plan["trace"])
+    plan = plan_generation(results, history, query, num_ctx, use_context=use_context)
     # 唯一事件契约：首事件恒为 RETRIEVAL，之后 thinking/delta/error/done；检索为空也照常生成。
-    yield EVENT_RETRIEVAL, { "query": query, "results": results, "steps": steps, "confidence": confidence, "messages": plan["messages"], "gen": plan["stats"], "elapsed": elapsed, }
+    # 诊断只报**实际发出**的内容：gen（plan["stats"]）就是装配真正执行后统计出来的
+    # （context_docs_kept/context_partial/query_truncated/…），不再另拼一套 steps。
+    yield EVENT_RETRIEVAL, { "query": query, "results": results, "confidence": confidence, "gen": plan["stats"], "elapsed": elapsed }
     answer_chars = 0
-    for kind, delta in chat(plan["messages"]):
+    # 预算参数必须真的进请求（见 stream_chat 文档）：chat 可调用对象须接受这两个关键字。
+    # **无重试、无长度/时间闸**：本轮生成原样转发，窗口（num_ctx）与上下文移位是唯一边界；
+    # 空答 / done_reason=length / 报错照原样交给上层（空答不入历史、错误照常显式）。
+    for kind, delta in chat(plan["messages"], num_ctx=num_ctx, num_predict=request_predict):
         if kind == EVENT_DELTA:
             answer_chars += len(delta)
         elif kind == EVENT_DONE:
-            delta = { **delta, "answer_chars": answer_chars, "elapsed": elapsed, "steps": steps, }
+            delta = { **delta, "answer_chars": answer_chars, "elapsed": elapsed, }
         yield kind, delta
 
 
-def cmd_process():
+def cmd_process(args=None):
     log("阶段一: 处理数据 (读取 + 分块)")
-    build_chunks()
+    return build_chunks()
 
 
-def cmd_index():
+def cmd_index(args=None):
     log("阶段二: 向量化入库")
     build_index()
 
@@ -2314,28 +3047,40 @@ def _streamlit_pids():
 
 
 def _qdrant_gate():
-    """serve/api 共用的启动门禁：连不上或集合为空则报错退出，返回 (client, coll, count)。"""
+    """serve/api 共用的启动门禁：连不上或集合为空则报错退出，返回 (coll, count)。
+
+    门禁 client 只服务这次启动检查，不向下传（真正的 client 由 RAGEngine 自建）——
+    以前把它 return 出去却被调用方丢弃，服务进程里白挂一个没人关的连接池。
+    """
     from qdrant_client import QdrantClient
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
-    coll = resolve_collection_name(client)
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
     try:
-        count = 0 if not client.collection_exists(coll) else client.count(collection_name=coll).count
-    except Exception as exc:
-        log(f"错误: 连不上向量数据库 {QDRANT_HOST}:{QDRANT_PORT}")
-        log(f"  原因: {type(exc).__name__}: {exc}")
-        log("  请先确认服务已启动: docker compose up -d")
-        sys.exit(1)
-    if count == 0:
-        log("错误: 向量数据库为空")
-        log("请先运行:")
-        log("  python chatbot.py process")
-        log("  python chatbot.py index")
-        sys.exit(1)
-    return client, coll, count
+        coll = resolve_collection_name(client)
+        if _state_ref().alias_degraded:
+            log(f"⚠️  集合别名不可用，直接读 {COLLECTION_NAME}：当前检索不读索引目标集合，切别名（index 重建）后不会自动跟随")
+        try:
+            count = 0 if not client.collection_exists(coll) else client.count(collection_name=coll).count
+        except Exception as exc:
+            log(f"错误: 连不上向量数据库 {QDRANT_HOST}:{QDRANT_PORT}")
+            log(f"  原因: {type(exc).__name__}: {exc}")
+            log("  请先确认服务已启动: docker compose up -d")
+            sys.exit(1)
+        if count == 0:
+            log("错误: 向量数据库为空")
+            log("请先运行:")
+            log("  python chatbot.py process")
+            log("  python chatbot.py index")
+            sys.exit(1)
+        return coll, count
+    finally:
+        try:
+            client.close()  # 不留无主连接池；老版本 qdrant-client 没有 close 就等 GC
+        except Exception:
+            pass
 
 
-def cmd_serve():
-    _client, coll, count = _qdrant_gate()
+def cmd_serve(args=None):
+    coll, count = _qdrant_gate()
     log(f"向量数据库: {coll} {count} 条记录")
     log(f"Qdrant服务: {QDRANT_HOST}:{QDRANT_PORT}")
     if _port_in_use(8501):
@@ -2359,15 +3104,12 @@ def cmd_serve():
 
 # ── 交互入口：Streamlit 主界面 ──
 def _render_stored_message(msg):
-    """渲染输入、输出、思维链与错误（兼容旧会话里带 error 字段的历史条目）。"""
+    """历史消息最简渲染：只有正文或错误（思维链只在当轮流式展示，历史不留折叠区）。"""
     import streamlit as st
     with st.chat_message(msg["role"]):
-        if msg["role"] == "assistant" and THINK and msg.get("thinking"):
-            with st.expander("🧠", expanded=False):
-                st.markdown(msg["thinking"])
         if msg.get("content"):
             st.markdown(msg["content"])
-        elif msg["role"] == "assistant" and msg.get("error"):
+        elif msg.get("error"):
             st.error(msg["error"])
 
 
@@ -2392,13 +3134,10 @@ def _gen_failure_hint(gen_error):
 
 def _stream_reply(events):
     """流式渲染本轮答案：生成失败与 num_predict 截断必须可见（静默失效违背项目不变量）。
-    返回 (thinking, answer, gen_error, done)；done 为空即生成未正常结束（与 API 侧同判据）。"""
+    返回 (thinking, answer, gen_error, done)；done 为空即生成未正常结束（与 API 侧同判据）。
+    界面最简：思维链与正文都是裸 markdown 流——无图标、无状态框；error/warning 只在失败态出现。"""
     import streamlit as st
-    think_status, think_ph = None, None
-    if THINK:
-        think_status = st.status("🧠", expanded=True)
-        with think_status:
-            think_ph = st.empty()
+    think_ph = st.empty() if THINK else None
     answer_ph = st.empty()
     thinking, answer, gen_error, done = drain_events(
         events,
@@ -2411,22 +3150,53 @@ def _stream_reply(events):
         if hint:
             st.caption(hint)
     elif not answer:
+        # 空答案与错误必须一样显眼：think 开启时预算被思考吃光正是这样收场的
+        # （done 齐全、正文 0 字），只画一个 ⚠️ 会让用户以为是网络问题。
         answer_ph.markdown("⚠️")
-    if think_status is not None:
-        if thinking:
-            think_ph.markdown(thinking)
-        think_status.update(state="complete", expanded=False)
+        st.warning(
+            "生成正常结束但没有产出任何正文"
+            + (f"（done_reason={done.get('done_reason')}, eval_count={done.get('eval_count')}）"
+               if done else "")
+            + ("：思维链吃掉了输出预算，关掉 RAG_THINK 或调大 RAG_NUM_PREDICT。"
+               if THINK else "：调大 RAG_NUM_PREDICT 或换个问法重试。")
+        )
+    if think_ph is not None and thinking:
+        think_ph.markdown(thinking)  # 流末对齐一次全文，防尾块丢失
     if done and done.get("done_reason") == "length":
-        st.warning("⚠️ 生成被 num_predict 截断（done_reason=length）：答案没写完，可调大 RAG_NUM_PREDICT。")
+        # 调大 num_predict 在 think 开启时会连带撞内存墙（预算同时归思考与正文用），
+        # 那种情形下先关思维链才是对的下一步。
+        st.warning(
+            "⚠️ 生成被 num_predict 截断（done_reason=length）：答案没写完。"
+            + ("先关 RAG_THINK（思考与正文共用预算），确实需要思维链再调大 RAG_NUM_PREDICT。"
+               if THINK else "调大 RAG_NUM_PREDICT。")
+        )
     return thinking, answer, gen_error, done
+
+
+def answer_is_good(gen_error, done, answer):
+    """生成是否算"本轮成功"：无错误、有 done 事件、正文非空（trim 后）。
+    只供 Streamlit 决定是否入历史；/_ask 无闸（空答/done_reason=length 原样交上层，
+    done 事件如实携带 answer_chars）——不存在"两侧各写一套判据"的问题，别给 /ask 加闸。"""
+    return not gen_error and bool(done) and bool(answer and answer.strip())
 
 
 def _run_assistant_turn(engine, prompt, history):
     """跑一轮检索与生成并渲染；只有生成正常结束且答案非空才把助手消息写进会话历史。"""
     import streamlit as st
+
+    def rollback_orphan_user():
+        # 本轮 user 消息由 run_streamlit 先写进会话。失败必须撤掉，否则会话里留下一条
+        # 没有配对的孤儿提问，下一轮会被当成历史重发给模型（症状：同题被答两遍）。
+        # 只在确认"队尾正是本轮这条 user"时弹，防止误删更早的内容。
+        msgs = st.session_state.messages
+        if msgs and msgs[-1].get("role") == "user" and msgs[-1].get("content") == prompt:
+            msgs.pop()
+
     try:
-        events = run_turn(engine, prompt, history, top_k=TOP_K, trace=False)
-        next(events)  # 首事件恒为 retrieval，不在页面上渲染
+        events = run_turn(engine, prompt, history, top_k=TOP_K)
+        # 首事件恒为 retrieval，必须消费掉（drain_events 的事件契约），且消费时显式断言
+        # 非契约形态（first_retrieval）：最简前端暂不展示本轮资料清单，编号对照能力给 API 侧。
+        first_retrieval(events)
         thinking, answer, gen_error, done = _stream_reply(events)
     except Exception as exc:
         # 只打「类型: 消息」无法定位（stat(None) 这类消息看不出是哪一行）：完整调用栈必须落盘，
@@ -2440,18 +3210,27 @@ def _run_assistant_turn(engine, prompt, history):
         st.error(
             f"本轮执行异常: {type(exc).__name__}: {exc}\n"
             f"出错位置: {where}\n"
-            f"完整调用栈: {os.getenv('RAG_LOG_FILE', 'rag.log')}"
+            f"完整调用栈: {os.getenv('RAG_LOG_FILE', DEFAULT_LOG_FILE)}"
         )
+        rollback_orphan_user()
         return
-    # 生成失败或空答案：不入历史。gen_error 也进判据（不只依赖"error 必不产出 done"
-    # 这个上游契约）——一旦生产侧违约，残缺答案也不会被当成完整回复留下。
-    if gen_error or not done or not answer or not answer.strip():
+    except BaseException:
+        # Stop 按钮/主动重跑抛的是 ScriptControlException（BaseException 子类），上面的
+        # except Exception 接不住 —— 不回滚，孤儿 user 就永久留进会话历史（下一轮被当
+        # 历史重发，同题被答两遍）。回滚后原样上抛：这个异常是 Streamlit 完成停止/重跑
+        # 的通道，吞掉会把"停"变成"继续跑完"。
+        rollback_orphan_user()
+        raise
+    # 生成失败或空答案：不入历史（且 rollback 本轮 user）。gen_error 也进判据（不只依赖
+    # "error 必不产出 done"这个上游契约）——一旦生产侧违约，残缺答案也不会被当成完整回复留下。
+    if not answer_is_good(gen_error, done, answer):
         if gen_error:
             log(f"⚠️  生成失败，本轮回复未写入历史: {gen_error[:300]}")
         elif not done:
             log("⚠️  生成未正常结束（无 done 事件），本轮回复未写入历史")
         else:
             log("⚠️  生成为空答案，本轮回复未写入历史")
+        rollback_orphan_user()
         return
     entry = {"role": "assistant", "content": answer}
     if THINK and thinking:
@@ -2466,22 +3245,30 @@ def _st_engine():
 
 def run_streamlit():
     import streamlit as st
-    st.set_page_config(layout="wide")
+    global _STATE
+    st.set_page_config(layout="wide")  # 展示最大化：宽屏铺满视口
+    # 先把运行态单例钉到模块变量：脚本线程会在 cache_resource 之外再访问 load_lexicon 等
+    # 懒加载，若预热/首查询线程抢先建了一份、脚本线程又建一份，就是"同一进程两套词表"。先
+    # 赋值（值来自 cache_resource 指向的同一模块单例），其后所有懒加载都走这一个。
+    _STATE = _streamlit_runtime_state()
     engine = _st_engine()
-    try:
-        empty = engine.count() == 0
-    except Exception as exc:
-        st.error(f"无法访问向量库: {type(exc).__name__}: {exc}")
-        st.stop()
-    if empty:
+    # 集合点数按会话只取一次：rerun 时 Qdrant 点数不会变，反复 count() 只会白等网络。
+    if "collection_count" not in st.session_state:
+        try:
+            st.session_state["collection_count"] = engine.count()
+        except Exception as exc:
+            st.session_state.pop("collection_count", None)
+            st.error(f"无法访问向量库: {type(exc).__name__}: {exc}")
+            st.stop()
+    if st.session_state["collection_count"] == 0:
         st.error("向量库为空，先跑：python chatbot.py process && python chatbot.py index")
         st.stop()
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    # 复制消息列表避免迭代时修改导致的竞态（Streamlit 重跑机制下虽偶然正确，但显式复制更稳健）
     for msg in list(st.session_state.messages):
         _render_stored_message(msg)
-    if prompt := st.chat_input(""):
+    # 思维链有无只看 RAG_THINK 配置（_stream_reply 按 THINK 建/不建思考区），前端不做选择。
+    if prompt := st.chat_input("", submit_mode="stop"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -2492,8 +3279,10 @@ def run_streamlit():
 # ── 交互入口：HTTP API ──
 _ENGINE = None
 _ENGINE_LOCK = threading.RLock()
-_REQUEST_LOCK = threading.Lock()
-MAX_BODY_BYTES = int(os.getenv("RAG_API_MAX_BODY", str(64 * 1024)))
+MAX_BODY_BYTES = env_int_min("RAG_API_MAX_BODY", 64 * 1024, 1)
+# 可选 API 鉴权：未设 = 不校验（默认绑 127.0.0.1 本机自用）。对外监听（--host /
+# RAG_API_HOST 非回环）时设它，否则任何能连到端口的客户端都能检索、烧生成算力。
+API_KEY = (os.getenv("RAG_API_KEY") or "").strip() or None
 
 
 def _warm_engine(engine):
@@ -2509,10 +3298,22 @@ def _warm_engine(engine):
             # 旧写法丢弃返回值、直接打印"预热完成"。而 entrypoint 正是把生成模型拉取
             # 放在后台的，冷启动窗口内这次预热必然落在 404 上 —— 唯一的"已预热"信号
             # 成了假信号，首个真故障要等用户提问时的 500 才暴露。
-            r = requests.post( API_URL, json={ "model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": False, "think": THINK, "options": {"num_predict": 1}, }, timeout=180, )
+            # 还必须看正文：think 开启时 num_predict 预算会被思考吃光，content 恒为空，
+            # 只看状态码会把"能产出 0 个字的生成链路"报成预热成功（判据恒真）。
+            # 故预热一律 think=false、给 8 token —— 它验的是链路能出字，不是验思维链。
+            # 超时取 OLLAMA_TIMEOUT（不是硬编码 180）：慢冷启动（模型后台拉取/加载）下
+            # 探针等得起，才不会把"还在加载"误报成"预热未完成"。
+            r = _ollama_session().post( API_URL, json={ "model": MODEL, "messages": [{"role": "user", "content": ""}], "stream": False, "think": False, "options": {"num_predict": 8, "temperature": TEMPERATURE}, }, timeout=TIMEOUT, )
             if r.status_code != 200:
                 raise RuntimeError(f"生成模型预热失败 HTTP {r.status_code}: {r.text[:200]}")
-            log("模型预热完成（嵌入/重排/生成）")
+            data = r.json() if r.text else {}
+            _reply = ((data or {}).get("message") or {}).get("content") if isinstance(data, dict) else None
+            if not (_reply or "").strip():
+                raise RuntimeError(
+                    f"生成模型预热返回空正文（done_reason={(data or {}).get('done_reason')!r}, "
+                    f"eval_count={(data or {}).get('eval_count')!r}）—— 链路通但一个字都没产出"
+                )
+            log(f"模型预热完成（嵌入/重排/生成，探针 {_reply.strip()[:20]!r}）")  # type: ignore[union-attr]
         except Exception as exc:
             log(f"⚠️  预热未完成（不影响服务，首次查询冷加载）: {type(exc).__name__}: {exc}")
     threading.Thread(target=_warm, daemon=True).start()
@@ -2644,20 +3445,15 @@ class Handler(BaseHTTPRequestHandler):
             _drain_body(self)
         _json_response(self, status, {"error": message}, close=True)
     def do_GET(self):
-        if self.path.split("?")[0] != "/health":
-            self._reject(404, f"未知路径: {self.path}")
+        if not self._authorized():
+            self._reject(401, "缺少或错误的 API key（头 X-API-Key 或 Authorization: Bearer <key>）")
             return
-        try:
-            engine = get_engine()
-            with _REQUEST_LOCK:
-                count = engine.count()
-                collection = engine.collection_name
-        except Exception as exc:
-            _json_response(self, 503, { "status": "error", "error": f"无法访问向量库: {type(exc).__name__}: {exc}", }, close=True)
-            return
-        _json_response(self, 200, { "status": "ok" if count else "empty", "chunks": count, "collection": collection, "model": MODEL, "ollama": OLLAMA_BASE_URL, "use_context": RAG_USE_CONTEXT, "think": THINK, })
+        self._reject(404, f"未知路径: {self.path}")
     def do_POST(self):
         path = self.path.split("?")[0]
+        if not self._authorized():
+            self._reject(401, "缺少或错误的 API key（头 X-API-Key 或 Authorization: Bearer <key>）")
+            return
         if path not in ("/search", "/ask"):
             self._reject(404, f"未知路径: {self.path}")
             return
@@ -2667,29 +3463,54 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._reject(400, str(exc))
             return
-        history, history_stripped = strip_current_turn(history, query)
+        try:
+            history, history_stripped = strip_current_turn(history, query)
+        except Exception as exc:
+            # 参数已过 _search_params 校验，这里再炸就是服务侧缺陷 → 500，不裸抛断连接。
+            self._reject(500, f"历史裁剪失败: {type(exc).__name__}: {exc}")
+            return
         if path == "/search":
             self._handle_search(query, top_k, source, history_stripped)
         else:
             self._handle_ask(query, top_k, source, history, history_stripped)
+    def _authorized(self):
+        """RAG_API_KEY 未设 = 不鉴权（默认只绑回环）。设了就两处头都认：
+        X-API-Key 与 Authorization: Bearer。compare_digest 防时序侧信道。"""
+        if not API_KEY:
+            return True
+        import hmac
+        got = self.headers.get("X-API-Key") or ""
+        if not got:
+            auth = self.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                got = auth[7:].strip()
+        # 转 bytes 再比：compare_digest 对 str 只收 ASCII，请求头里出现任何非 ASCII
+        # 字节就 TypeError —— 401 没有，客户端拿到的是裸断连（自崩形态）。
+        return hmac.compare_digest(got.encode("utf-8"), API_KEY.encode("utf-8"))
     def _handle_search(self, query, top_k, source, history_stripped=False):
         try:
-            with _REQUEST_LOCK:
-                engine = get_engine()
-                t0 = time.time()
-                results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source )
+            engine = get_engine()
+            t0 = time.time()
+            results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source )
+            payload = { "query": query, "source": source, "source_field": SOURCE_FIELD, "elapsed": round(time.time() - t0, 3), "confidence": steps.get(STEP_CONFIDENCE), "history_stripped": history_stripped, "results": [_result_json(r) for r in results], "steps": steps, }
         except Exception as exc:
             _json_response(self, 500, {"error": f"检索失败: {type(exc).__name__}: {exc}"})
             return
-        _json_response(self, 200, { "query": query, "source": source, "source_field": SOURCE_FIELD, "elapsed": round(time.time() - t0, 3), "confidence": steps.get(STEP_CONFIDENCE), "history_stripped": history_stripped, "results": [_result_json(r) for r in results], "steps": steps, })
+        try:
+            _json_response(self, 200, payload)
+        except Exception as exc:
+            # 响应写入失败（客户端半路断开等）不能裸抛进 handle_one_request：
+            # 与 500 分支同理，服务侧问题必须落日志，而不是只留一个断掉的连接。
+            log(f"⚠️  /search 响应写入失败: {type(exc).__name__}: {exc}")
+            self.close_connection = True
     def _handle_ask(self, query, top_k, source, history, history_stripped=False):
         headers_sent = False
         t0 = time.time()
+        events = None
         try:
-            with _REQUEST_LOCK:
-                engine = get_engine()
-                events = run_turn(engine, query, history, top_k=top_k, source=source, trace=False)
-                _kind, payload = next(events)   # 首事件恒为 retrieval，没有第二种起始契约
+            engine = get_engine()
+            events = run_turn(engine, query, history, top_k=top_k, source=source)
+            payload = first_retrieval(events)   # 首事件恒为 retrieval，没有第二种起始契约；断言在 helper 内
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
@@ -2700,10 +3521,14 @@ class Handler(BaseHTTPRequestHandler):
             def emit(obj):
                 self.wfile.write( (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
                 self.wfile.flush()
-            emit({ "type": "retrieval", "query": query, "elapsed": round(payload["elapsed"], 3), "confidence": payload["confidence"], "source": source, "source_field": SOURCE_FIELD, "sources": context_sources(payload["results"]), "history_stripped": history_stripped, "results": [_result_json(r) for r in payload["results"]], })
             gen = payload["gen"]
+            kept_docs = gen.get("context_docs_kept")
+            ctx_sources = context_sources(payload["results"])
+            if kept_docs is not None:
+                ctx_sources = ctx_sources[:kept_docs]
+            emit({ "type": "retrieval", "query": query, "elapsed": round(payload["elapsed"], 3), "confidence": payload["confidence"], "source": source, "source_field": SOURCE_FIELD, "sources": ctx_sources, "context_docs_kept": kept_docs, "context_partial": gen.get("context_partial"), "history_stripped": history_stripped, "results": [_result_json(r) for r in payload["results"]], })
             if gen["dropped_messages"] or gen["truncated"] or gen.get("over_window"):
-                emit({ "type": "history_trimmed", "dropped_messages": gen["dropped_messages"], "budget": gen["budget"], "used_tokens": gen["used_tokens"], "context_tokens": gen["context_tokens"], "truncated": gen["truncated"], "truncated_user": gen["truncated_user"], "query_tokens": gen.get("query_tokens"), "over_window": bool(gen.get("over_window")), })
+                emit({ "type": "history_trimmed", "dropped_messages": gen["dropped_messages"], "budget": gen["budget"], "used_tokens": gen["used_tokens"], "context_tokens": gen["context_tokens"], "truncated": gen["truncated"], "truncated_user": gen["truncated_user"], "query_tokens": gen.get("query_tokens"), "input_cap": gen.get("input_cap"), "cap_trimmed": gen.get("cap_trimmed"), "frame_truncated": gen.get("frame_truncated"), "context_truncated": gen.get("context_truncated"), "query_truncated": gen.get("query_truncated"), "over_window": bool(gen.get("over_window")), })
             # 无拒答分支：首个事件恒为 retrieval，之后一律走 drain_events；检索为空也照常生成。
             _thinking, _answer, _error, done = drain_events(
                 events,
@@ -2737,22 +3562,32 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except Exception:
                 pass
+        finally:
+            # 客户端断开后必须**主动**收掉上游流：关掉 events 会一路触发 stream_chat 的
+            # finally: r.close()，让 Ollama 端看到连接关闭。不写 finally 就只能指望本函数
+            # 返回后 GC 触发 GeneratorExit —— 那是不确定的，断开的请求可能继续烧完
+            # num_predict 才停，而这台 Ollama 是单槽的，期间后续请求全在排队。
+            # （Ollama 是否立即中止生成未做实测，但连接关闭这一侧已变成确定行为。）
+            if events is not None:
+                try:
+                    events.close()
+                except Exception:
+                    pass
 
 
-def cmd_api():
-    parser = argparse.ArgumentParser(description="RAG 知识库 HTTP API")
-    parser.add_argument("--host", default=os.getenv("RAG_API_HOST", "::"), help="监听地址（默认 :: 双栈，IPv4/IPv6 localhost 均可访问）")
-    parser.add_argument("--port", type=int, default=int(os.getenv("RAG_API_PORT", "8000")))
-    args = parser.parse_args()
-    _client, _coll, count = _qdrant_gate()
+def cmd_api(args=None):
+    if args is None:
+        args = _build_parser().parse_args(["api"])
+    _coll, count = _qdrant_gate()
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not API_KEY:
+        log(f"⚠️  API 监听 {args.host}（非回环）且未设 RAG_API_KEY：服务无鉴权，任何能连到该端口的客户端都能检索与生成。")
     import socket as _socket
     server_cls = ThreadingHTTPServer
     if ":" in args.host:
-        server_cls = type("DualStackHTTPServer", (ThreadingHTTPServer,), {"address_family": _socket.AF_INET6})
+        server_cls = type("DualStackHTTPServer", (ThreadingHTTPServer,), {"address_family": _socket.AF_INET6})  # type: ignore[assignment]
     server = server_cls((args.host, args.port), Handler)
     _shown = f"[{args.host}]" if ":" in args.host else args.host
     log(f"API 就绪: http://{_shown}:{args.port}  （{count} 条，模型 {MODEL}）")
-    log("  GET  /health")
     log("  POST /search  {\"query\": \"<你的问题>\", \"top_k\": 5}")
     log("  POST /ask     {\"query\": \"<你的问题>\"}  → NDJSON 流")
     try:
@@ -2763,8 +3598,7 @@ def cmd_api():
         server.server_close()
 
 
-# 元数据必填字段；来源字段名可配置，兼容旧索引的 book / source 写法。
-REQUIRED_PAYLOAD_FIELDS = ("chunk_index", "parent_text", "contextual_text")
+# 来源字段名可配置，兼容旧索引的 book / source 写法。
 SOURCE_PAYLOAD_FIELDS = tuple(dict.fromkeys((SOURCE_FIELD, "source", "book")))
 
 
@@ -2778,228 +3612,16 @@ def bad(msg):
     return 1
 
 
-def cmd_health():
-    from qdrant_client import QdrantClient
-    parser = argparse.ArgumentParser(description="RAG 服务健康检查")
-    parser.add_argument("--offline", action="store_true", help="跳过 Ollama / 模型在线检查")
-    parser.add_argument("--timeout", type=int, default=120, help="Ollama 问答超时(秒)，默认 120（冷启动需加载模型）")
-    args = parser.parse_args()
-    fail = 0
-    log("RAG 健康检查")
-    log("\n[1] 配置")
-    # 模型目录判据只有一份：直接问 _require_model_dir（load_embedding_model /
-    # load_reranker_model 用的同一个），避免"health 说 ✅、查询却抛 RuntimeError"。
-    for _path, _what, _hint in (
-        (EMBED_MODEL_PATH, "嵌入", "确认 RAG_EMBED_MODEL_PATH 指向可用的模型目录"),
-        (RERANK_MODEL_PATH, "重排", "确认 RAG_RERANK_MODEL_PATH 指向可用的模型目录"),
-    ):
-        try:
-            _require_model_dir(_path, _what, _hint)
-            ok(f"{_what}模型: {_path}")
-        except RuntimeError as exc:
-            fail += bad(str(exc))
-    # MPS 水印由 torch 读取（不是应用配置，故不进 env_declared_but_unread），但它们是
-    # 本机唯一防 MPS 冻结的安全阀：只设 HIGH 不设 LOW 会让"任何触碰 MPS 的调用"抛
-    # invalid low watermark ratio。删掉 .env 里任意一行都必须在这里被点名。
-    _mps_hi = os.getenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO")
-    _mps_lo = os.getenv("PYTORCH_MPS_LOW_WATERMARK_RATIO")
-    if _mps_hi is not None and _mps_lo is None:
-        log("  ⚠️  设了 PYTORCH_MPS_HIGH_WATERMARK_RATIO 却没有 PYTORCH_MPS_LOW_WATERMARK_RATIO："
-            "PyTorch 的 LOW 默认 1.4 > HIGH，任何触碰 MPS 的调用都会抛 "
-            "invalid low watermark ratio（连 torch.mps.empty_cache() 也会炸）")
-    else:
-        ok(f"MPS 水印: HIGH={_mps_hi or '默认'} LOW={_mps_lo or '默认'}（torch 读取，非应用配置）")
-    ok(f"生成模型: {MODEL}  @  {OLLAMA_BASE_URL}")
-    # 思维链开关的生效值回读：模型侧与页面/API 侧共用一个值，这里只报这一个值。
-    if THINK:
-        log(f"  ⚠️  思维链: 开启（RAG_THINK） —— think=true，页面/API 同步展示；num_ctx={NUM_CTX} num_predict={NUM_PREDICT} 共用")
-    else:
-        log(f"  ℹ️  思维链: 关闭（RAG_THINK） —— think=false，页面与 /ask 不产生思维链输出；num_ctx={NUM_CTX} num_predict={NUM_PREDICT} 固定")
-    if not RAG_USE_CONTEXT:
-        log("  \u26a0\ufe0f  上下文注入: 关闭（RAG_USE_CONTEXT=0） —— 不发资料消息，只发本轮提问")
-    else:
-        sys_note = f"规则 {len(SYSTEM_RULES_PROMPT)} 字" if SYSTEM_RULES_PROMPT else "空"
-        ok(f"上下文注入: 纯资料消息(role={CONTEXT_ROLE}，只含检索 parent_text) + 本轮提问；system={sys_note}")
-    if RERANK_ON == "parent" and RERANK_MAX_LENGTH < PARENT_MAX_TOKENS:
-        log(f"  \u26a0\ufe0f  RERANK_ON=parent 但 RERANK_MAX_LENGTH={RERANK_MAX_LENGTH} < 父块上限 {PARENT_MAX_TOKENS}：父块尾部会被静默截掉")
-    # 校验 rerank 模型实际最大长度
-    try:
-        from transformers import AutoTokenizer
-        rr_tok = AutoTokenizer.from_pretrained(RERANK_MODEL_PATH)
-        model_max_len = getattr(rr_tok, "model_max_length", None)
-        if model_max_len and model_max_len < 1000000:  # 忽略超大默认值（如 10^9）
-            effective_max = min(RERANK_MAX_LENGTH, model_max_len)
-            if RERANK_ON == "parent" and effective_max < PARENT_MAX_TOKENS:
-                log(f"  \u26a0\ufe0f  Rerank 模型最大长度 {model_max_len} 导致有效上限 {effective_max} < 父块上限 {PARENT_MAX_TOKENS}：父块尾部会被静默截掉")
-            elif RERANK_ON == "child" and effective_max < CHILD_MAX_TOKENS:
-                log(f"  \u26a0\ufe0f  Rerank 模型最大长度 {model_max_len} 导致有效上限 {effective_max} < 子块上限 {CHILD_MAX_TOKENS}：子块可能被静默截掉")
-            elif RERANK_MAX_LENGTH > model_max_len:
-                log(f"  \u2139\ufe0f  RERANK_MAX_LENGTH={RERANK_MAX_LENGTH} 超过模型最大长度 {model_max_len}，实际将被截断至 {model_max_len}")
-    except Exception as exc:
-        log(f"  \u26a0\ufe0f  无法校验 rerank 模型最大长度: {type(exc).__name__}: {exc}")
-    if not RRF_DENSE_WEIGHT:
-        log("  \u2139\ufe0f  RRF_DENSE_WEIGHT=0：稠密通道整体退出")
-    if not RRF_SPARSE_WEIGHT:
-        log("  \u2139\ufe0f  RRF_SPARSE_WEIGHT=0：稀疏通道整体退出")
-    ok(f"检索参数: top_k={TOP_K} / 候选池 {RERANK_TOP_K} / 每通道召回 {RECALL_LIMIT} / RRF k={RRF_K} 权重 稠密 {RRF_DENSE_WEIGHT} 稀疏 {RRF_SPARSE_WEIGHT} / rerank {RERANK_ON}（max_length {RERANK_MAX_LENGTH}）")
-    unread = env_declared_but_unread()
-    if unread:
-        log(f"  \u26a0\ufe0f  以下 {len(unread)} 个 .env 变量本应用不读取（写了对本应用无效）: {unread}")
-    else:
-        ok("配置项检查: .env 里声明的检索/生成变量全部被代码读取")
-    log("\n[2] 源文档")
-    try:
-        doc_paths = _document_paths()
-    except Exception as exc:
-        doc_paths = []
-        fail += bad(f"数据目录检查失败: {type(exc).__name__}: {exc}")
-    if doc_paths:
-        names = [os.path.basename(p) for p in doc_paths]
-        ok(f"{DATA_DIR}/ 匹配 {DOC_GLOB!r}: {len(names)} 个（{', '.join(names)}）")
-    log("\n[3] 向量库 Qdrant")
-    qdrant_count = 0
-    client = None
-    coll = None
-    try:
-        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=60)
-        coll = resolve_collection_name(client)
-        if not client.collection_exists(coll):
-            fail += bad( f"集合 {coll} 不存在（索引未构建），请运行: python chatbot.py index" )
-        else:
-            qdrant_count = client.count(collection_name=coll, exact=True).count
-            if qdrant_count > 0:
-                ok(f"{coll} 记录数: {qdrant_count}")
-                if os.path.exists(CHUNKS_JSON):
-                    try:
-                        import json as _json
-                        with open(CHUNKS_JSON, encoding="utf-8") as f:
-                            n_chunks = len(_json.load(f))
-                    except Exception as exc:
-                        fail += bad(f"分块产物 {CHUNKS_JSON} 读取失败: {type(exc).__name__}: {exc} —— 请重跑 process")
-                    else:
-                        if n_chunks == qdrant_count:
-                            ok(f"数量一致: chunks.json {n_chunks} 条 == 集合 {qdrant_count} 条")
-                        else:
-                            fail += bad(f"数量不一致: chunks.json {n_chunks} 条 != 集合 {qdrant_count} 条（请重跑 index）")
-                else:
-                    log(f"  ⏭  跳过数量一致性（找不到 {CHUNKS_JSON}）")
-                sample = client.scroll( collection_name=coll, limit=1, with_payload=True, with_vectors=False )[0]
-                if sample:
-                    meta = sample[0].payload
-                    missing = [k for k in REQUIRED_PAYLOAD_FIELDS if k not in meta]
-                    if not any(f in meta for f in SOURCE_PAYLOAD_FIELDS):
-                        missing.append(SOURCE_FIELD)
-                    if missing:
-                        fail += bad(f"元数据缺字段: {missing}")
-                    else:
-                        ok(f"元数据字段完整（来源字段 {SOURCE_FIELD}）")
-                try:
-                    pts, _ = client.scroll(collection_name=coll, limit=1, with_payload=True, with_vectors=False)
-                    idx_lex = ((pts[0].payload or {}).get(LEXICON_ID_FIELD) if pts else None)
-                    cur_lex = lexicon_fingerprint()
-                    if idx_lex is None:
-                        ok("词表指纹: 索引未记录（旧索引），跳过一致性检查")
-                    elif idx_lex == cur_lex:
-                        ok(f"词表指纹一致: {cur_lex}")
-                    else:
-                        fail += bad(f"词表与索引不一致（索引 {idx_lex} / 当前 {cur_lex}）—— 请运行: python chatbot.py reindex-sparse")
-                except Exception as e:
-                    fail += bad(f"词表一致性检查失败: {e}")
-                # 分块新鲜度：与 stages 的 A 阶段同一判据，在检索侧提前暴露
-                try:
-                    pts, _ = client.scroll(collection_name=coll, limit=1, with_payload=True, with_vectors=False)
-                    idx_fp = ((pts[0].payload or {}).get(CHUNK_FINGERPRINT_FIELD) if pts else None)
-                    cur_fp, _ = _chunking_config_fingerprint()
-                    if idx_fp is None:
-                        log("  ⏭  索引未记录分块指纹（旧索引），跳过分块新鲜度检查")
-                    elif idx_fp == cur_fp:
-                        ok(f"分块指纹一致: {cur_fp}")
-                    else:
-                        fail += bad(f"分块产物与索引不一致（索引 {idx_fp} / 当前 {cur_fp}）—— 检索在用过期分块，请运行: python chatbot.py process && python chatbot.py index")
-                except Exception as e:
-                    fail += bad(f"分块新鲜度检查失败: {e}")
-            else:
-                fail += bad(f"{coll} 为空，请运行: python chatbot.py index")
-    except Exception as e:
-        fail += bad(f"无法连接 Qdrant Docker服务 ({QDRANT_HOST}:{QDRANT_PORT}): {e}")
-    log("\n[4] 混合检索（稠密 + 稀疏）")
-    if client is None or qdrant_count == 0:
-        log("  ⏭  跳过（向量库不可用）")
-    else:
-        try:
-            info = client.get_collection(collection_name=coll)
-            sparse_names = list(info.config.params.sparse_vectors.keys())
-            dense_names = list(info.config.params.vectors.keys())
-            if sparse_names and dense_names:
-                ok(f"集合配置: 稠密 {dense_names} + 稀疏 {sparse_names}")
-            else:
-                fail += bad(f"集合缺少向量空间: 稠密 {dense_names} / 稀疏 {sparse_names}")
-            cov = sample_vector_coverage(client, coll, limit=50)
-            if not cov["miss_dense"] and not cov["miss_sparse"] and cov["n"]:
-                ok(f"抽样 {cov['n']} 条: 稠密/稀疏均已写入（首条稀疏 {cov['first_sparse_terms']} 个 term）")
-            else:
-                fail += bad(f"抽样 {cov['n']} 条中: 缺稠密 {cov['miss_dense']} 条, 缺稀疏 {cov['miss_sparse']} 条（混合检索名存实亡）")
-            pts, _ = client.scroll(collection_name=coll, limit=1, with_payload=True)
-            probe = (pts[0].payload.get("child_text", "")[:80] if pts else "")
-            if probe:
-                res = client.query_points( collection_name=coll, query=sparse_encode(probe), using=SPARSE_VECTOR_NAME, limit=3, )
-                if res.points:
-                    ok(f"稀疏单通道检索可用（{len(res.points)} 条命中，最高分 {res.points[0].score:.2f}）")
-                else:
-                    fail += bad("稀疏单通道检索返回空，稀疏索引可能未生效")
-        except Exception as e:
-            fail += bad(f"混合检索检查失败: {e}")
-    if args.offline:
-        log("\n(offline 模式：跳过 Ollama 在线检查)")
-    else:
-        log("\n[5] Ollama 后端")
-        try:
-            r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
-            if r.status_code == 200:
-                models = [m["name"] for m in r.json().get("models", [])]
-                ok(f"Ollama 可达，已装模型: {models}")
-                # Ollama 的 /api/tags 恒返回 name:tag（无 tag 补 latest），而 MODEL 允许写成
-                # 不带 tag（llama3）。末段含 ":" 才是显式 tag；否则按前缀补 latest 比对，
-                # 否则明明已装也报"未安装"，把 health 引到一次根本不需要的 pull 上。
-                _installed = MODEL in models
-                if ":" not in MODEL.rsplit("/", 1)[-1]:
-                    _installed = _installed or any(m.rsplit(":", 1)[0] == MODEL for m in models)
-                if not _installed:
-                    fail += bad(f"MODEL={MODEL} 未安装，请: ollama pull {MODEL}")
-            else:
-                fail += bad(f"Ollama /api/tags 返回 HTTP {r.status_code}")
-        except Exception as e:
-            fail += bad(f"Ollama 不可达: {e}")
-        log(f"\n[6] 生成模型应答（think:{str(THINK).lower()} 简短问答）")
-        payload = { "model": MODEL, "messages": [{"role": "user", "content": HEALTH_PROBE_QUESTION}], "stream": False, "think": THINK, "options": {"num_predict": 64}, }
-        t0 = time.time()
-        try:
-            r = requests.post(API_URL, json=payload, timeout=args.timeout)
-            elapsed = time.time() - t0
-            data = r.json()
-            if isinstance(data, dict) and data.get("error"):
-                fail += bad(f"模型应答返回错误: {data['error']}")
-            else:
-                reply = (data.get("message", {}) or {}).get("content", "") if isinstance(data, dict) else ""
-                ok(f"应答成功 耗时 {elapsed:.1f}s: {reply[:60]!r}")
-        except requests.exceptions.Timeout:
-            fail += bad(f"模型应答超时({args.timeout}s)——多半是模型冷启动（权重加载慢）：先预热或调大超时，例如:\n      curl -s {API_URL} -d '{{\"model\":\"{MODEL}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":false,\"think\":false}}' >/dev/null\n      python chatbot.py health --timeout 300")
-        except Exception as e:
-            fail += bad(f"模型应答失败({args.timeout}s): {type(e).__name__}: {e}")
-    log("\n" + "=" * 60)
-    if fail:
-        log(f"健康检查失败: {fail} 项")
-        sys.exit(1)
-    else:
-        log("健康检查通过 ✓")
-        sys.exit(0)
-
 
 # ── 工具：分块 A/B 比较 ──
 DEFAULT_B = CHUNKS_JSON
 # 字段名以产物实际结构为准；source 是来源字段，旧产物里叫 book，按 source 归一比较。
 FIELDS = [ "child_text", "parent_text", "source", "chunk_index", "total_chunks", "contextual_text", "id", "parent_id", "parent_chunk_count", ]
 _LEGACY_CHUNK_FIELDS = {"book"}
+# 记录里来源字段的键名由 RAG_SOURCE_FIELD 决定（可能不是 "source"），比较器必须一并放行。
+# 差异比对仍按规范名 "source" 走 _source_of，故这里是"合法的记录键"，不是"参与比对的列"。
+_ALLOWED_CHUNK_FIELDS = set(FIELDS) | _LEGACY_CHUNK_FIELDS | {SOURCE_FIELD}
+_SOURCE_ALIASES = {SOURCE_FIELD, "source", "book"}
 
 
 def load(path):
@@ -3020,10 +3642,10 @@ def show(text, limit=90):
 def check_schema(a, b, path_a, path_b):
     seen = set()
     for rows in (a, b):
-        for r in rows[:50]:
+        for r in rows:
             if isinstance(r, dict):
                 seen |= set(r)
-    unknown = sorted(seen - set(FIELDS) - _LEGACY_CHUNK_FIELDS)
+    unknown = sorted(seen - _ALLOWED_CHUNK_FIELDS)
     if unknown:
         sys.exit(f"❌ 分块产物出现未登记字段 {unknown}（{path_a} / {path_b}）：比较器只遍历 FIELDS，未登记字段会被静默忽略。请先登记进 FIELDS。")
 
@@ -3048,7 +3670,7 @@ def compare_chunks_diff(a, b, allow, path_a, path_b):
         if na != nb:
             ok = False
     n = min(len(a), len(b))
-    diff = {f: [] for f in FIELDS}
+    diff: dict = {f: [] for f in FIELDS}
     for i in range(n):
         ra, rb = a[i], b[i]
         for f in FIELDS:
@@ -3058,6 +3680,11 @@ def compare_chunks_diff(a, b, allow, path_a, path_b):
                 diff[f].append((i, va, vb))
     log("\n[2] 字段差异（按列表位置逐条比对）")
     for f in FIELDS:
+        if n == 0:
+            # 空侧比对：0 差异是"没东西可比"，不是"比过了都一致" —— 报 ✅ 是把无从
+            # 判断伪装成通过（总量行已给正确结论，这里给哑签即可）。
+            log(f"      {f:16s} —（无可比对记录）")
+            continue
         cnt = len(diff[f])
         if cnt == 0:
             log(f"      {f:16s} ✅ 完全一致")
@@ -3082,26 +3709,23 @@ def compare_chunks_diff(a, b, allow, path_a, path_b):
     return 0 if ok else 1
 
 
-def cmd_compare_chunks():
-    ap = argparse.ArgumentParser(description="分块结果 A/B 比较")
-    ap.add_argument("a", help="基线文件（改动前存档的分块产物）")
-    ap.add_argument("b", nargs="?", default=DEFAULT_B, help=f"对照文件（默认 {DEFAULT_B}）")
-    ap.add_argument("--allow", action="append", default=[], help="允许不同的字段名，可重复指定，例如 --allow contextual_text")
-    args = ap.parse_args()
-    unknown = [f for f in args.allow if f not in FIELDS]
+def cmd_compare_chunks(args=None):
+    if args is None:
+        args = _build_parser().parse_args(["compare-chunks"])
+    unknown = [f for f in args.allow if f not in _ALLOWED_CHUNK_FIELDS]
     if unknown:
-        sys.exit(f"❌ --allow 出现未知字段: {unknown}（可用: {FIELDS}）")
+        sys.exit(f"❌ --allow 出现未知字段: {unknown}（可用: {sorted(_ALLOWED_CHUNK_FIELDS)}）")
+    # 自定义来源键名归一到比对列 "source"
+    allow = {("source" if f in _SOURCE_ALIASES else f) for f in args.allow}
     a, b = load(args.a), load(args.b)
-    sys.exit(compare_chunks_diff(a, b, set(args.allow), args.a, args.b))
+    sys.exit(compare_chunks_diff(a, b, allow, args.a, args.b))
 
 
 # ── 工具：稀疏向量重建 ──
-BATCH = 1000
-
-
-def cmd_reindex_sparse():
+def cmd_reindex_sparse(args=None):
     from qdrant_client import QdrantClient, models
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=120)
+    # 批量重建会话较长：客户端给普通查询 2 倍超时，逐页 scroll 沿用 QDRANT_TIMEOUT。
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
     COLL = resolve_collection_name(client)
     info = client.get_collection(COLL)
     total = info.points_count
@@ -3113,15 +3737,33 @@ def cmd_reindex_sparse():
     done = 0
     lexicon_id = lexicon_fingerprint()
     offset = None
+    scroll_failures = 0
     while True:
-        pts, offset = client.scroll( COLL, limit=BATCH, offset=offset, with_payload=True, with_vectors=False, timeout=60 )
+        try:
+            pts, offset = client.scroll( COLL, limit=WRITE_BATCH, offset=offset, with_payload=True, with_vectors=False, timeout=QDRANT_TIMEOUT )
+        except Exception as exc:
+            # scroll 失败推进不了页 → 同一页重试，只重试一次；连败 2 次即熔断。
+            scroll_failures += 1
+            if scroll_failures >= 2:
+                log(f"❌ scroll 连续失败 {scroll_failures} 次（{type(exc).__name__}: {exc}），无法推进，中止")
+                return 1
+            log(f"  ⚠️  scroll 失败（{scroll_failures}/2），重试同一页: {type(exc).__name__}: {exc}")
+            continue
+        scroll_failures = 0
         if not pts:
             break
         ids = [p.id for p in pts]
-        # 与 build_index 同一份文本（_index_text），否则重算的稀疏向量与稠密侧错配
-        points = [ models.PointVectors( id=p.id, vector={SPARSE_VECTOR_NAME: sparse_encode(_index_text(p.payload or {}))}, ) for p in pts ]
-        client.update_vectors(COLL, points=points)
-        client.set_payload(collection_name=COLL, payload={LEXICON_ID_FIELD: lexicon_id}, points=ids)
+        try:
+            # 与 build_index 同一份文本（_index_text），否则重算的稀疏向量与稠密侧错配
+            points = [ models.PointVectors( id=p.id, vector={SPARSE_VECTOR_NAME: sparse_encode(_index_text(p.payload or {}))}, ) for p in pts ]
+            client.update_vectors(COLL, points=points)
+            client.set_payload(collection_name=COLL, payload={LEXICON_ID_FIELD: lexicon_id}, points=ids)
+        except Exception as exc:
+            # 单页失败跳页继续，末尾 done != total 照样返回 1（继续但不静默）。
+            log(f"  ⚠️  批量更新失败，跳过本页 {len(pts)} 条: {type(exc).__name__}: {exc}")
+            if offset is None:
+                break
+            continue
         done += len(pts)
         log(f"  {done}/{total}  ({time.time() - t0:.1f}s)")
         if offset is None:
@@ -3132,8 +3774,8 @@ def cmd_reindex_sparse():
         return 1
     sample, _ = client.scroll(COLL, limit=5, with_vectors=True, timeout=30)
     for p in sample:
-        sp = p.vector.get(SPARSE_VECTOR_NAME)
-        log(f"  校验 point {p.id}: 稠密 {len(p.vector.get(DENSE_VECTOR_NAME, []))} 维, 稀疏 {len(sp.indices) if sp else 0} terms")
+        sp = p.vector.get(SPARSE_VECTOR_NAME)  # type: ignore[union-attr]
+        log(f"  校验 point {p.id}: 稠密 {len(p.vector.get(DENSE_VECTOR_NAME, []))} 维, 稀疏 {len(sp.indices) if sp else 0} terms")  # type: ignore[arg-type, union-attr]
     log(f"完成: {done} 条，耗时 {time.time() - t0:.1f}s")
     return 0
 
@@ -3142,22 +3784,24 @@ def cmd_reindex_sparse():
 # 数据目录与词表路径全部走全局配置，不写死文档名或文件名。
 ALIAS_PATH = ALIASES_FILE
 STOP_PATH = STOPWORDS_FILE
-READ_KWARGS = dict(encoding="utf-8", errors="replace")
 FORBIDDEN_NEGATION = set("不无未莫非没别勿弗毋否亡沒無別罔靡")
 FORBIDDEN_DEGREE = set("很太最更极極甚颇頗稍略愈越挺蛮太殊煞")
-NOISE_CHARS = set( "的了着过们这那一二三四五六七八九十百千万见说道问答叫唤令教使与和在" "是有将把被大小老好众位个名字等来去出入上下前后里外中而又也都便就却" "只遂因故然若且乃其之于以为所曰我你他她它相再从向往到至及并同连皆亦" "复可会要想知听看望走行坐立笑哭怒喜心手头身口眼声气人家儿子们兮乎者" "也矣焉哉尔汝卿彼此谁每各另别样般些点儿" )
+NOISE_CHARS = set( "的了着过们这那一二三四五六七八九十百千万见说道问答叫唤令教使与在和" "是有将把被大小老好众位个名字等来去出入上下前后里外中而又也都便就却" "只遂因故然若且乃其之于以为所曰我你他她它相再从向往到至及并同连皆亦" "复可会要想知听看望走行坐立笑哭怒喜心手头身口眼声气人家儿子们兮乎者" "也矣焉哉尔汝卿彼此谁每各另别样般些点儿" )
 
 
 def die(msg: str) -> None:
+    """致命错误：打日志后终止本次命令行调用。-O 下 raise 不失效（sys.exit 则是真退出）。"""
     log("错误：" + msg)
+    raise SystemExit(1)
 
 
 def load_documents():
+    """读语料文档做词表统计。与分块侧共用 read_document_text：字面量加引号归一这些
+    预处理保持一致——两处各写一套读取逻辑，同一文档在两个入口读出两种文本，词表与
+    入库正文就描述的不是同一份语料。坏字节转成的 \ufffd 这里剥掉（统计词面无意义）。"""
     docs = []
     for p in _document_paths():
-        with open(p, **READ_KWARGS) as fh:
-            text = fh.read()
-        text = text.replace("\ufffd", "")
+        text = read_document_text(p).replace("\ufffd", "")
         docs.append((_document_name(p), text))
     return docs
 
@@ -3189,8 +3833,8 @@ def longest_first_scan(docs, surfaces):
         by_first[s[0]].append(s)
     for ch in by_first:
         by_first[ch].sort(key=len, reverse=True)
-    matched = Counter()
-    crossing = defaultdict(Counter)
+    matched: Counter = Counter()
+    crossing: defaultdict = defaultdict(Counter)
     for _name, text in docs:
         i, n = 0, len(text)
         while i < n:
@@ -3216,7 +3860,7 @@ def longest_first_scan(docs, surfaces):
 
 
 def competitor_windows(docs, surface, surface_set, limit=4, min_count=2):
-    found = Counter()
+    found: Counter = Counter()
     L = len(surface)
     for _name, text in docs:
         start = 0
@@ -3241,13 +3885,13 @@ def competitor_windows(docs, surface, surface_set, limit=4, min_count=2):
     return [(w, n) for w, n in found.most_common() if n >= min_count][:limit]
 
 
-def cmd_verify_lexicon():
-    # main 分发统一 fn() 零参调用，并已把 rest 拼回 sys.argv = ["chatbot.py lexicon", *rest]
-    argv = sys.argv[1:]
-    quiet = "-q" in argv or "--quiet" in argv
-    pos = [a for a in argv if not a.startswith("-")]
-    alias_path = pos[0] if len(pos) > 0 else ALIAS_PATH
-    stop_path = pos[1] if len(pos) > 1 else STOP_PATH
+def cmd_verify_lexicon(args=None):
+    # 参数经 _build_parser 上收（原为手写 sys.argv 解析：-q/--quiet + 两个可选位置参数）
+    if args is None:
+        args = _build_parser().parse_args(["lexicon"])
+    quiet = bool(args.quiet)
+    alias_path = args.alias_path or ALIAS_PATH
+    stop_path = args.stop_path or STOP_PATH
     def out(*a):
         if not quiet:
             log(*a)
@@ -3263,12 +3907,14 @@ def cmd_verify_lexicon():
     out("-" * 78)
     out("[1] 别名表: %s" % alias_path)
     out("-" * 78)
-    groups, ap, aw = parse_aliases(alias_path)
+    groups, ap = parse_aliases(alias_path)
     problems += ap
-    warnings += aw
     if not groups:
-        die("别名表为空或无法解析")
-        return 1
+        # 问题清单原本只在末尾统一打印：die 在这里先退出，根因（哪行没解析出来）就被吞，
+        # 只剩"为空"这句结果，照着输出都不知道该改哪一行。
+        for p in problems:
+            log(f"  ❌ {p}")
+        die("别名表为空或无法解析（根因见上）")
     surfaces = []
     for g in groups:
         surfaces.append(g["canonical"])
@@ -3347,6 +3993,7 @@ def cmd_verify_lexicon():
         first_idx[s[0]].append(s)
     for ch in first_idx:
         first_idx[ch].sort(key=len, reverse=True)
+    canon_set = {g["canonical"] for g in groups}
     def normalize(text, identity_canonical=True):
         out_chars, i, n = [], 0, len(text)
         while i < n:
@@ -3364,7 +4011,6 @@ def cmd_verify_lexicon():
                 out_chars.append(text[i])
                 i += 1
         return "".join(out_chars)
-    canon_set = {g["canonical"] for g in groups}
     sample = []
     for _name, text in docs:
         step = max(1, len(text) // 120000)
@@ -3396,7 +4042,7 @@ def cmd_verify_lexicon():
     if normalize(demo) == normalize(demo, identity_canonical=False):
         warnings.append("参考实现的正/反例输出相同，说明该样例没覆盖到子串陷阱")
     # 对拍只在"校验的正是线上加载的那张表"时才有意义：normalize_aliases 读的是模块级
-    # ALIASES_FILE/_LEXICON，传入自定义路径时线上实现根本没换表，硬比只会报假"分叉"。
+    # ALIASES_FILE，传入自定义路径时线上实现根本没换表，硬比只会报假"分叉"。
     same_table = os.path.abspath(alias_path) == os.path.abspath(ALIASES_FILE)
     if not same_table or not ALIASES_ENABLED:
         out("与线上实现对拍：跳过（校验 %s；线上加载 %s，别名开关 %s）" % (
@@ -3467,7 +4113,7 @@ def cmd_verify_lexicon():
 
 
 # ── 工具：阶段状态与最小重跑指引 ──
-def cmd_stages():
+def cmd_stages(args=None):
     """逐阶段比对指纹，给出最小重跑命令。
     A 分块（语料/切分变 → process） B 稠密（换模型/新内容 → index 增量）
     C 稀疏（词表/BM25/编码变 → reindex-sparse） D 入库（集合缺失/点数不符 → index）"""
@@ -3475,78 +4121,110 @@ def cmd_stages():
     cd_unknown = False
 
     log("[A] 分块产物")
-    if not os.path.exists(CHUNKS_META_JSON):
-        stale.append("A"); log("  ❌ 缺少元信息指纹 -> 需要: python chatbot.py process")
+    # 产物只读一次，A/B/C/D 共用同一份数据：各段各自再 open 一遍，文件截断/损坏时就出现
+    # "同一份文件半截读得出、半截读不出"的混乱结论。读失败 = 产物坏了，B/D 都判不了。
+    chunks = None
+    read_failed = False
+    if os.path.exists(CHUNKS_JSON):
+        try:
+            with open(CHUNKS_JSON, encoding="utf-8") as f:
+                chunks = json.load(f)
+        except Exception as exc:
+            log(f"  ⚠️  读取 {CHUNKS_JSON} 失败（产物可能损坏，重跑 process 修复）: {type(exc).__name__}: {exc}")
+            read_failed = True
+            cd_unknown = True
+    n_chunks = len(chunks) if chunks is not None else None
+    if read_failed:
+        # chunks 读坏时 meta 仍可能是好的：只比 meta 会打出"A ✅ 新鲜"，与上方⚠️
+        # 自相矛盾（坏产物被报成新鲜），D 段也会因拿不到点数而无从比对。坏产物 = A 过期。
+        stale.append("A")
+        log("  ❌ chunks.json 不可读（见上方）-> 需要: python chatbot.py process")
     else:
-        with open(CHUNKS_META_JSON, encoding="utf-8") as f:
-            meta = json.load(f)
-        fingerprint, _ = _chunking_config_fingerprint()
-        if meta.get("fingerprint") != fingerprint:
-            stale.append("A"); log(f"  ❌ 切分代码/参数指纹不一致（{meta.get('fingerprint')} -> {fingerprint}）-> 需要: process")
-        else:
-            try:
-                paths = _document_paths()
-                old_sources = meta.get("sources") if "sources" in meta else meta.get("books")
-                if old_sources != _sources_fingerprint(paths):
-                    stale.append("A"); log("  ❌ 语料内容已变化 -> 需要: process")
-                else:
-                    log(f"  ✅ 新鲜（{len(paths)} 个文档，指纹 {fingerprint}）")
-            except Exception as exc:
-                stale.append("A"); log(f"  ❌ 语料检查失败: {type(exc).__name__}: {exc}")
+        try:
+            meta = verify_chunks_freshness()
+            fingerprint = meta.get("fingerprint")
+            old = meta.get("sources") if "sources" in meta else meta.get("books") or {}
+            log(f"  ✅ 新鲜（{len(old)} 个文档，指纹 {fingerprint}）")
+        except Exception as exc:
+            stale.append("A")
+            log(f"  ❌ {exc}")
 
     log("[B] 稠密向量缓存")
     if "A" in stale:
         log("  ⏭  A 过期，先重跑 process 再谈 B")
     elif not EMBED_CACHE_ENABLED:
         log("  ⏭  RAG_EMBED_CACHE=0：无缓存，index 每次全量重算")
-    elif not os.path.exists(CHUNKS_JSON):
-        log("  ⏭  缺 chunks.json，先跑 process")
+    elif chunks is None:
+        log("  ⏭  缺/坏 chunks.json，先跑 process（见上方提示）")
     else:
-        precision = _index_cache_precision()
-        preferred = _embed_cache_file(precision)
-        if not os.path.exists(preferred):
-            stale.append("B")
-            log(f"  ❌ 缺少当前设备精度（{precision}）的缓存文件 {os.path.basename(preferred)} -> index 会全量重算稠密向量")
-        else:
-            try:
-                cache = _load_embed_cache(preferred)
-                with open(CHUNKS_JSON, encoding="utf-8") as f:
-                    chunks = json.load(f)
-                need = sum(1 for c in chunks if _embed_cache_key(_index_text(c)) not in cache)
-                if need:
-                    # 缓存里缺条目 = index 仍要重算 need 条：不标 B 会让 A/C/D 全新鲜时
-                    # 打出"无需重跑"，与上面这行自相矛盾（同一轮日志两个结论）。
-                    stale.append("B")
-                    log(f"  ⚠️  缓存 {os.path.basename(preferred)}（{precision}）：{len(cache)} 条，缺 {need}/{len(chunks)} 条（增量）→ 需要: python chatbot.py index")
-                else:
-                    log(f"  ✅ 缓存 {os.path.basename(preferred)}（{precision}）：{len(cache)} 条；当前产物 0/{len(chunks)} 条需重算")
-            except Exception as exc:
-                log(f"  ⚠️  缓存检查失败（不影响 A/C/D 判定）: {type(exc).__name__}: {exc}")
+        try:
+            keys = [_embed_cache_key(_index_text(c)) for c in chunks]
+            # 与 index 共用 _inspect_embed_caches / _full_embed_cache：这里若再按设备预测
+            # 一次精度，就会与 index 的实际选择分叉（同一轮日志给出两个结论），而且预测
+            # 要 import torch —— 只为读一个文件名，白花 200MB。
+            cands = _inspect_embed_caches(keys)
+            hit = _full_embed_cache(cands)
+            if hit is not None:
+                precision, path, cache, _missing = hit
+                log(f"  ✅ 缓存 {os.path.basename(path)}（{precision}）：{len(cache)} 条全部命中；当前产物 0/{len(chunks)} 条需重算")
+            else:
+                # 没有完整覆盖的那份 = index 仍要重算：不标 B 会让 A/C/D 全新鲜时打出
+                # "无需重跑"，与这一行自相矛盾（同一轮日志两个结论）。
+                stale.append("B")
+                detail = "，".join(
+                    f"{p} 缺 {len(m)}/{len(chunks)} 条" for p, _f, _c, m in cands
+                ) or "磁盘上没有任何缓存文件"
+                log(f"  ❌ 没有一份缓存完整覆盖当前产物（{detail}）-> 需要: python chatbot.py index")
+        except Exception as exc:
+            # 检查失败 = B 没验证过：不置位会让 A/C/D 全新鲜时打出"无需重跑"、exit 0，
+            # 而 B 正可能过期（判据恒真式假新鲜）。CD 类"未验证"与"已过期"同权计数。
+            cd_unknown = True
+            log(f"  ⚠️  缓存检查失败（B 未验证，不算新鲜）: {type(exc).__name__}: {exc}")
 
     log("[C] 稀疏向量（词表/BM25）与 [D] 入库（Qdrant）")
+    # 产物读取与 Qdrant 连接分开兜底：chunks.json 截断/损坏是"产物坏了"，
+    # 合并在一个 except 里一律报"连不上 Qdrant"会把根因指错。
     try:
         from qdrant_client import QdrantClient
-        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=30)
+        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
         coll = resolve_collection_name(client)
+        if _state_ref().alias_degraded:
+            log(f"  ⚠️  集合别名不可用，直接读 {COLLECTION_NAME}：重跑 index 切别名后不会自动跟随")
         if not client.collection_exists(coll):
-            stale.append("D"); log("  [D] ❌ 集合不存在 -> 需要: python chatbot.py index")
+            stale.append("C")
+            stale.append("D")
+            log("  [C] ❌ 集合不存在，稀疏向量随之不存在 -> 需要: python chatbot.py index")
+            log("  [D] ❌ 集合不存在 -> 需要: python chatbot.py index")
         else:
             qd_count = client.count(collection_name=coll, exact=True).count
-            pts, _ = client.scroll(collection_name=coll, limit=1, with_payload=True) if qd_count else ([], None)
-            idx_lex = (pts[0].payload or {}).get(LEXICON_ID_FIELD) if pts else None
             lex_now = lexicon_fingerprint()
-            if idx_lex is None:
-                stale.append("C"); log("  [C] ❌ 索引未记录词表指纹（旧索引）-> 需要: reindex-sparse")
-            elif idx_lex != lex_now:
-                stale.append("C"); log(f"  [C] ❌ 词表/稀疏编码指纹不一致（索引 {idx_lex} / 当前 {lex_now}）-> 需要: reindex-sparse")
+            if qd_count == 0:
+                # 空集合没有点可比：报"旧索引/不一致"会把根因指错（真正的问题是没入库，
+                # D 段已给出 index；词表指纹也随下次 index 一并写入）。
+                log("  [C] ⏭ 集合为空，词表指纹无从比对（随 D/入库一并写入）")
             else:
-                log("  [C] ✅ 新鲜（稠密向量不受影响）")
-            n_chunks = None
-            if os.path.exists(CHUNKS_JSON):
-                with open(CHUNKS_JSON, encoding="utf-8") as f:
-                    n_chunks = len(json.load(f))
-            if n_chunks is not None and qd_count != n_chunks:
-                stale.append("D"); log(f"  [D] ❌ 点数不一致（集合 {qd_count} / 产物 {n_chunks}）-> 需要: index")
+                # 全量滚动而非抽首点：reindex-sparse 逐页原地更新，中断/跳页留下
+                # "已更新前缀 + 旧指纹后缀"，scroll 首点恒属前缀 —— 抽样必过、
+                # 旧稀疏向量静默参与融合（闸门侧同款缺陷，共用 _distinct_lexicon_ids）。
+                lex_ids = _distinct_lexicon_ids(client, coll)
+                if len(lex_ids) > 1:
+                    stale.append("C")
+                    log(f"  [C] ❌ 集合内词表指纹混合（{dict(lex_ids)}，reindex-sparse 中断/跳页残留）-> 需要: reindex-sparse")
+                elif lex_ids[0][0] is None:
+                    stale.append("C")
+                    log("  [C] ❌ 索引未记录词表指纹（旧索引）-> 需要: reindex-sparse")
+                elif lex_ids[0][0] != lex_now:
+                    stale.append("C")
+                    log(f"  [C] ❌ 词表/稀疏编码指纹不一致（索引 {lex_ids[0][0]} / 当前 {lex_now}）-> 需要: reindex-sparse")
+                else:
+                    log("  [C] ✅ 新鲜（稠密向量不受影响）")
+            if n_chunks is None:
+                # 产物缺失/不可读（A 段已判）：点数无从比对，绝不能落进 else 打"D ✅"。
+                cd_unknown = True
+                log(f"  [D] ⏭ 产物缺失/不可读，点数无法比对（集合 {qd_count} 条，先跑 process，见 A 段）")
+            elif qd_count != n_chunks:
+                stale.append("D")
+                log(f"  [D] ❌ 点数不一致（集合 {qd_count} / 产物 {n_chunks}）-> 需要: index")
             else:
                 log(f"  [D] ✅ 集合 {coll} 共 {qd_count} 条")
     except Exception as exc:
@@ -3563,13 +4241,42 @@ def cmd_stages():
     elif "C" in stale:
         log("最小重跑: python chatbot.py reindex-sparse")
     else:
-        # stale 为空但 Qdrant 没连上：C/D 没验过，绝不能落到上面的"全部新鲜"。
-        log("C/D 未能验证（Qdrant 不可达）→ 恢复后重跑: python chatbot.py stages")
-    return 0
+        # stale 为空但有阶段没验过：绝不能落到上面的"全部新鲜"。
+        log("有阶段未能完成验证（原因见上）→ 恢复后重跑: python chatbot.py stages")
+    # 退出码与 lexicon/compare-chunks 对齐：有阶段过期或未验证 = 1，全新鲜才 0，
+    # 自动化才能用退出码判断"要不要重跑"（以前恒 0，判据形同虚设）。
+    return 1 if (stale or cd_unknown) else 0
 
 
 # ── 命令分发 ──
-COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "api": cmd_api, "health": cmd_health, "reindex-sparse": cmd_reindex_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
+COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "api": cmd_api, "reindex-sparse": cmd_reindex_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
+
+
+def _build_parser():
+    """子命令解析器：命令集的单点真相 = COMMANDS（usage 与分发共用同一张表）。
+
+    迁移前每个带参命令自己 new ArgumentParser 再 parse_args()——"一个命令有哪些参数"
+    散在 4 处，帮助也各说各话。两处有意的行为变化（都从静默变报错）：
+      - `process --help` 以前被零参命令静默忽略（照跑），现在打印该子命令的帮助
+      - `lexicon a b c` 第三个位置参数以前被静默丢弃，现在 unrecognized arguments
+    """
+    parser = argparse.ArgumentParser(prog="chatbot.py", add_help=False)
+    subs = parser.add_subparsers(dest="command")
+    descriptions = {"api": "RAG 知识库 HTTP API", "compare-chunks": "分块结果 A/B 比较"}
+    for name in COMMANDS:
+        sub = subs.add_parser(name, add_help=True, description=descriptions.get(name))
+        if name == "api":
+            sub.add_argument("--host", default=os.getenv("RAG_API_HOST", "127.0.0.1"), help="监听地址（默认 127.0.0.1 仅本机；确需远程访问再显式设 --host 0.0.0.0 或 RAG_API_HOST，并设 RAG_API_KEY 启用鉴权）")
+            sub.add_argument("--port", type=int, default=env_int_min("RAG_API_PORT", 8000, 1))
+        elif name == "compare-chunks":
+            sub.add_argument("a", help="基线文件（改动前存档的分块产物）")
+            sub.add_argument("b", nargs="?", default=DEFAULT_B, help=f"对照文件（默认 {DEFAULT_B}）")
+            sub.add_argument("--allow", action="append", default=[], help="允许不同的字段名，可重复指定，例如 --allow contextual_text")
+        elif name == "lexicon":
+            sub.add_argument("-q", "--quiet", action="store_true", help="只报告问题，不打印正常明细")
+            sub.add_argument("alias_path", nargs="?", default=None, help=f"别名表路径（默认 {ALIAS_PATH}）")
+            sub.add_argument("stop_path", nargs="?", default=None, help=f"停用词路径（默认 {STOP_PATH}）")
+    return parser
 
 
 def usage():
@@ -3584,13 +4291,26 @@ def main(argv=None):
         usage()
         return 0 if argv else 1
     name, rest = argv[0], argv[1:]
-    fn = COMMANDS.get(name)
-    if fn is None:
+    if name not in COMMANDS:
         log(f"未知命令: {name}")
         usage()
         return 1
+    # 旧协议保留：子命令运行期间 sys.argv 形态为 ["chatbot.py <name>", *rest]。参数已
+    # 上收到 _build_parser，这条改写不再服务于解析，但调试/第三方脚本读 sys.argv 仍一致。
     sys.argv = [f"chatbot.py {name}"] + rest
-    result = fn()
+    try:
+        ns = _build_parser().parse_args([name, *rest])
+    except SystemExit as exc:
+        # argparse 的 --help(0)/参数错误(2)：从"就地终止进程"改为经 main 返回，退出码不变。
+        return int(exc.code) if exc.code is not None else 0
+    try:
+        result = COMMANDS[ns.command](ns)
+    except Exception as exc:
+        # 命令级兜底：受控失败（摘要 + 完整栈 + 退出码 1），不再裸 traceback 中断。
+        # SystemExit 不是 Exception 子类，_qdrant_gate 等显式 sys.exit 的退出码不受影响。
+        log(f"❌ 命令 {name} 执行失败: {type(exc).__name__}: {exc}")
+        log(traceback.format_exc().rstrip())
+        return 1
     return int(result) if isinstance(result, int) else 0
 
 

@@ -28,6 +28,11 @@
 
 FROM python:3.10-slim-bookworm
 
+# stdout 不缓冲：非 logging 的 print（jieba 初始化行等）在容器里默认块缓冲，
+# 崩溃/OOM 时最后一批输出整段丢失，而运行日志是唯一的现场。
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 ARG TARGETARCH
 ARG QDRANT_VERSION=v1.19.1
 ARG OLLAMA_VERSION=0.34.4
