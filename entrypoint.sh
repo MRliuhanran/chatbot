@@ -24,6 +24,28 @@ _pid_alive() {
     return 0
 }
 
+# ── 0.1b 等待后台 HTTP 服务就绪（qdrant / ollama 共用一份）──────────────────
+# 两段启动块完全同构：轮询 healthz → 进程死则 dump 日志退出 → 60 秒超时同样处理。
+# 旧写法逐行复制，改一处漏一处（例如只给其中一段加存活判据）。name/logfile 参数
+# 让各自的日志文案与日志文件保持不变。
+_wait_http_ready() {
+    local _name="$1" _url="$2" _pid="$3" _logf="$4" _ready=0 _i
+    for _i in $(seq 1 60); do
+        if curl -fsS "${_url}" >/dev/null 2>&1; then _ready=1; break; fi
+        if ! _pid_alive "${_pid}"; then
+            _log "❌ ${_name} 异常退出，最后 50 行日志："
+            tail -n 50 "${_logf}"
+            exit 1
+        fi
+        sleep 1
+    done
+    if [ "${_ready}" != 1 ]; then
+        _log "❌ ${_name} 60 秒未就绪，最后 50 行日志："
+        tail -n 50 "${_logf}"
+        exit 1
+    fi
+}
+
 # ── 0.2 从 .env 补齐本脚本要用的变量（与 python-dotenv 同语义）───────────────
 # 旧写法只特判 MODEL 一行，于是 RAG_HTTP_PORT / RAG_SKIP_MODEL_PULL / HF_ENDPOINT 等
 # 写进 .env 对本脚本**静默无效**（端口仍是 7860）—— 而本项目配置的唯一入口就是 .env。
@@ -122,41 +144,13 @@ export QDRANT__STORAGE__STORAGE_PATH="${QDRANT__STORAGE__STORAGE_PATH:-/app/qdra
 /opt/qdrant/qdrant --config-path /app/qdrant_config/config.yaml >/tmp/qdrant.log 2>&1 &
 _qdrant_pid=$!
 _log "qdrant 启动中（storage=${QDRANT__STORAGE__STORAGE_PATH}）"
-_ready=0
-for _i in $(seq 1 60); do
-    if curl -fsS http://127.0.0.1:6333/healthz >/dev/null 2>&1; then _ready=1; break; fi
-    if ! _pid_alive "${_qdrant_pid}"; then
-        _log "❌ qdrant 异常退出，最后 50 行日志："
-        tail -n 50 /tmp/qdrant.log
-        exit 1
-    fi
-    sleep 1
-done
-if [ "${_ready}" != 1 ]; then
-    _log "❌ qdrant 60 秒未就绪，最后 50 行日志："
-    tail -n 50 /tmp/qdrant.log
-    exit 1
-fi
+_wait_http_ready qdrant http://127.0.0.1:6333/healthz "${_qdrant_pid}" /tmp/qdrant.log
 _log "qdrant 就绪（http://127.0.0.1:6333）"
 
 # ── 2. Ollama ──────────────────────────────────────────────────────────────
 ollama serve >/tmp/ollama.log 2>&1 &
 _ollama_pid=$!
-_ready=0
-for _i in $(seq 1 60); do
-    if curl -fsS http://127.0.0.1:11434/api/version >/dev/null 2>&1; then _ready=1; break; fi
-    if ! _pid_alive "${_ollama_pid}"; then
-        _log "❌ ollama 异常退出，最后 50 行日志："
-        tail -n 50 /tmp/ollama.log
-        exit 1
-    fi
-    sleep 1
-done
-if [ "${_ready}" != 1 ]; then
-    _log "❌ ollama 60 秒未就绪，最后 50 行日志："
-    tail -n 50 /tmp/ollama.log
-    exit 1
-fi
+_wait_http_ready ollama http://127.0.0.1:11434/api/version "${_ollama_pid}" /tmp/ollama.log
 _log "ollama 就绪（http://127.0.0.1:11434, models=${OLLAMA_MODELS}）"
 
 # ── 3. 嵌入/重排权重：不打进镜像，启动时按需下载（后台，不占住 7860）───────────

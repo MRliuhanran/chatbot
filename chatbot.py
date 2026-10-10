@@ -167,7 +167,12 @@ def get_logger(name):
         fh = _file_handler()
         if fh is not None:
             logger.addHandler(fh)
-        logger.setLevel(os.getenv("RAG_LOG_LEVEL", "INFO").strip().upper() or "INFO")
+        _lvl = os.getenv("RAG_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+        if _lvl not in logging._nameToLevel:
+            # 一个笔误不该让所有命令起不来（import 期就崩）：告警 + 回退 INFO。
+            logging.getLogger().warning("未知 RAG_LOG_LEVEL=%r，回退到 INFO（可用: DEBUG/INFO/WARNING/ERROR/CRITICAL）", _lvl)
+            _lvl = "INFO"
+        logger.setLevel(_lvl)
         logger.propagate = False
     return logger
 console = get_logger("console")
@@ -395,8 +400,8 @@ RERANK_BATCH = env_int_min("RAG_RERANK_BATCH", 32, 1)  # padding 隔离下分数
 RERANK_MAX_LENGTH = env_int_min("RAG_RERANK_MAX_LENGTH", 384, 1)
 RERANK_ON = env_choice("RAG_RERANK_ON", "child", ("child", "parent"))
 PRELOAD_MODELS = env_bool("RAG_PRELOAD", True)  # api/serve 启动时后台预热模型与词典，首查询冷加载提前到启动期
-CHILD_MAX_TOKENS = env_int("RAG_CHILD_MAX_TOKENS", 128)
-PARENT_MAX_TOKENS = env_int("RAG_PARENT_MAX_TOKENS", 512)
+CHILD_MAX_TOKENS = env_int_min("RAG_CHILD_MAX_TOKENS", 128, 1)
+PARENT_MAX_TOKENS = env_int_min("RAG_PARENT_MAX_TOKENS", 512, 1)
 CHUNK_OVERLAP = env_int("RAG_CHUNK_OVERLAP", 32)
 PARENT_MIN_TOKENS = env_int("RAG_PARENT_MIN_TOKENS", 192)
 CHILD_MIN_TOKENS = env_int("RAG_CHILD_MIN_TOKENS", 32)
@@ -404,7 +409,7 @@ if CHILD_MAX_TOKENS > PARENT_MAX_TOKENS:
     raise ValueError(f"RAG_CHILD_MAX_TOKENS={CHILD_MAX_TOKENS} 不能大于 RAG_PARENT_MAX_TOKENS={PARENT_MAX_TOKENS}")
 SEMANTIC_THRESHOLD = env_float("RAG_SEMANTIC_THRESHOLD", 0.6)
 SEMANTIC_MIN_CHARS = env_int("RAG_SEMANTIC_MIN_CHARS", 500)
-EMBED_BATCH_SIZE = env_int("RAG_EMBED_BATCH_SIZE", 64)
+EMBED_BATCH_SIZE = env_int_min("RAG_EMBED_BATCH_SIZE", 64, 1)
 SEMANTIC_EMBED_DEVICE = os.getenv("SEMANTIC_EMBED_DEVICE", "")  # 空=自动选设备（MPS 优先），见 get_device()
 INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
 QDRANT_HOST = os.getenv("QDRANT_HOST") or os.getenv("RAG_QDRANT_HOST") or "localhost"
@@ -2417,6 +2422,12 @@ def _count_tokens(tok, text):
 
 def _get_gen_tokenizer():
     state = _state_ref()
+    # 快路径无锁读引用：CPython 下属性读是原子的，tokenizer 一旦挂好就是常量，后续
+    # estimate_tokens 紧循环（_cut_to_tokens 二分、message_tokens 逐条）不再每步取锁。
+    # 锁只保护"首次加载"，失败（gen_tokenizer=None）仍退 lock 路径、不重试。
+    tok = state.gen_tokenizer
+    if tok is not None:
+        return tok
     with state.gen_tokenizer_lock:
         if state.gen_tokenizer_tried:
             return state.gen_tokenizer
@@ -2542,13 +2553,17 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
                     cur = sum(kept_toks) + (len(kept) - 1) * sep_tok
                     k = len(kept)
                     while k > 1:
-                        cur -= kept_toks[k - 1] + sep_tok
+                        k -= 1
+                        cur -= kept_toks[k] + sep_tok
                         if sys_tok + h_tok + q_tok + cur <= cap:
                             break
-                        k -= 1
                     kept = kept[:k]
                     context = "\n\n".join(kept)
                     ctx_tokens = estimate_tokens(context)
+                    # 运行计数 cur 与实际拼接必须一致，否则"整条从尾部丢"的记账就是错的
+                    # （离一 bug 会让 kept 多留一条、cur 却已扣掉它）。raise 而非 assert：-O 下不失效。
+                    if ctx_tokens != cur:
+                        raise RuntimeError(f"资料裁剪记账不一致: 运行计数 cur={cur} 与整条拼接 {ctx_tokens}（块数 {len(kept)}）")
                     allow = max(0, cap - sys_tok - h_tok - q_tok)
                     if ctx_tokens > allow:
                         context = _cut_to_tokens(context, allow)
@@ -2575,6 +2590,10 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
     if context and role != "system":
         out.append({"role": role, "content": context})
     out.append({"role": "user", "content": query})
+    # 硬上界不变量：整条 prompt 估算 token 恒 ≤ 输入上界（AGENTS 明文）。
+    # raise 而非 assert：-O 下不失效；估算口径与装配同源，正常路径恒成立，越界即装配 bug。
+    if cap is not None and message_tokens(out) > cap:
+        raise RuntimeError(f"整条 prompt 估算 {message_tokens(out)} tok 超过输入上界 {cap}")
     return { "messages": out, "system_text": system, "context_text": context, "dropped_messages": dropped_messages, "used_tokens": h_tok, "context_tokens": ctx_tokens, "budget": budget, "truncated": truncated, "truncated_user": truncated_user, "input_cap": cap, "cap_trimmed": cap_trimmed, "frame_truncated": frame_truncated, "context_truncated": context_truncated, "context_partial": context_partial, "context_docs_kept": context_docs_kept, "query_truncated": query_truncated, }
 
 
@@ -2649,12 +2668,6 @@ TRACE_NOTES = {
 }
 
 
-def sample_vector_coverage(client, collection, limit=100):
-    pts, _ = client.scroll(collection_name=collection, limit=limit, with_payload=False, with_vectors=True)
-    first_sparse = pts[0].vector.get(SPARSE_VECTOR_NAME) if pts else None
-    return { "n": len(pts), "miss_dense": sum(1 for p in pts if not p.vector.get(DENSE_VECTOR_NAME)), "miss_sparse": sum(1 for p in pts if not p.vector.get(SPARSE_VECTOR_NAME)), "first_sparse_terms": len(first_sparse.indices) if first_sparse is not None else 0, }
-
-
 def chunk_from_payload(payload, point_id):
     payload = payload or {}
     out = {k: payload.get(f, d) for f, k, d in _PAYLOAD_SPEC}
@@ -2681,7 +2694,7 @@ class RAGEngine:
         self._collection_name = COLLECTION_NAME
         self._lexicon_checked = False
         self._chunk_fp_checked = False
-        self._empty_warned = False
+        self._empty_warned = {}  # 集合名 -> 已告警过：空回取告警按集合记，别名切新集合后不会被旧告警状态压掉
         # 加载（懒初始化）与推理分开两把锁：加载慢、推理短，共用一把会拖慢并发查询。
         # 查询侧前向/rerank 用推理锁串行（MPS 单模型不做真并行），加载持初始化锁。
         self._model_init_lock = threading.Lock()
@@ -2815,11 +2828,11 @@ class RAGEngine:
         if not points:
             # 命中 id 回取为空：集合为空或索引正在重建。不再用 id=0 探针判断——id 0 缺失时
             # 旧写法会把非空集合误判为空并静默丢掉全部命中。
-            if not self._empty_warned:
+            if not self._empty_warned.get(collection):
                 log(f"⚠️  集合 {collection} 按命中 id 回取为空，请确认已运行: python chatbot.py index")
-                self._empty_warned = True
+                self._empty_warned[collection] = True
             return {}
-        self._empty_warned = False
+        self._empty_warned.pop(collection, None)
         # 分块/词表指纹核对由 hybrid_search 开跑前的 _gate_check_collection_fingerprint 承担
         # （fail-closed 且只查一次）；这里只做按 id 精确回取，不再重复取号。
         return {p.id: chunk_from_payload(p.payload, p.id) for p in points}
@@ -3612,17 +3625,6 @@ def cmd_api(args=None):
 
 # 来源字段名可配置，兼容旧索引的 book / source 写法。
 SOURCE_PAYLOAD_FIELDS = tuple(dict.fromkeys((SOURCE_FIELD, "source", "book")))
-
-
-# ── 工具：健康检查 ──
-def ok(msg):
-    log(f"  \u2705 {msg}")
-
-
-def bad(msg):
-    log(f"  \u274c {msg}")
-    return 1
-
 
 
 # ── 工具：分块 A/B 比较 ──
