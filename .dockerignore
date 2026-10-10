@@ -30,3 +30,15 @@ snapshots/
 models/
 artifacts/embeddings/
 artifacts/docs/
+# Qdrant WAL 大分段：Qdrant 启动时靠 wal/first-index 重建，段内数据已落 segments。
+# 本机实测：仅保留 first-index、删掉 closed-*/open-*，22019 点全部健在、状态 green；
+# 而整个 wal/ 目录缺失会让 Qdrant 直接 panic "Can't init WAL: NotFound" —— 故
+# first-index 必须保留，绝不能用 qdrant_storage/**/wal/ 这种把整个目录排掉的写法。
+# 这些文件各 32MB 且每跑一次 Qdrant 就变，随镜像携带纯属抖动。两条写法并存是为兼容
+# 不同 Docker 版本的 ** 语义。
+# ⚠️ 前提：打包（docker build）前 Qdrant 必须已优雅落盘，否则未刷入 segments 的操作只
+# 存在于这些 open-* 里，排除即静默丢数据（会由点位数与 chunks 记录数的校验兜住）。
+qdrant_storage/**/wal/closed-*
+qdrant_storage/**/wal/open-*
+qdrant_storage/collections/*/*/wal/closed-*
+qdrant_storage/collections/*/*/wal/open-*

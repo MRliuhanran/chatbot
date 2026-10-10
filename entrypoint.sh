@@ -148,6 +148,12 @@ _wait_http_ready qdrant http://127.0.0.1:6333/healthz "${_qdrant_pid}" /tmp/qdra
 _log "qdrant 就绪（http://127.0.0.1:6333）"
 
 # ── 2. Ollama ──────────────────────────────────────────────────────────────
+# 生成模型常驻：Ollama 默认 5 分钟卸载，闲置后再问一次就要重新加载 3.4GB（首字多等数秒）。
+# 这是**服务端**变量，客户端 .env 对它无效（.env 里已注明）；容器内 ollama serve 由本脚本
+# 拉起，故在此显式导出默认值 —— 若部署方在 .env 设了 OLLAMA_KEEP_ALIVE，_load_dotenv
+# 已导出，${VAR:-...} 会沿用而非覆盖。峰值内存不变（提问时 LLM 与检索模型本就同时
+# 驻留），只提高闲置占用。
+export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 ollama serve >/tmp/ollama.log 2>&1 &
 _ollama_pid=$!
 _wait_http_ready ollama http://127.0.0.1:11434/api/version "${_ollama_pid}" /tmp/ollama.log
@@ -161,13 +167,14 @@ _log "ollama 就绪（http://127.0.0.1:11434, models=${OLLAMA_MODELS}）"
 # 会让应用在 checkpoint 写到一半时就把模型读进去（半截权重），失败分支再 rm -rf 更会
 # 删掉正被 mmap 的目录。暂存 + 改名让"就绪"只剩一个含义：清单文件全部非空。
 _download_model() {
-    _name="$1"; _repo="$2"; _weight="$3"; shift 3
-    _dir="/app/models/${_name}"
+    # 全部变量 local：两个模型现在**并发**调用本函数（见 _download_models），旧的函数级
+    # 全局变量会互相踩（_name/_dir/_ok/_tmp 被对方覆盖 → 串目录、错判就绪）。
+    local _name="$1" _repo="$2" _weight="$3"; shift 3
+    local _dir="/app/models/${_name}"
+    local _f _ok=1 _miss="" _tmp
     # 就绪判据 = 清单文件全部非空。只看 checkpoint 会把"权重在、tokenizer.json 缺"的
     # 半成品判成就绪，此后每次启动都被这里短路，永不重下，from_pretrained 永久失败。
     # 不在首个缺失处 break：要把缺的全列出来，否则失败日志只说"失败"、不给可执行信息。
-    _ok=1
-    _miss=""
     for _f in "$@"; do
         if [ ! -s "${_dir}/${_f}" ]; then _ok=0; _miss="${_miss} ${_f}"; fi
     done
@@ -182,16 +189,21 @@ _download_model() {
     _tmp="${_dir}.part"
     rm -rf "${_tmp}"
     mkdir -p "${_tmp}"
-    _log "下载权重 ${_name}（checkpoint ${_weight}，主源 ModelScope:${_repo}，清单 $# 个文件）"
-    _ok=1
+    _log "下载权重 ${_name}（checkpoint ${_weight}，主源 ModelScope:${_repo}，清单 $# 个文件，文件级并发）"
+    # 清单内每个文件一条 curl 并行拉，全部 wait 收口后再判成败。单文件失败不再 break 掉
+    # 其余（旧实现会提前放弃后面所有文件），失败项由下面的"暂存清单校验"统一暴露。
+    local -a _pids=()
+    local _i
     for _f in "$@"; do
         mkdir -p "${_tmp}/$(dirname "${_f}")"
-        if ! curl -fsSL --retry 3 --connect-timeout 20 --max-time 3600 \
-                "https://modelscope.cn/models/${_repo}/resolve/master/${_f}" \
-                -o "${_tmp}/${_f}"; then
-            _ok=0
-            break
-        fi
+        curl -fsSL --retry 3 --connect-timeout 20 --max-time 3600 \
+            "https://modelscope.cn/models/${_repo}/resolve/master/${_f}" \
+            -o "${_tmp}/${_f}" &
+        _pids+=("$!")
+    done
+    _ok=1
+    for _i in "${!_pids[@]}"; do
+        if ! wait "${_pids[$_i]}"; then _ok=0; fi
     done
     if [ "${_ok}" != 1 ] && command -v huggingface-cli >/dev/null 2>&1; then
         _log "⚠️ ModelScope 下载不完整，改用 HF 镜像重试: ${_name}"
@@ -201,6 +213,7 @@ _download_model() {
         fi
     fi
     if [ "${_ok}" = 1 ]; then
+        _miss=""
         for _f in "$@"; do
             if [ ! -s "${_tmp}/${_f}" ]; then _ok=0; _miss="${_miss} ${_f}(暂存)"; fi
         done
@@ -233,14 +246,21 @@ _download_model() {
 _download_models() {
     # 本函数跑在后台（`&`），退出码无人可 wait：失败必须**自带可见结果**，
     # 否则"下载失败"与"下载成功"在日志与状态上完全无从区分。
-    _dl_fail=0
+    # 两个模型并发下载，把串行的 TLS/首字节空等重叠掉（总字节不变，带宽是主要瓶颈时
+    # 收益有限；reranker 文件多、收益更明显）。_download_model 已全部 local，并发安全；
+    # 失败经 wait 收集，下面汇总逻辑不变。
+    local _dl_fail=0 _p1 _p2
     _download_model bge-base-zh-v1.5 BAAI/bge-base-zh-v1.5 pytorch_model.bin \
         config.json pytorch_model.bin tokenizer.json tokenizer_config.json vocab.txt \
         special_tokens_map.json sentence_bert_config.json config_sentence_transformers.json \
-        modules.json 1_Pooling/config.json || _dl_fail=1
+        modules.json 1_Pooling/config.json &
+    _p1=$!
     _download_model bge-reranker-base BAAI/bge-reranker-base model.safetensors \
         config.json model.safetensors tokenizer.json tokenizer_config.json \
-        sentencepiece.bpe.model special_tokens_map.json || _dl_fail=1
+        sentencepiece.bpe.model special_tokens_map.json &
+    _p2=$!
+    wait "${_p1}" || _dl_fail=1
+    wait "${_p2}" || _dl_fail=1
     if [ "${_dl_fail}" = 0 ]; then
         printf 'ok\n' > /tmp/model-download.status
         _log "嵌入/重排权重检查结束"

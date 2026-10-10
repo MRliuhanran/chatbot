@@ -36,6 +36,8 @@ ENV PYTHONUNBUFFERED=1 \
 ARG TARGETARCH
 ARG QDRANT_VERSION=v1.19.1
 ARG OLLAMA_VERSION=0.34.4
+# uv 版本固定到本机现役版，避免构建工具本身漂移。
+ARG UV_VERSION=0.12.13
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 # 兜底源不能再用阿里云：其 PEP 658 元数据文件（*.whl.metadata）对部分包返回 404，
@@ -99,20 +101,30 @@ WORKDIR /app
 
 # 依赖分两步：先装 CPU 版 torch —— PyPI 默认 linux wheel 会连带拉数 GB 的 CUDA 依赖。
 # requirements 里的 torch==2.7.1 此时已被 2.7.1+cpu 满足（PEP 440：无 local 标记的
-# == 比较会忽略候选的 local 标记），不会被重装。装完 pip check 自检，再清字节码与缓存。
+# == 比较会忽略候选的 local 标记），不会被重装。装完 uv pip check 自检，再清字节码与缓存。
+#
+# pip → uv：--index-url/--extra-index-url/--find-links 语义一致，但解析与下载并发度远高，
+# 2vCPU 构建机上这一阶段明显更快（依赖已全 == 锁定，解析量本就接近零）。uv 用 --system
+# 装进系统 site-packages（官方 python 镜像无 venv、也无 EXTERNALLY-MANAGED 标记），
+# --break-system-packages 仅为将来基座变化兜底；--no-cache 与末尾 rm -rf /root/.cache 呼应。
+# uv 本身也走主源+兜底源，避免镜像滞后导致构建工具装不上。
 COPY requirements.txt .
 COPY wheels/ /tmp/wheels/
 RUN pip install --no-cache-dir \
+        --index-url "${PIP_INDEX_URL}" \
+        --extra-index-url "${PIP_FALLBACK_INDEX}" \
+        "uv==${UV_VERSION}" \
+    && uv pip install --system --break-system-packages --no-cache \
         --index-url "${TORCH_INDEX_URL}" \
         --extra-index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
         "torch==2.7.1+cpu" \
-    && pip install --no-cache-dir \
+    && uv pip install --system --break-system-packages --no-cache \
         --find-links /tmp/wheels \
         --index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
         -r requirements.txt \
-    && pip check \
+    && uv pip check --system \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
     && rm -rf /root/.cache
 
