@@ -299,6 +299,9 @@ fi
 # ── 5. Streamlit：前台运行（容器主进程），端口按创空间要求固定 7860 ────────────
 # 0.0.0.0 是**容器语境的正确值**（容器内直连 127.0.0.1 拿不到宿主端口映射）；不要照搬
 # 到裸机 —— 裸机上 Streamlit 默认绑 localhost，对外暴露需自己显式选 --server.address。
+# 让应用侧知道权重仍在后台下载：模型加载时轮询等待，而不是把首查询竞态当错误抛出。
+# RAG_SKIP_MODEL_DOWNLOAD=1（本地挂载模型自测）时下载根本没跑，别让应用去空等。
+[ "${RAG_SKIP_MODEL_DOWNLOAD:-0}" = 1 ] || export RAG_WEIGHTS_BACKGROUND=1
 _log "Streamlit 启动: http://0.0.0.0:${RAG_HTTP_PORT:-7860}"
 exec python -m streamlit run chatbot.py \
     --server.address 0.0.0.0 \

@@ -58,7 +58,8 @@ RUN set -eux; \
 # - 多源下载：每个源失败/超时后自动换下一个（gh-proxy.com 只是加前缀，真实资产仍在 GitHub）。
 #   必须带 --max-time：curl 的 --speed-time 在「连接已建立但收不到任何字节」时不会生效，
 #   ollama 是 ~1.4G 的大资产，一旦卡在 0 字节会无限期挂住整个构建（2026-10-10 魔塔构建
-#   卡在第 7 层 16 分钟、日志停在 0 字节，即此因）。
+#   卡在第 7 层 16 分钟、日志停在 0 字节，即此因）。大资产优先 gh-proxy（实测 9MB/s），
+#   直连 GitHub 实测卡死、仅作兜底；qdrant 小资产直连更快，顺序不变。
 RUN set -eux; \
     case "${TARGETARCH}" in \
       amd64) _qarch="x86_64-unknown-linux-musl" ;; \
@@ -85,8 +86,8 @@ RUN set -eux; \
     chmod +x /opt/qdrant/qdrant; \
     test -x /opt/qdrant/qdrant; \
     _dl /tmp/ollama.tar.zst \
-        "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${TARGETARCH}.tar.zst" \
         "https://gh-proxy.com/https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${TARGETARCH}.tar.zst" \
+        "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${TARGETARCH}.tar.zst" \
         "https://ollama.com/download/ollama-linux-${TARGETARCH}.tar.zst"; \
     tar --zstd -xf /tmp/ollama.tar.zst -C /usr/local; \
     rm -f /tmp/ollama.tar.zst; \

@@ -426,6 +426,12 @@ COLLECTION_ALIAS = os.getenv("RAG_COLLECTION_ALIAS", "rag_current")
 USE_COLLECTION_ALIAS = env_bool("RAG_USE_COLLECTION_ALIAS", True)
 EMBED_MODEL_PATH = os.getenv("RAG_EMBED_MODEL_PATH", "./models/bge-base-zh-v1.5")
 RERANK_MODEL_PATH = os.getenv("RAG_RERANK_MODEL_PATH", "./models/bge-reranker-base")
+# 创空间 entrypoint 把嵌入/重排权重下载放后台、并先启动服务：首查询会撞上下载窗口，
+# 旧行为直接抛"模型目录缺失或为空"。entrypoint 在真实下载时导出 RAG_WEIGHTS_BACKGROUND=1，
+# 加载侧据此轮询等待（RAG_MODEL_WAIT_SECS，默认 900s），下载明确失败才提前放弃；
+# 本地/离线命令不置位，缺模型依旧立即报错，不长等。
+WEIGHTS_BACKGROUND = env_bool("RAG_WEIGHTS_BACKGROUND", False)
+MODEL_WAIT_SECS = env_int_min("RAG_MODEL_WAIT_SECS", 900, 0)
 _ARTIFACTS_DIR = os.getenv("RAG_ARTIFACTS_DIR", "./artifacts")
 CHUNKS_JSON = os.path.join(_ARTIFACTS_DIR, "chunks.json")
 
@@ -532,10 +538,39 @@ def _float16_ok(device):
 
 
 # ── 模型加载与向量化 ──
+def _model_dir_ready(path):
+    return bool(path) and os.path.isdir(path) and bool(os.listdir(path))
+
+
+def _wait_for_weights(path):
+    """后台下载权重时轮询等待目录就绪；返回 True=可用。entrypoint 用 目录.part → 清单
+    齐备后原子改名，故最终目录一出现即完整；下载明确失败会写 /tmp/model-download.status
+    =failed，据此提前放弃，不白等到超时。"""
+    _deadline = time.monotonic() + MODEL_WAIT_SECS
+    _told = False
+    while True:
+        if _model_dir_ready(path):
+            return True
+        try:
+            with open("/tmp/model-download.status", encoding="utf-8") as f:
+                if f.read().strip() == "failed":
+                    return False
+        except OSError:
+            pass
+        if time.monotonic() >= _deadline:
+            return False
+        if not _told:
+            log(f"⏳ 权重尚未就绪（{path}），等待 entrypoint 后台下载完成（最多 {MODEL_WAIT_SECS}s）…")
+            _told = True
+        time.sleep(2)
+
+
 def _require_model_dir(path, what, hint):
-    if not path or not os.path.isdir(path) or not os.listdir(path):
-        raise RuntimeError(f"{what}模型目录缺失或为空: {path!r} —— {hint}")
-    return path
+    if _model_dir_ready(path):
+        return path
+    if WEIGHTS_BACKGROUND and MODEL_WAIT_SECS > 0 and _wait_for_weights(path):
+        return path
+    raise RuntimeError(f"{what}模型目录缺失或为空: {path!r} —— {hint}")
 
 
 def load_embedding_model(device=None, model_path=None):
