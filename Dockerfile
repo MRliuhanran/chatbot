@@ -38,7 +38,11 @@ ARG QDRANT_VERSION=v1.19.1
 ARG OLLAMA_VERSION=0.34.4
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
-ARG PIP_FALLBACK_INDEX=https://mirrors.aliyun.com/pypi/simple
+# 兜底源不能再用阿里云：其 PEP 658 元数据文件（*.whl.metadata）对部分包返回 404，
+# 而 pip 一旦选中该候选会直接失败、不会回退到其它索引（本地 pip 26.1.2 可复现）。
+# 2026-10-10 魔塔构建正是因 streamlit==1.62.0 的 metadata 404 中断经验证。华为云镜像
+# 元数据完整且在国内，速度与可靠性兼得；若它再滞后可改官方 https://pypi.org/simple。
+ARG PIP_FALLBACK_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
 
 # 系统依赖单独成层（这个层很慢但很稳定，与下面的下载分层，改下载逻辑不必重装 apt）
 RUN set -eux; \
