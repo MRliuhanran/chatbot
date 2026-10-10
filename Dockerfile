@@ -55,8 +55,10 @@ RUN set -eux; \
 #   （实测 amd64 gnu 版起不来：GLIBC_2.38 not found），musl 静态版不挑发行版；
 # - Ollama 只发 .tar.zst（.tgz 已 404），解压需要 zstd；
 # - 删掉 Ollama 的 CUDA/ROCm 运行库：CPU 服务器只用 libggml-cpu-*，删后 ollama 仍可用；
-# - 多源下载：直连 GitHub 常被限速到 <100KB/s，低于 200KB/s 持续 30s 即判慢，自动改走
-#   gh-proxy.com 镜像（只是加前缀，真实资产仍在 GitHub）。
+# - 多源下载：每个源失败/超时后自动换下一个（gh-proxy.com 只是加前缀，真实资产仍在 GitHub）。
+#   必须带 --max-time：curl 的 --speed-time 在「连接已建立但收不到任何字节」时不会生效，
+#   ollama 是 ~1.4G 的大资产，一旦卡在 0 字节会无限期挂住整个构建（2026-10-10 魔塔构建
+#   卡在第 7 层 16 分钟、日志停在 0 字节，即此因）。
 RUN set -eux; \
     case "${TARGETARCH}" in \
       amd64) _qarch="x86_64-unknown-linux-musl" ;; \
@@ -67,7 +69,7 @@ RUN set -eux; \
       _out="$1"; shift; \
       for _u in "$@"; do \
         echo "== 下载 ${_u}"; \
-        if curl -fSL --http1.1 --connect-timeout 20 --speed-limit 204800 --speed-time 30 "${_u}" -o "${_out}"; then \
+        if curl -fSL --http1.1 --connect-timeout 20 --max-time 420 --speed-limit 51200 --speed-time 60 "${_u}" -o "${_out}"; then \
           return 0; \
         fi; \
         rm -f "${_out}"; \
