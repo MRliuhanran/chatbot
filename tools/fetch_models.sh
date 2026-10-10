@@ -152,11 +152,28 @@ _pull_ollama_model() {
             sleep 1
         done
     fi
-    _log "拉取生成模型: ${_model}（models=${OLLAMA_MODELS}）→ /tmp/ollama-pull.log"
-    if ! ollama pull "${_model}" >/tmp/ollama-pull.log 2>&1; then
-        _log "❌ 生成模型拉取失败: ${_model}，详见 /tmp/ollama-pull.log"
+    # 源选择：优先 ModelScope 官方 Ollama 集成（modelscope.cn/<owner>/<repo>:<quant>，
+    # 走 ModelScope CDN；实测 ~8MB/s，而 registry.ollama.ai 只有 ~1.4MB/s，3.4GB 差约 40 分钟）。
+    # 变量可空，空则退回官方 registry（老行为）。
+    local _src="${RAG_GEN_MODEL_MODELSCOPE:-$(_env_get RAG_GEN_MODEL_MODELSCOPE)}"
+    local _pulled="${_model}"
+    [ -n "${_src}" ] && _pulled="${_src}"
+    _log "拉取生成模型: ${_pulled}（models=${OLLAMA_MODELS}）→ /tmp/ollama-pull.log"
+    if ! ollama pull "${_pulled}" >/tmp/ollama-pull.log 2>&1; then
+        _log "❌ 生成模型拉取失败: ${_pulled}，详见 /tmp/ollama-pull.log"
         [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
         return 1
+    fi
+    if [ "${_pulled}" != "${_model}" ]; then
+        # ModelScope 源名带 host/repo，应用只认短名；ollama cp 只新建 manifest、共享同一份 blob，
+        # 不复制数据；随后删源名，避免 ollama list 出现两个名字。
+        ollama rm "${_model}" >/dev/null 2>&1 || true
+        if ! ollama cp "${_pulled}" "${_model}" >>/tmp/ollama-pull.log 2>&1; then
+            _log "❌ 生成模型重命名失败: ${_pulled} → ${_model}，详见 /tmp/ollama-pull.log"
+            [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
+            return 1
+        fi
+        ollama rm "${_pulled}" >/dev/null 2>&1 || true
     fi
     [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
     _log "生成模型已就绪: ${_model}"

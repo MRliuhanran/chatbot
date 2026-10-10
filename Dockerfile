@@ -117,11 +117,13 @@ RUN pip install --no-cache-dir \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
         "uv==${UV_VERSION}" \
     && uv pip install --system --break-system-packages --no-cache \
+        --index-strategy unsafe-best-match \
         --index-url "${TORCH_INDEX_URL}" \
         --extra-index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
         "torch==2.7.1+cpu" \
     && uv pip install --system --break-system-packages --no-cache \
+        --index-strategy unsafe-best-match \
         --find-links /tmp/wheels \
         --index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
