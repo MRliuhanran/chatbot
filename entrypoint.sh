@@ -7,6 +7,10 @@ cd /app || exit 1
 
 _log() { printf '[entrypoint] %s\n' "$*"; }
 
+# 模型清单与拉取的唯一实现（构建期烘焙 / 运行期补下共用），见 tools/fetch_models.sh。
+# 缺失时只告警不中断：镜像里必然存在，本地裸跑不会走到这里（第 6 行已 cd /app）。
+. /app/tools/fetch_models.sh || _log "⚠️ 缺少 /app/tools/fetch_models.sh，模型按需下载不可用"
+
 # ── 0.1 进程存活判据（唯一一份）─────────────────────────────────────────────
 # `kill -0` 对**僵尸**返回 0：exec 之后 Streamlit 是 PID 1、没人 wait，qdrant/ollama
 # 运行期崩溃只会变成僵尸，于是 `! kill -0` 恒为假 —— 存活哨兵一次都不会喊（判据恒假，
@@ -159,140 +163,24 @@ _ollama_pid=$!
 _wait_http_ready ollama http://127.0.0.1:11434/api/version "${_ollama_pid}" /tmp/ollama.log
 _log "ollama 就绪（http://127.0.0.1:11434, models=${OLLAMA_MODELS}）"
 
-# ── 3. 嵌入/重排权重：不打进镜像，启动时按需下载（后台，不占住 7860）───────────
-#    主源魔搭 hub（创空间内必达），备源 HF 镜像。RAG_SKIP_MODEL_DOWNLOAD=1 可跳过。
-#    任一权重文件已存在（如本地测试挂载了宿主 models/）即视为就绪、直接跳过。
-# 权重一律下到暂存目录、清单齐了再改名就位。加载侧（chatbot.py 的 _require_model_dir）
-# 只看"目录非空"，而本函数与 Streamlit 启动是并发的（后台作业 + exec）：直接写最终目录
-# 会让应用在 checkpoint 写到一半时就把模型读进去（半截权重），失败分支再 rm -rf 更会
-# 删掉正被 mmap 的目录。暂存 + 改名让"就绪"只剩一个含义：清单文件全部非空。
-_download_model() {
-    # 全部变量 local：两个模型现在**并发**调用本函数（见 _download_models），旧的函数级
-    # 全局变量会互相踩（_name/_dir/_ok/_tmp 被对方覆盖 → 串目录、错判就绪）。
-    local _name="$1" _repo="$2" _weight="$3"; shift 3
-    local _dir="/app/models/${_name}"
-    local _f _ok=1 _miss="" _tmp
-    # 就绪判据 = 清单文件全部非空。只看 checkpoint 会把"权重在、tokenizer.json 缺"的
-    # 半成品判成就绪，此后每次启动都被这里短路，永不重下，from_pretrained 永久失败。
-    # 不在首个缺失处 break：要把缺的全列出来，否则失败日志只说"失败"、不给可执行信息。
-    for _f in "$@"; do
-        if [ ! -s "${_dir}/${_f}" ]; then _ok=0; _miss="${_miss} ${_f}"; fi
-    done
-    if [ "${_ok}" = 1 ]; then
-        _log "权重已就绪: ${_name}（清单 $# 个文件齐备）"
-        return 0
-    fi
-    if [ "${RAG_SKIP_MODEL_DOWNLOAD:-0}" = 1 ]; then
-        _log "RAG_SKIP_MODEL_DOWNLOAD=1，跳过 ${_name}（未就绪，缺:${_miss}）"
-        return 0
-    fi
-    _tmp="${_dir}.part"
-    rm -rf "${_tmp}"
-    mkdir -p "${_tmp}"
-    _log "下载权重 ${_name}（checkpoint ${_weight}，主源 ModelScope:${_repo}，清单 $# 个文件，文件级并发）"
-    # 清单内每个文件一条 curl 并行拉，全部 wait 收口后再判成败。单文件失败不再 break 掉
-    # 其余（旧实现会提前放弃后面所有文件），失败项由下面的"暂存清单校验"统一暴露。
-    local -a _pids=()
-    local _i
-    for _f in "$@"; do
-        mkdir -p "${_tmp}/$(dirname "${_f}")"
-        curl -fsSL --retry 3 --connect-timeout 20 --max-time 3600 \
-            "https://modelscope.cn/models/${_repo}/resolve/master/${_f}" \
-            -o "${_tmp}/${_f}" &
-        _pids+=("$!")
-    done
-    _ok=1
-    for _i in "${!_pids[@]}"; do
-        if ! wait "${_pids[$_i]}"; then _ok=0; fi
-    done
-    if [ "${_ok}" != 1 ] && command -v huggingface-cli >/dev/null 2>&1; then
-        _log "⚠️ ModelScope 下载不完整，改用 HF 镜像重试: ${_name}"
-        # 只按清单文件下（reranker 仓库里还有 pytorch_model.bin/onnx 冗余，全量会多拉 2.1G）
-        if huggingface-cli download "${_repo}" --local-dir "${_tmp}" "$@" >/dev/null 2>&1; then
-            _ok=1
-        fi
-    fi
-    if [ "${_ok}" = 1 ]; then
-        _miss=""
-        for _f in "$@"; do
-            if [ ! -s "${_tmp}/${_f}" ]; then _ok=0; _miss="${_miss} ${_f}(暂存)"; fi
-        done
-    fi
-    if [ "${_ok}" = 1 ]; then
-        # rm/mv 的退出码必须看：磁盘满/只读挂载（本地跑法把 models/ 挂成 :ro）时，
-        # 旧写法照样打"下载完成"，与随后 _require_model_dir 的报错互相矛盾。
-        if rm -rf "${_dir}" && mv "${_tmp}" "${_dir}"; then
-            _log "权重下载完成: ${_name}"
-        else
-            _ok=0
-            _miss="${_miss:-?}（落盘失败：rm/mv 返回非 0）"
-            rm -rf "${_tmp}" 2>/dev/null
-            _log "❌ 权重落盘失败: ${_name}（磁盘满/只读挂载？已清理暂存，保留既有 ${_dir} 不动）"
-            return 1
-        fi
-    else
-        # 只删暂存，绝不删 ${_dir}：那里可能有宿主挂载进来的完整 checkpoint（4.4G/1.1G，
-        # 重下不回来）。残留的半成品由下次启动重新判定并覆盖，代价是这期间查询报
-        # "模型目录缺失或为空"——而下面这行已经把缺哪个文件写清楚了。
-        rm -rf "${_tmp}"
-        _log "❌ 权重下载失败: ${_name}（缺:${_miss:-?}；已清理暂存，保留既有 ${_dir} 不动，重启容器重试；嵌入/重排不可用）"
-        # 必须 return 1：_log 是 printf（退出码 0），不显式返回非 0 时本函数"下载失败"
-        # 却返回 0 → 调用方 _dl_fail 不置位 → /tmp/model-download.status 写成 ok、
-        # ❌ 汇总行永不出现 —— 权重恰恰缺失时状态通道报"一切正常"，违反上面的契约。
-        return 1
-    fi
-}
-
-_download_models() {
-    # 本函数跑在后台（`&`），退出码无人可 wait：失败必须**自带可见结果**，
-    # 否则"下载失败"与"下载成功"在日志与状态上完全无从区分。
-    # 两个模型并发下载，把串行的 TLS/首字节空等重叠掉（总字节不变，带宽是主要瓶颈时
-    # 收益有限；reranker 文件多、收益更明显）。_download_model 已全部 local，并发安全；
-    # 失败经 wait 收集，下面汇总逻辑不变。
-    local _dl_fail=0 _p1 _p2
-    _download_model bge-base-zh-v1.5 BAAI/bge-base-zh-v1.5 pytorch_model.bin \
-        config.json pytorch_model.bin tokenizer.json tokenizer_config.json vocab.txt \
-        special_tokens_map.json sentence_bert_config.json config_sentence_transformers.json \
-        modules.json 1_Pooling/config.json &
-    _p1=$!
-    _download_model bge-reranker-base BAAI/bge-reranker-base model.safetensors \
-        config.json model.safetensors tokenizer.json tokenizer_config.json \
-        sentencepiece.bpe.model special_tokens_map.json &
-    _p2=$!
-    wait "${_p1}" || _dl_fail=1
-    wait "${_p2}" || _dl_fail=1
-    if [ "${_dl_fail}" = 0 ]; then
-        printf 'ok\n' > /tmp/model-download.status
-        _log "嵌入/重排权重检查结束"
-    else
-        printf 'failed\n' > /tmp/model-download.status
-        _log "❌ 嵌入/重排权重检查结束（有失败项，见上方日志）→ 嵌入或重排不可用，检索会失败；状态 /tmp/model-download.status"
-    fi
-}
+# ── 3. 嵌入/重排权重：清单与实现见 tools/fetch_models.sh（构建期烘焙 / 运行期补下共用）──
+#     构建期已烘焙进镜像时，这里只会打"已就绪"、不产生任何下载。RAG_SKIP_MODEL_DOWNLOAD=1
+#     可跳过。就绪判据=清单文件全部非空；下到暂存目录齐了再整目录改名就位，避免应用读到
+#     半截权重（详见 _download_model）。后台运行，不占住 7860。
 _download_models &
 
 # ── 4. 生成模型：缺失则后台拉取，不阻塞对外服务（首启多等几分钟，期间问答会失败）──
-#     RAG_SKIP_MODEL_PULL=1 可跳过（本地测试挂载宿主机模型时用）。
+#     实现与"已就绪"判据见 tools/fetch_models.sh 的 _pull_ollama_model（构建期已烘焙时
+#     这里只判就绪、不下载）。RAG_SKIP_MODEL_PULL=1 可跳过。
 #     MODEL 的取法已统一进脚本开头的 _load_dotenv：进程环境优先于 .env，且 `export`
-#     前缀、`=` 两侧空白、单双引号都认（与 python-dotenv 同语义）。旧写法在这里单独
-#     sed 特判一行 MODEL，只去空白不去引号 —— `MODEL="qwen3.5:4b-q4_K_M"` 会解析出
-#     带引号的名字，ollama pull 静默失败；而 .env 里其它变量对本脚本全部静默无效。
+#     前缀、`=` 两侧空白、单双引号都认（与 python-dotenv 同语义）。
 _model="${MODEL:-}"
 if [ "${RAG_SKIP_MODEL_PULL:-0}" = 1 ]; then
     _log "RAG_SKIP_MODEL_PULL=1，跳过模型检查"
 elif [ -z "${_model}" ]; then
     _log "⚠️ .env 里没有 MODEL，跳过模型拉取（生成将不可用）"
-elif ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -Fxq "${_model}"; then
-    _log "生成模型已就绪: ${_model}"
 else
-    _log "生成模型缺失，后台拉取中: ${_model}（日志 /tmp/ollama-pull.log）"
-    (
-        if ollama pull "${_model}" >/tmp/ollama-pull.log 2>&1; then
-            _log "模型拉取完成: ${_model}"
-        else
-            _log "❌ 模型拉取失败，详见 /tmp/ollama-pull.log"
-        fi
-    ) &
+    _pull_ollama_model "${_model}" &
 fi
 
 # ── 4.5 存活哨兵 ────────────────────────────────────────────────────────────

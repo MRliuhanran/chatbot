@@ -1,8 +1,9 @@
 # 单镜像全栈：Qdrant + Ollama(CPU) + RAG 应用（魔搭创空间 Docker 类型用，端口 7860）
 #
 # ★ 最小化策略（2026-09-27）★
-#   1) 服务器可下载的一律不打包：Ollama 生成模型、bge 嵌入/重排权重都由 entrypoint
-#      在容器启动时按需下载（见 entrypoint.sh；models/ 已在 .dockerignore 排除）。
+#   1) 模型默认在**构建期烘焙**进镜像（BAKE_MODELS/BAKE_OLLAMA，见下方烘焙层）：容器
+#      可写层不持久，运行期下载=每次重启重下数 GB、且"构建完"并不"能用"。置 0 退回运行期
+#      按需下载（镜像回到 ~2.5G，但首启要等下载）。清单唯一来源 tools/fetch_models.sh。
 #   2) Ollama 自带 CUDA/ROCm 运行库在无 GPU 服务器上是纯浪费，构建时删除（约省 2.1G）。
 #   3) 本地数据全部打进镜像：.env / artifacts / qdrant_storage / corpus / lexicon，
 #      开箱即用、无需在服务器重建（2 核重建索引远超 73 分钟）。
@@ -31,7 +32,8 @@ FROM python:3.10-slim-bookworm
 # stdout 不缓冲：非 logging 的 print（jieba 初始化行等）在容器里默认块缓冲，
 # 崩溃/OOM 时最后一批输出整段丢失，而运行日志是唯一的现场。
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    OLLAMA_MODELS=/app/ollama_models
 
 ARG TARGETARCH
 ARG QDRANT_VERSION=v1.19.1
@@ -127,6 +129,26 @@ RUN pip install --no-cache-dir \
     && uv pip check --system \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
     && rm -rf /root/.cache
+
+# ── 构建期烘焙模型（"构建完就能用"）────────────────────────────────────────────
+# 容器的可写层不跨重启持久：模型若在运行期下载，每次冷启都要重下数 GB，且"构建完成"
+# 并不等于"可服务"。烘焙进镜像层后，entrypoint 的清单判据直接判"已就绪"，启动即用，
+# 运行日志里不再有下载过程。清单与实现唯一来源 tools/fetch_models.sh（与运行期共用，
+# 避免两处清单漂移）；BAKE_MODELS / BAKE_OLLAMA 任一置 0 即可关掉对应烘焙、退回运行期下载。
+# 烘焙后 chmod a+rX 让平台以非 root 跑时也能读；_download_models 返回非 0 / ollama pull
+# 失败会让本层构建失败，避免产出"模型缺失却照样成功"的半成品镜像。
+COPY .env ./
+COPY tools/fetch_models.sh ./tools/
+ARG BAKE_MODELS=1
+ARG BAKE_OLLAMA=1
+RUN set -eux; \
+    mkdir -p /app/models /app/ollama_models; \
+    . ./tools/fetch_models.sh; \
+    if [ "${BAKE_MODELS}" = "1" ]; then _download_models; fi; \
+    if [ "${BAKE_OLLAMA}" = "1" ]; then _pull_ollama_model "$(_env_get MODEL)"; fi; \
+    rm -f /tmp/model-download.status /tmp/ollama-pull.log /tmp/ollama-bake.log; \
+    chmod -R a+rX /app/models /app/ollama_models; \
+    du -sh /app/models /app/ollama_models
 
 # 本地数据全量进镜像：--chmod=0777 让平台以非 root 跑时也能写 qdrant_storage/artifacts/rag.log，
 # 且不额外产生整份文件的 chmod 层。models/ 已排除，由 entrypoint 运行时下载。
