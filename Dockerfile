@@ -94,12 +94,14 @@ WORKDIR /app
 # requirements 里的 torch==2.7.1 此时已被 2.7.1+cpu 满足（PEP 440：无 local 标记的
 # == 比较会忽略候选的 local 标记），不会被重装。装完 pip check 自检，再清字节码与缓存。
 COPY requirements.txt .
+COPY wheels/ /tmp/wheels/
 RUN pip install --no-cache-dir \
         --index-url "${TORCH_INDEX_URL}" \
         --extra-index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
         "torch==2.7.1+cpu" \
     && pip install --no-cache-dir \
+        --find-links /tmp/wheels \
         --index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
         -r requirements.txt \
