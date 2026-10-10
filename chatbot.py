@@ -1710,22 +1710,34 @@ def _embed_code_fingerprint():
 
 
 def _model_content_fingerprint():
-    """嵌入模型目录内容指纹（相对路径 + 大小 + mtime）。
+    """嵌入模型目录内容指纹（相对路径 + 大小 + 文件头哈希）。
 
-    只按 abspath 命名缓存时，**在同一路径原地替换同维度权重**会静默复用旧向量：
-    _expected_embed_dim 只校验维度，抓不到同维替换。这里把目录清单的 stat 打进缓存名
-    —— 不读权重字节，index/stages 每次调用都可承受；文件被替换/增删即换缓存名。
+    原实现用 mtime_ns：容器启动时下载模型会更新 mtime，导致切分指纹漂移，
+    进而触发「分块产物与索引不一致」闸门。改用内容特征（大小 + 文件头哈希），
+    同一份模型内容不变即指纹不变，容器重建/重新下载不再漂移。
+
+    同时**跳过隐藏文件/目录**（如 HF 的 `.cache/` 下载记账、`.part` 暂存）：这些是
+    下载器的元数据（含下载时间戳），与模型内容无关；容器走 curl 直下、宿主走 HF
+    下载，`.cache` 的有无会让指纹凭空分叉。清单文件（config/tokenizer/权重）才是内容身份。
     """
     parts = []
     try:
         for root, dirs, files in os.walk(EMBED_MODEL_PATH):
-            dirs.sort()
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
             for fn in sorted(files):
+                if fn.startswith("."):
+                    continue
                 path = os.path.join(root, fn)
                 rel = os.path.relpath(path, EMBED_MODEL_PATH)
                 try:
                     st = os.stat(path)
-                    parts.append(f"{rel}:{st.st_size}:{st.st_mtime_ns}")
+                    # 只读文件头算哈希，避免全量读大文件（权重文件可达 GB 级但头部足够区分版本）；
+                    # 不读字节则同路径同大小换权重会被静默复用。
+                    h = hashlib.sha256()
+                    with open(path, "rb") as f:
+                        h.update(f.read(4096))
+                    head = h.hexdigest()[:8]
+                    parts.append(f"{rel}:{st.st_size}:{head}")
                 except OSError:
                     parts.append(f"{rel}:missing")
     except OSError:

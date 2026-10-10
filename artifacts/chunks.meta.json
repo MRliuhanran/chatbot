@@ -1,6 +1,6 @@
 {
   "meta_version": 1,
-  "fingerprint": "62927c1485639d91",
+  "fingerprint": "67ebe8987efeedf6",
   "chunking_config": {
     "child_max_tokens": 128,
     "child_min_tokens": 32,
@@ -11,7 +11,7 @@
     "semantic_min_chars": 500,
     "normalize_quotes": true,
     "embed_model": "./models/bge-base-zh-v1.5",
-    "embed_model_content": "1ea6e2f12bf5",
+    "embed_model_content": "19a5a18e3c02",
     "sentencex": "1.0.30",
     "sentence_lang": "zh",
     "chunking_code": "b1dbc820ac07ecde",
@@ -27,6 +27,6 @@
   },
   "total_chunks": 22019,
   "total_parents": 5711,
-  "reused_documents": 2,
-  "build_time": "2026-10-08T23:19:44"
+  "reused_documents": 4,
+  "build_time": "2026-10-10T11:38:25"
 }
