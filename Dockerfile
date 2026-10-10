@@ -133,6 +133,12 @@ RUN pip install --no-cache-dir \
     && rm -rf /root/.cache
 
 # ── 构建期烘焙模型（"构建完就能用"）────────────────────────────────────────────
+# ⚠️ 必须先把 RUN 的 shell 换成 bash：Docker 默认 /bin/sh，Debian 上是 dash，而
+# tools/fetch_models.sh 用了 bash 专有语法（declare -F / 数组 local -a / ${!arr[@]}），
+# dash 在**解析阶段**就报 `Syntax error: "(" unexpected`，整层从未执行
+# （2026-10-10 构建实测的失败点）。只影响其后的 RUN；entrypoint.sh 自带 bash shebang。
+SHELL ["/bin/bash", "-c"]
+
 # 容器的可写层不跨重启持久：模型若在运行期下载，每次冷启都要重下数 GB，且"构建完成"
 # 并不等于"可服务"。烘焙进镜像层后，entrypoint 的清单判据直接判"已就绪"，启动即用，
 # 运行日志里不再有下载过程。清单与实现唯一来源 tools/fetch_models.sh（与运行期共用，
