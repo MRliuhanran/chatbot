@@ -1,13 +1,46 @@
-version: '3.8'
+# 容器化路径 · 现成组件版（2026-10-12）：行为与本地原生平行，模型服务优先用现成组件。
+#   qdrant —— 向量库（版本锁 v1.19.1，必须与 Dockerfile 的 ARG QDRANT_VERSION 同版：
+#             共用 ./qdrant_storage，Qdrant 存储**不支持降级**，latest 写过数据后镜像
+#             里固定版打不开）。
+#   ollama —— 生成模型服务（对齐 Dockerfile ARG OLLAMA_VERSION=0.34.4 的二进制版；
+#             挂载本地 ~/.ollama/models 复用现有权重、不重新拉取）。
+#   app    —— 应用（build 自 Dockerfile 的"全栈镜像"，但**绕开 all-in-one entrypoint**，
+#             只跑 Streamlit）。嵌入与重排都走 HTTP 后端 → embed 容器；业务进程不再持有
+#             检索模型，torch 只留给离线命令（process/index/sparse）。
+#   embed  —— 检索模型服务：infinity 容器（专用精简镜像 embed.Dockerfile）**一个进程托管
+#             两个模型**（挂载 ./models 只读，不烘焙）：/v1/embeddings 打 bge-m3、
+#             /v1/rerank 打 bge-reranker-v2-m3，请求按 body 里的 model 字段路由到对应 engine。
+#
+# 与本地/魔塔配置对齐的三处：
+#   1. env_file: .env —— RAG_* 全部读同一份（RAG_NUM_CTX=4096 / RAG_THINK=0 /
+#      RAG_NUM_PREDICT=512 等随之自动一致）。
+#   2. ollama 服务带 OLLAMA_NUM_PARALLEL=4 等并发/内存档 —— 与 entrypoint.sh 里
+#      "魔塔部署并发档"完全相同。
+#   3. 权重同源：模型挂载/烘焙自本机与镜像同一批，逐字节一致。
+#
+# 内存预算（8G 本机/部署机已知并接受）：app 不再持嵌入模型（~-1G），但重排回进程内
+# （~1.7G），embed 容器再持一份 torch+嵌入（~1G）—— 总量与"app 单进程持双模型"相当。
+# 魔搭创空间**不支持 compose**：docker 类型是"仓库根一个 Dockerfile → 一个容器"、端口只能
+# 7860（平台 deploy_schema.json 里 sdk_type=docker 的定义），故那边维持单镜像三进程
+# （Dockerfile/entrypoint.sh）；本文件只服务本地 Docker 与自有服务器。
+#
+# 使用（Docker Desktop 起 daemon 后）：
+#   docker compose up -d --build      # 构建两个镜像（app 全栈镜像 + embed 精简镜像）并起四个容器
+#   docker compose ps                 # qdrant/ollama/app/embed 全 healthy，app up
+#   http://127.0.0.1:7860             # 应用；http://127.0.0.1:8001/health 是嵌入服务
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d   # NVIDIA 主机：生成模型上 GPU
+#
+# 注意：
+#   - Mac 的 Docker 透传不了 Metal，容器里 llama 与嵌入服务都走 CPU；本地原生跑才是 GPU 路径
+#     （一键起停见 tools/run_local.sh）。
+#   - 若宿主同时起了原生 qdrant/ollama，端口 6333/11434 会冲突 —— 两路二选一。
+#   - infinity 容器需要 ./models/bge-m3 与 ./models/bge-reranker-v2-m3 存在（与本地同源权重）。
 
 services:
   qdrant:
-    # 必须与 Dockerfile 的 ARG QDRANT_VERSION 保持同一版本：两者共用 ./qdrant_storage，
-    # 而 Qdrant 存储**不支持降级** —— latest 一旦拉到新版写过数据，镜像里的固定版本就
-    # 打不开该目录（entrypoint 会在"60 秒未就绪"处退出）。
     image: qdrant/qdrant:v1.19.1
     container_name: qdrant
-    restart: always
+    restart: unless-stopped
     ports:
       # 只绑回环：默认的 6333:6333 会发布到所有网卡，而鉴权默认关闭（API_KEY 为空），
       # 任何能连到本机的客户端都能读/删整个索引。确需远程访问时再放开并同时设
@@ -30,8 +63,137 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      - qdrant-network
+      - rag
+
+  ollama:
+    # 与 Dockerfile 二进制版对齐（ARG OLLAMA_VERSION=0.34.4）；镜像 tag 拉不到时改
+    # 同版本其它 tag 或 latest：版本漂移只影响能力（如 DRY 是否支持），API 稳定。
+    image: ollama/ollama:0.34.4
+    container_name: rag-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"   # 本地原生进程（python chatbot.py serve）也能直连
+    environment:
+      # ── 部署并发/内存档（与 entrypoint.sh 的"魔塔部署并发档"逐一对应）──────────
+      # 单槽 KV 已由 RAG_NUM_CTX=4096 压到 ~0.15G，4 槽约 +0.6G；权重 ~2.7G 常驻。
+      # OLLAMA_NUM_THREADS 用 ${VAR:-2} 允许宿主 .env 覆盖（原生/大核机器可调大）。
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
+      - OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-1}
+      - OLLAMA_NUM_THREADS=${OLLAMA_NUM_THREADS:-2}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
+    volumes:
+      # 复用本地 Ollama 模型目录（~/.ollama/models，含 qwen3.5:4b-q4_K_M）：
+      # 与本地原生权重逐字节同一份，零重拉。只读挂载，容器内不写。
+      - ~/.ollama/models:/root/.ollama/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/11434; printf \"GET /api/version HTTP/1.0\\r\\n\\r\\n\" >&3; read -r line <&3; [[ $$line == *200* ]]'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - rag
+
+  app:
+    # 应用镜像（Dockerfile ALL-IN-ONE，含构建期烘焙的嵌入/重排权重）。entrypoint 覆盖为
+    # 空、command 直接起 Streamlit —— 容器内不跑 qdrant/ollama。嵌入向量查询走 embed
+    # 容器（OpenAI 契约）；重排走本进程 torch（未拆分）。
+    build:
+      context: .
+      args:
+        - BAKE_MODELS=1
+        - BAKE_OLLAMA=1
+    image: rag-chatbot
+    container_name: rag-app
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      embed:
+        condition: service_healthy
+    environment:
+      - QDRANT_HOST=qdrant          # 服务名互联（默认 localhost）
+      - OLLAMA_BASE_URL=http://ollama:11434
+      # 嵌入查询侧交给现成服务容器（OpenAI /v1/embeddings，infinity）；重排回进程内
+      # （RERANK_BACKEND 概念已删，bge-reranker 无现成服务、恒与 Streamlit 同进程）。
+      - RAG_EMBED_BACKEND=http
+      - RAG_EMBED_URL=http://embed:8001/v1
+      - RAG_EMBED_MODEL_NAME=bge-m3
+      # 重排也走同一个 infinity 进程（一个进程托管两个模型、共享一份 torch）；
+      # 客户端会校验"全体候选都拿到分数"，服务端不得裁剪。
+      - RAG_RERANK_BACKEND=http
+      - RAG_RERANK_URL=http://embed:8001/v1
+      - RAG_RERANK_MODEL_NAME=bge-reranker-v2-m3
+      # RAG_WEIGHTS_BACKGROUND 不设：绕过 entrypoint 后无后台下载，权重已烘焙、直接可用。
+    env_file:
+      - .env                        # RAG_* 与本地同一份（含 RAG_NUM_CTX 等部署档）
+    ports:
+      - "127.0.0.1:7860:7860"
+    entrypoint: []
+    command:
+      - python
+      - -m
+      - streamlit
+      - run
+      - chatbot.py
+      - --server.address
+      - 0.0.0.0
+      - --server.port
+      - "${RAG_HTTP_PORT:-7860}"
+      - --server.headless
+      - "true"
+    networks:
+      - rag
+
+  embed:
+    # 检索模型服务：infinity（专用精简镜像，不装应用依赖、不烘焙权重），一进程两模型。
+    # curl 是镜像自带（健康检查依赖它）。两个 --served-model-name 必须与 app 的
+    # RAG_EMBED_MODEL_NAME / RAG_RERANK_MODEL_NAME 一致；模型权重挂载自宿主 ./models 只读。
+    build:
+      context: .
+      dockerfile: embed.Dockerfile
+    image: rag-embed
+    container_name: rag-embed
+    restart: unless-stopped
+    volumes:
+      - ./models:/models:ro
+    ports:
+      - "127.0.0.1:8001:8001"
+    command:
+      - infinity_emb
+      - v2
+      - --model-id
+      - /models/bge-m3
+      - --served-model-name
+      - bge-m3
+      - --model-id
+      - /models/bge-reranker-v2-m3
+      - --served-model-name
+      - bge-reranker-v2-m3
+      - --engine
+      - torch
+      - --device
+      - cpu
+      - --no-bettertransformer
+      - --url-prefix
+      - /v1
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+    healthcheck:
+      # 探测 /health：infinity 在服务就绪后才返回 200；冷加载由 start_period 吸收。
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - rag
 
 networks:
-  qdrant-network:
+  rag:
     driver: bridge

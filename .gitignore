@@ -15,11 +15,19 @@ artifacts/
 # ---- 源文本（体积大，可重新获取）----
 corpus/
 
+# ---- 本地缓存（infinity 模型影子视图等，可重建）----
+.cache/
+
+# ---- 本地原生二进制（如 qdrant，本地起用，不入仓）----
+.bin/
+*qdrant*.tar.gz
+
 # ---- 运行时产物 ----
 *.log
 *.log.*
 *.out
 *.pid
+.qdrant-initialized
 debug_*.png
 
 # ---- 本地备份 ----

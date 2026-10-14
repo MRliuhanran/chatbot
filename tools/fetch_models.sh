@@ -102,22 +102,57 @@ _download_model() {
     fi
 }
 
+# _model_spec <模型目录 basename> → "repo|checkpoint|文件…" ────────────────────
+# 清单**必须与宿主模型目录逐文件一致**：_model_content_fingerprint 按 (relpath, size,
+# 头 4096 字节 sha256) 全量哈希，少一个文件（哪怕运行时用不到，如 bge-m3 的
+# colbert_linear.pt）都会让容器算出的切分指纹与索引记录不符，_check_chunk_freshness
+# 直接 fail-closed —— 就是 2026-10-10 那类事故的复发路径。
+_model_spec() {
+    case "$1" in
+        bge-base-zh-v1.5)
+            printf '%s' "BAAI/bge-base-zh-v1.5|pytorch_model.bin|config.json pytorch_model.bin tokenizer.json tokenizer_config.json vocab.txt special_tokens_map.json sentence_bert_config.json config_sentence_transformers.json modules.json 1_Pooling/config.json" ;;
+        bge-m3)
+            printf '%s' "BAAI/bge-m3|pytorch_model.bin|config.json pytorch_model.bin tokenizer.json tokenizer_config.json special_tokens_map.json sentencepiece.bpe.model sentence_bert_config.json config_sentence_transformers.json modules.json colbert_linear.pt sparse_linear.pt" ;;
+        bge-reranker-base)
+            printf '%s' "BAAI/bge-reranker-base|model.safetensors|config.json model.safetensors tokenizer.json tokenizer_config.json sentencepiece.bpe.model special_tokens_map.json" ;;
+        bge-reranker-v2-m3)
+            printf '%s' "BAAI/bge-reranker-v2-m3|model.safetensors|config.json model.safetensors tokenizer.json tokenizer_config.json sentencepiece.bpe.model special_tokens_map.json" ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+# _spawn_model_download <name> <pid 变量名>：按清单表后台起一个下载并回填 pid。
+# 未登记的模型名**直接判失败**，不静默跳过：那会让应用加载 A、容器里却只有 B。
+_spawn_model_download() {
+    local _name="$1" _target="$2" _spec _repo _ckpt _files
+    printf -v "${_target}" '%s' ""
+    [ -n "${_name}" ] || { _log "❌ .env 未指定检索模型路径（RAG_EMBED_MODEL_PATH / RAG_RERANK_MODEL_PATH）"; return 1; }
+    if ! _spec="$(_model_spec "${_name}")"; then
+        _log "❌ 未知检索模型清单: ${_name}（先在 tools/fetch_models.sh 的 _model_spec 里登记）"
+        return 1
+    fi
+    _repo="${_spec%%|*}"; _spec="${_spec#*|}"
+    _ckpt="${_spec%%|*}"; _files="${_spec#*|}"
+    # shellcheck disable=SC2086  # _files 是空格分隔的清单，需按词展开
+    _download_model "${_name}" "${_repo}" "${_ckpt}" ${_files} &
+    printf -v "${_target}" '%s' "$!"
+}
+
 # _download_models ───────────────────────────────────────────────────────────
-# 两个检索模型并发下载（总字节不变；并发主要重叠 TLS/首字节空等）。
+# 下载**当前 .env 指定的**两个检索模型（按 RAG_EMBED_MODEL_PATH / RAG_RERANK_MODEL_PATH
+# 的 basename 查 _model_spec）。旧写法把模型名写死在函数里：.env 换成 bge-m3 之后容器
+# 仍只下 bge-base，应用加载 m3、容器里却只有 base —— 又一处"配置不生效"的静默原型。
 # 返回 0/1，并写 /tmp/model-download.status 供运行期状态通道读取。
 _download_models() {
-    local _dl_fail=0 _p1 _p2
-    _download_model bge-base-zh-v1.5 BAAI/bge-base-zh-v1.5 pytorch_model.bin \
-        config.json pytorch_model.bin tokenizer.json tokenizer_config.json vocab.txt \
-        special_tokens_map.json sentence_bert_config.json config_sentence_transformers.json \
-        modules.json 1_Pooling/config.json &
-    _p1=$!
-    _download_model bge-reranker-base BAAI/bge-reranker-base model.safetensors \
-        config.json model.safetensors tokenizer.json tokenizer_config.json \
-        sentencepiece.bpe.model special_tokens_map.json &
-    _p2=$!
-    wait "${_p1}" || _dl_fail=1
-    wait "${_p2}" || _dl_fail=1
+    local _dl_fail=0 _p1="" _p2=""
+    local _embed_name _rerank_name
+    _embed_name="$(basename "${RAG_EMBED_MODEL_PATH:-$(_env_get RAG_EMBED_MODEL_PATH)}")"
+    _rerank_name="$(basename "${RAG_RERANK_MODEL_PATH:-$(_env_get RAG_RERANK_MODEL_PATH)}")"
+    _spawn_model_download "${_embed_name}" _p1 || _dl_fail=1
+    _spawn_model_download "${_rerank_name}" _p2 || _dl_fail=1
+    if [ -n "${_p1}" ]; then wait "${_p1}" || _dl_fail=1; fi
+    if [ -n "${_p2}" ]; then wait "${_p2}" || _dl_fail=1; fi
     if [ "${_dl_fail}" = 0 ]; then
         printf 'ok\n' > /tmp/model-download.status
         _log "嵌入/重排权重检查结束"

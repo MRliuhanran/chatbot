@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 单容器编排：Qdrant → Ollama → 嵌入/重排权重按需下载 → 生成模型按需拉取 → Streamlit（前台）
+# 单容器编排：Qdrant → Ollama → 权重按需下载 → 检索模型服务(infinity，可选) → 生成模型按需拉取 → Streamlit（前台）
 # 端口与地址全部走 CLI 参数，不改仓库内任何配置文件（CLI 优先级高于 .streamlit/config.toml）。
 set -u
 
@@ -153,10 +153,10 @@ _log "qdrant 就绪（http://127.0.0.1:6333）"
 
 # ── 2. Ollama ──────────────────────────────────────────────────────────────
 # 生成模型常驻：Ollama 默认 5 分钟卸载，闲置后再问一次就要重新加载 3.4GB（首字多等数秒）。
-# 这是**服务端**变量，客户端 .env 对它无效（.env 里已注明）；容器内 ollama serve 由本脚本
-# 拉起，故在此显式导出默认值 —— 若部署方在 .env 设了 OLLAMA_KEEP_ALIVE，_load_dotenv
-# 已导出，${VAR:-...} 会沿用而非覆盖。峰值内存不变（提问时 LLM 与检索模型本就同时
-# 驻留），只提高闲置占用。
+# 这是**服务端**变量；单例模式（RAG_EXCLUSIVE_MODELS=1）下客户端每次请求都带
+# keep_alive=RAG_GEN_KEEP_ALIVE（=0），**请求级字段覆盖这里**，故本默认值只在
+# 非单例/其它客户端访问时生效。容器内 ollama serve 由本脚本拉起，故在此显式导出默认值
+# —— 若部署方在 .env 设了 OLLAMA_KEEP_ALIVE，_load_dotenv 已导出，${VAR:-...} 会沿用。
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 ollama serve >/tmp/ollama.log 2>&1 &
 _ollama_pid=$!
@@ -168,6 +168,74 @@ _log "ollama 就绪（http://127.0.0.1:11434, models=${OLLAMA_MODELS}）"
 #     可跳过。就绪判据=清单文件全部非空；下到暂存目录齐了再整目录改名就位，避免应用读到
 #     半截权重（详见 _download_model）。后台运行，不占住 7860。
 _download_models &
+
+# ── 3.5 检索模型服务（infinity）：嵌入 + 重排同一个进程、共享一份 torch ───────────
+# RAG_EMBED_BACKEND / RAG_RERANK_BACKEND 任一为 http 时才起。业务进程（Streamlit）因此
+# 不再持有检索模型；查询侧按 OpenAI /v1/embeddings 与 Cohere 风格 /v1/rerank 调它。
+# **必须在权重就绪之后**（infinity 启动时找不到模型目录会直接退出），故先用子 shell 轮询
+# 目录、再 exec 成 infinity —— exec 保住 pid，4.5 的存活哨兵才盯得住真进程。
+# 注意：单例（RAG_EXCLUSIVE_MODELS=1）下 infinity 常驻它的两个模型且**没有卸载接口**，
+# 互斥只能从另一侧保证 —— 生成模型答完即卸（RAG_GEN_KEEP_ALIVE=0）。
+_infinity_pid=""
+if [ "${RAG_EMBED_BACKEND:-torch}" = "http" ] || [ "${RAG_RERANK_BACKEND:-torch}" = "http" ]; then
+    _embed_dir="/app/models/$(basename "${RAG_EMBED_MODEL_PATH:-./models/bge-m3}")"
+    _rerank_dir="/app/models/$(basename "${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-base}")"
+    _embed_served="${RAG_EMBED_MODEL_NAME:-$(basename "${_embed_dir}")}"
+    _rerank_served="${RAG_RERANK_MODEL_NAME:-$(basename "${_rerank_dir}")}"
+    # 端口从 RAG_EMBED_URL 派生（单一来源），解析不出来才退 8001
+    _inf_port="$(printf '%s' "${RAG_EMBED_URL:-}" | sed -n 's|^[a-z]*://[^:/]*:\([0-9][0-9]*\).*|\1|p')"
+    _inf_port="${_inf_port:-8001}"
+    (
+        _i=0
+        while [ "${_i}" -lt 300 ]; do
+            [ -d "${_embed_dir}" ] && [ -d "${_rerank_dir}" ] && break
+            _i=$((_i + 1))
+            sleep 2
+        done
+        _log "检索模型服务启动中：embed=${_embed_served} rerank=${_rerank_served} port=${_inf_port}（日志 /tmp/infinity.log）"
+        exec infinity_emb v2 \
+            --model-id "${_embed_dir}" --served-model-name "${_embed_served}" \
+            --model-id "${_rerank_dir}" --served-model-name "${_rerank_served}" \
+            --engine torch --device cpu --no-bettertransformer \
+            --url-prefix /v1 --host 127.0.0.1 --port "${_inf_port}" \
+            >/tmp/infinity.log 2>&1
+    ) &
+    _infinity_pid=$!
+fi
+
+# ── 3.5 检索模型服务（infinity）：嵌入 + 重排同一个进程、共享一份 torch ───────────
+# RAG_EMBED_BACKEND / RAG_RERANK_BACKEND 任一为 http 时才起。业务进程（Streamlit）因此
+# 不再持有检索模型；查询侧按 OpenAI /v1/embeddings 与 Cohere 风格 /v1/rerank 调它。
+# **必须在权重就绪之后**（infinity 启动时找不到模型目录会直接退出），故先用子 shell 轮询
+# 目录、再 exec 成 infinity —— exec 保住 pid，4.5 的存活哨兵才盯得住真进程。
+# 注意：单例（RAG_EXCLUSIVE_MODELS=1）下 infinity 常驻它的两个模型且**没有卸载接口**，
+# 互斥只能从另一侧保证 —— 生成模型答完即卸（RAG_GEN_KEEP_ALIVE=0）。
+_infinity_pid=""
+if [ "${RAG_EMBED_BACKEND:-torch}" = "http" ] || [ "${RAG_RERANK_BACKEND:-torch}" = "http" ]; then
+    _embed_dir="/app/models/$(basename "${RAG_EMBED_MODEL_PATH:-./models/bge-m3}")"
+    _rerank_dir="/app/models/$(basename "${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-base}")"
+    _embed_served="${RAG_EMBED_MODEL_NAME:-$(basename "${_embed_dir}")}"
+    _rerank_served="${RAG_RERANK_MODEL_NAME:-$(basename "${_rerank_dir}")}"
+    # 端口从 RAG_EMBED_URL 派生（单一来源），解析不出来才退 8001
+    _inf_port="$(printf '%s' "${RAG_EMBED_URL:-}" | sed -n 's|^[a-z]*://[^:/]*:\([0-9][0-9]*\).*|\1|p')"
+    _inf_port="${_inf_port:-8001}"
+    (
+        _i=0
+        while [ "${_i}" -lt 300 ]; do
+            [ -d "${_embed_dir}" ] && [ -d "${_rerank_dir}" ] && break
+            _i=$((_i + 1))
+            sleep 2
+        done
+        _log "检索模型服务启动中：embed=${_embed_served} rerank=${_rerank_served} port=${_inf_port}（日志 /tmp/infinity.log）"
+        exec infinity_emb v2 \
+            --model-id "${_embed_dir}" --served-model-name "${_embed_served}" \
+            --model-id "${_rerank_dir}" --served-model-name "${_rerank_served}" \
+            --engine torch --device cpu --no-bettertransformer \
+            --url-prefix /v1 --host 127.0.0.1 --port "${_inf_port}" \
+            >/tmp/infinity.log 2>&1
+    ) &
+    _infinity_pid=$!
+fi
 
 # ── 4. 生成模型：缺失则后台拉取，不阻塞对外服务（首启多等几分钟，期间问答会失败）──
 #     实现与"已就绪"判据见 tools/fetch_models.sh 的 _pull_ollama_model（构建期已烘焙时
@@ -190,7 +258,7 @@ fi
 # 刻意只告警不自动重启：Qdrant 崩溃循环 + 反复打开损坏的 WAL 比直接停机更糟，重启策略
 # 该交给编排层（restart: unless-stopped）或人。每个进程只喊一次，避免刷屏。
 (
-    _said_q=0; _said_o=0
+    _said_q=0; _said_o=0; _said_m=0
     while :; do
         sleep 30
         if [ "${_said_q}" = 0 ] && ! _pid_alive "${_qdrant_pid}"; then
@@ -200,6 +268,10 @@ fi
         if [ "${_said_o}" = 0 ] && ! _pid_alive "${_ollama_pid}"; then
             _said_o=1
             _log "🔴 ollama 已死（pid=${_ollama_pid}）→ 生成必然失败；容器不自动重启，详见 /tmp/ollama.log"
+        fi
+        if [ -n "${_infinity_pid}" ] && [ "${_said_m}" = 0 ] && ! _pid_alive "${_infinity_pid}"; then
+            _said_m=1
+            _log "🔴 检索模型服务（infinity）已死（pid=${_infinity_pid}）→ 嵌入/重排全部失败、检索必挂；详见 /tmp/infinity.log"
         fi
     done
 ) &

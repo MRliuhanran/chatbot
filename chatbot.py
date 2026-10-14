@@ -16,7 +16,6 @@ import traceback
 import unicodedata
 import warnings
 from collections import Counter, defaultdict
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -285,7 +284,7 @@ def _chat_options(temperature=None, num_ctx=None, num_predict=None):
     没人注意到的高惩罚"。
     """
     _predict = int(NUM_PREDICT if num_predict is None else num_predict)
-    return {
+    opts = {
         "temperature": TEMPERATURE if temperature is None else temperature,
         "num_ctx": int(NUM_CTX if num_ctx is None else num_ctx),
         # ≤0 = 不限长，映射到 Ollama 的 -1（默认即无限）；正数才是硬上限。
@@ -299,6 +298,57 @@ def _chat_options(temperature=None, num_ctx=None, num_predict=None):
         "frequency_penalty": float(GEN_FREQUENCY_PENALTY),
         "seed": int(GEN_SEED),
     }
+    # num_gpu 只在这里组装（**必须在 options 里**，顶层同名字段 Ollama 不认）：
+    # 取"生效值"而不是原始模式串 —— auto 模式下生效值是 999，回落之后是 None。
+    _ng = _gen_num_gpu_effective()
+    if _ng is not None:
+        opts["num_gpu"] = _ng
+    return opts
+
+
+def _keep_alive_value():
+    """Ollama 的 keep_alive：空=不发（用服务端默认）；纯数字=秒；"5m" 之类原样透传。
+
+    单例模式下由 RAG_EXCLUSIVE_MODELS 派生为 0（答完即卸），但也可以显式写
+    RAG_GEN_KEEP_ALIVE=30s 做"半常驻"。服务端 OLLAMA_KEEP_ALIVE 是**另一个**开关
+    （魔塔 entrypoint 默认 -1=永不卸），请求级字段会覆盖它。
+    """
+    if not GEN_KEEP_ALIVE:
+        return None
+    try:
+        return int(GEN_KEEP_ALIVE)
+    except ValueError:
+        return GEN_KEEP_ALIVE
+
+
+# GPU 优先/回落的进程内状态（RAG_GEN_NUM_GPU=auto）。回落是**一次性**的：一旦确认这台机器
+# 起不来 GPU，本进程内所有后续请求都不再尝试，避免每次问答都白等一次失败。
+GEN_AUTO_NUM_GPU = 999
+_GEN_GPU_LOCK = threading.Lock()
+_GEN_GPU_STATE = {"fallback": False}
+
+
+def _gen_num_gpu_effective():
+    """本次请求要发的 num_gpu；None = 不发该字段（交给 llama.cpp，纯 CPU 机上即全 CPU）。"""
+    if GEN_NUM_GPU == "auto":
+        with _GEN_GPU_LOCK:
+            if _GEN_GPU_STATE["fallback"]:
+                return None
+        return GEN_AUTO_NUM_GPU
+    return GEN_NUM_GPU
+
+
+def _gen_gpu_fallback(reason):
+    """auto 模式：把 num_gpu 永久降级为"不发该字段"。返回 True 表示这次真的落了一次
+    （调用方据此决定是否重发）；非 auto 或已经落过则返回 False。"""
+    if GEN_NUM_GPU != "auto":
+        return False
+    with _GEN_GPU_LOCK:
+        if _GEN_GPU_STATE["fallback"]:
+            return False
+        _GEN_GPU_STATE["fallback"] = True
+    log(f"⚠️  生成侧 GPU 不可用（{reason}）→ RAG_GEN_NUM_GPU=auto 回落为 CPU，本进程内不再尝试 GPU")
+    return True
 
 
 def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, think=None):
@@ -320,7 +370,21 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
     try:
         # try 内发起请求：requests 缺失/连接失败要走 EVENT_ERROR，而不是从生成器里
         # 抛出去砸消费侧（requests 由 _ollama_session 惰性 import，失败同样落在这层）。
-        r = _ollama_session().post( API_URL, json={ "model": MODEL, "messages": messages, "stream": True, "think": use_think, "options": options, }, stream=True, timeout=TIMEOUT, )
+        # keep_alive 是**请求级**字段（覆盖服务端的 OLLAMA_KEEP_ALIVE）：单例模式下置 0，
+        # 答完让 Ollama 立刻把权重还回去，下一轮检索才不会与生成模型同时驻留。
+        # 未设（GEN_KEEP_ALIVE 为空）时不发该字段，行为与改造前逐字节一致。
+        payload = { "model": MODEL, "messages": messages, "stream": True, "think": use_think, "options": options, }
+        _ka = _keep_alive_value()
+        if _ka is not None:
+            payload["keep_alive"] = _ka
+        r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=TIMEOUT, )
+        if r.status_code != 200 and _gen_gpu_fallback(f"HTTP {r.status_code} {r.text[:160]!r}"):
+            # auto 模式 + 本进程首次：去掉 num_gpu 重发一次。此刻**尚未产出任何 token**
+            # （流都还没开始读），所以不构成"生成重试"，没有任何已生成内容被丢弃。
+            # options 重新组装（而不是就地 pop）：回落状态已翻转，_chat_options 自然不再放 num_gpu。
+            r.close()
+            payload["options"] = _chat_options(temperature, num_ctx, num_predict)
+            r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=TIMEOUT, )
         if r.status_code != 200:
             yield EVENT_ERROR, f"HTTP {r.status_code} {r.text[:300]}"
             return
@@ -330,7 +394,7 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
             chunk = json.loads(line)
             if chunk.get("error"):
                 # return 而不是 continue：本函数对外承诺「error 与 done 互斥」，消费侧
-                # （_run_assistant_turn 只在 done 时入历史、_handle_ask 只在 done 时收尾）
+                # （唯一的消费方 _run_assistant_turn 只在 done 时入历史）
                 # 全靠这条。旧写法 continue 会让同一流后面的 {"done":true} 照常产出 done，
                 # 于是「被错误打断的残缺答案」同时满足 done 与非空，被写进会话历史 ——
                 # 而页面只渲染了错误，那段答案用户一个字符都没见过。
@@ -358,6 +422,65 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
             r.close()
 
 
+# ── 单例协调：生成模型与检索模型的互斥驻留（RAG_EXCLUSIVE_MODELS）──
+def _ollama_loaded_models():
+    """Ollama 当前驻留的模型名（GET /api/ps）。失败抛异常，由调用方决定降级方式。"""
+    r = _ollama_session().get(f"{OLLAMA_BASE_URL}/api/ps", timeout=MODEL_HTTP_TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} {r.text[:200]}")
+    data = r.json() if r.text else {}
+    names = []
+    for item in (data or {}).get("models") or []:
+        name = item.get("name") or item.get("model") or ""
+        if name:
+            names.append(name)
+    return names
+
+
+def _model_name_matches(loaded, wanted):
+    """Ollama 的 /api/ps 名字可能带/不带 :latest（或别的 tag）：去掉 tag 后比较。"""
+    a = str(loaded).strip()
+    b = str(wanted).strip()
+    if a == b:
+        return True
+    return bool(a) and a.split(":")[0] == b.split(":")[0]
+
+
+def ensure_generation_unloaded(timeout=None):
+    """单例模式：确认生成模型已从 Ollama 卸出，必要时发一次 keep_alive=0。
+
+    必须在**检索之前**调用——否则检索模型与生成模型同时驻留，峰值回到"两者之和"。
+    超时只告警、不阻断：用户的问题不该因为一次卸载没完成而失败，但这条告警必须显式，
+    因为它意味着本轮内存峰值会超（失效原型：静默降级）。
+    """
+    if not EXCLUSIVE_MODELS:
+        return True
+    _timeout = float(MODEL_HTTP_TIMEOUT if timeout is None else timeout)
+    try:
+        loaded = _ollama_loaded_models()
+    except Exception as exc:
+        log(f"⚠️  单例：读取 Ollama /api/ps 失败，跳过生成模型卸载确认: {type(exc).__name__}: {exc}")
+        return False
+    if not any(_model_name_matches(n, MODEL) for n in loaded):
+        return True
+    log("♻️  单例：生成模型仍驻留，先发 keep_alive=0 让它卸载，再加载检索模型")
+    try:
+        # Ollama 的卸载惯例：不带 prompt 的一次请求 + keep_alive=0（模型已驻留，不会重新加载）
+        _ollama_session().post( f"{OLLAMA_BASE_URL}/api/generate", json={ "model": MODEL, "keep_alive": 0, }, timeout=_timeout, )
+    except Exception as exc:
+        log(f"⚠️  单例：发送卸载请求失败（继续轮询）: {type(exc).__name__}: {exc}")
+    deadline = time.time() + _timeout
+    while time.time() < deadline:
+        try:
+            if not any(_model_name_matches(n, MODEL) for n in _ollama_loaded_models()):
+                return True
+        except Exception:
+            return False
+        time.sleep(0.5)
+    log(f"⚠️  单例：生成模型 {_timeout:.0f} 秒内未卸出（/api/ps 仍显示它），本轮将与检索模型同时驻留，内存峰值可能超限")
+    return False
+
+
 # ── 通用文本谓词 ──
 def _has_searchable_content(text):
     # 认 Unicode 字母与数字（CJK 的 Lo、数字的 Nd）；标点、符号、零宽等格式字符不算内容。
@@ -374,8 +497,6 @@ def _has_searchable_content(text):
 # RAG_BOOKS_DIR 是 RAG_DATA_DIR 的遗留别名（仍生效，老部署迁移用；新配置只写 RAG_DATA_DIR）
 DATA_DIR = os.getenv("RAG_DATA_DIR") or os.getenv("RAG_BOOKS_DIR") or "corpus"
 DOC_GLOB = os.getenv("RAG_DOC_GLOB", "*.txt")
-DOMAIN_NAME = os.getenv("RAG_DOMAIN_NAME", "垂直领域知识库")
-DOMAIN_DESCRIPTION = os.getenv("RAG_DOMAIN_DESCRIPTION", "")
 SOURCE_FIELD = (os.getenv("RAG_SOURCE_FIELD") or "source").strip() or "source"
 SOURCE_LABEL = os.getenv("RAG_SOURCE_LABEL", "来源")
 _RESERVED_SOURCE_FIELDS = {
@@ -383,8 +504,8 @@ _RESERVED_SOURCE_FIELDS = {
     "contextual_text", "parent_id", "parent_chunk_count", "build_id", "lexicon_id",
     # 见 INDEX_BUILD_ID_FIELD 一组：这两个字段名也是内部保留键，不能被来源字段占用
     "chunk_fingerprint",
-    # 以下不是 payload 字段，而是**对外输出**要用的键：SOURCE_FIELD 原样写进 /search 的
-    # _result_json 与 steps.context_sources，同名即就地覆盖 —— score/text/context/n/
+    # 以下不是 payload 字段，而是**对外输出**要用的键：SOURCE_FIELD 原样写进
+    # steps.context_sources 等诊断输出，同名即就地覆盖 —— score/text/context/n/
     # rerank_score/source_label/point_id 会静默变成来源字符串（响应看着正常，字段全错）。
     # source 是默认值本身，不能列入，否则启动必炸。
     "score", "text", "context", "n", "rerank_score", "source_label", "point_id",
@@ -400,6 +521,61 @@ RERANK_BATCH = env_int_min("RAG_RERANK_BATCH", 32, 1)  # padding 隔离下分数
 RERANK_MAX_LENGTH = env_int_min("RAG_RERANK_MAX_LENGTH", 384, 1)
 RERANK_ON = env_choice("RAG_RERANK_ON", "child", ("child", "parent"))
 PRELOAD_MODELS = env_bool("RAG_PRELOAD", True)  # api/serve 启动时后台预热模型与词典，首查询冷加载提前到启动期
+# 检索侧嵌入后端：torch=进程内（默认）；http=现成的 OpenAI 兼容嵌入服务（compose 用
+# infinity 容器起 bge-base-zh-v1.5，而**不**是自建微服务）。http 只作用于检索查询侧与
+# 预热：process 的分块语义定界与 index 入库固定进程内 torch（换后端不改切分/嵌入代码
+# 指纹，索引无需重建）。**重排没有再拆分**：bge-reranker 没有能直接用的现成服务
+# （infinity × XLM-R 有 upstream bug），恒与 Streamlit 同进程（torch）。非法取值启动即报错。
+EMBED_BACKEND = env_choice("RAG_EMBED_BACKEND", "torch", ("torch", "http"))
+# OpenAI 兼容 base_url：以 /v1 结尾（OpenAI SDK 惯例），客户端拼 "{url}/embeddings"。
+# infinity 的 --url-prefix /v1 与之对应；若服务端无前缀则把 RAG_EMBED_URL 设为
+# http://host:port（端点变 /embeddings）。RAG_EMBED_URL 的 /v1 就是契约的一部分。
+EMBED_URL = (os.getenv("RAG_EMBED_URL") or "http://127.0.0.1:8001/v1").rstrip("/")
+# http 端按 OpenAI /v1/embeddings 契约通信（infinity 等现成服务都实现它）；model 字段填
+# 服务端注册名（infinity 的 --served-model-name，默认即模型目录 basename）。
+EMBED_MODEL_NAME = (os.getenv("RAG_EMBED_MODEL_NAME") or "bge-base-zh-v1.5").strip() or "bge-base-zh-v1.5"
+# 嵌入服务 HTTP 超时（秒）：指向 embed 容器。首请求含服务端冷加载，预热线程已把它提前到
+# 启动期，这里取中档超时就够（冷启动失败有预热告警兜底）。
+MODEL_HTTP_TIMEOUT = env_int_min("RAG_MODEL_HTTP_TIMEOUT", 60, 1)
+# 重排后端与嵌入对称：torch=进程内（默认）；http=现成的 Cohere/Jina 风格 /rerank 服务，
+# 与嵌入共用同一个 infinity 进程（一个进程托管两个模型、共享一份 torch 运行时；infinity
+# 的 /rerank 就是"本地版 Cohere rerank"）。**重排的 http 契约比嵌入严**：响应必须一次
+# 给回**全部**候选的分数、服务端不得裁剪 —— 少给一条就直接报错，因为按子集排序会静默
+# 破坏"对全体候选统一打分"这条不变量。
+RERANK_BACKEND = env_choice("RAG_RERANK_BACKEND", "torch", ("torch", "http"))
+RERANK_URL = (os.getenv("RAG_RERANK_URL") or EMBED_URL).rstrip("/")
+RERANK_MODEL_NAME = (os.getenv("RAG_RERANK_MODEL_NAME") or "bge-reranker-v2-m3").strip() or "bge-reranker-v2-m3"
+# ── 单例（模型互斥驻留）+ 懒加载 ─────────────────────────────────────────────
+# 把峰值从"三者之和"压到"最大阶段"：检索阶段只驻留嵌入+重排，生成阶段只驻留 LLM。
+# RAG_PRELOAD=0 关掉启动预热（懒加载）；RAG_EXCLUSIVE_MODELS=1 打开互斥协调（每轮检索前
+# 确认生成模型已卸、检索完成后释放进程内检索模型）；RAG_GEN_KEEP_ALIVE 决定生成模型答完
+# 是否立刻卸载（0=即卸；空=不发该字段，用 Ollama 服务端默认）。**依赖 PyTorch 真把内存
+# 还给系统**——CPU 上缓存分配器会留着，故这是"8G 机器上跑最高配"的过渡手段，不是容量解。
+EXCLUSIVE_MODELS = env_bool("RAG_EXCLUSIVE_MODELS", False)
+GEN_KEEP_ALIVE = (os.getenv("RAG_GEN_KEEP_ALIVE") or ("0" if EXCLUSIVE_MODELS else "")).strip()
+# 生成模型的 GPU 层数（llama.cpp 的 -ngl，Ollama 暴露为 options.num_gpu）：
+#   空    = 不发该字段，由 llama.cpp 按**当时**可用显存自动分层（改造前的默认行为）
+#   0     = 全 CPU
+#   999   = 全 GPU（固定档，不回落）
+#   auto  = **GPU 优先、起不来回落 CPU**：先按 999 发；若首个请求在**产出任何 token 之前**
+#           失败（HTTP 非 200），去掉该字段重发一次，并在**本进程内**记住、之后不再尝试 GPU。
+#           这是"设备不可用"的启动级回落，不是"生成失败重试"——它发生在零 token 产出之前，
+#           不会丢弃任何已生成内容（生成仍然无长度/时间闸、不重试）。同一份 .env 因此在
+#           本地（Metal）与纯 CPU 容器（魔搭）都能用。
+# **只改"谁来算"，不改数值**；但换分层 = 换 kernel（Metal vs CPU BLAS），浮点累加顺序不同，
+# 贪心解码的长答案可能不再逐字可复现 —— 要严格复现就把档位固定住、不要每轮变。
+_gpu_raw = (os.getenv("RAG_GEN_NUM_GPU") or "").strip()
+GEN_NUM_GPU = None
+if _gpu_raw:
+    if _gpu_raw.lower() == "auto":
+        GEN_NUM_GPU = "auto"
+    else:
+        try:
+            GEN_NUM_GPU = int(_gpu_raw)
+        except ValueError:
+            raise ValueError(f"RAG_GEN_NUM_GPU 必须是整数或 auto（空=自动分层、0=全 CPU、999=全 GPU、auto=GPU 优先失败回落），收到 {_gpu_raw!r}") from None
+        if GEN_NUM_GPU < -1:
+            raise ValueError(f"RAG_GEN_NUM_GPU 不能小于 -1（-1=自动），收到 {GEN_NUM_GPU}")
 CHILD_MAX_TOKENS = env_int_min("RAG_CHILD_MAX_TOKENS", 128, 1)
 PARENT_MAX_TOKENS = env_int_min("RAG_PARENT_MAX_TOKENS", 512, 1)
 CHUNK_OVERLAP = env_int("RAG_CHUNK_OVERLAP", 32)
@@ -494,9 +670,24 @@ DEDUP_BY_PARENT = env_bool("RAG_DEDUP_BY_PARENT", True)
 BGE_QUERY_INSTRUCTION = os.getenv("RAG_EMBED_QUERY_INSTRUCTION", "")
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
-BM25_TEXT_OPTIONS = { "tokenizer": "word", "stemmer": {"type": "none"}, "stopwords": {}, "ascii_folding": True, }
 BM25_MODEL_NAME = "qdrant/bm25"
-_PUNCT_AND_WHITESPACE = set("，。！？、；：\u201c\u201d\u2018\u2019《》…—（）()[]{}<>!?,.;:'\"-·　 \n\t")
+
+
+def bm25_options():
+    """稀疏通道的 BM25 配置。**分词与停用词都交给 Qdrant**（2026-10-14 组件化）。
+
+    · tokenizer 由 "word" 改为 "multilingual"。实测（同一批文档 + 查询"中国革命的对象是谁"）：
+      "word" / "whitespace" / "prefix" 对中文整句**零召回**（没空格 → 整句 1 个 token），
+      "multilingual" 正确命中（相关 5.069 vs 无关 0.221）。故 Python 侧的 jieba 预分词整层删除。
+    · stopwords 用 Qdrant 内置中文表（"chinese"）；关掉时用 {} —— 字符串 "none" 不是合法值
+      （实测 400 Bad Request），"没有停用词"要用空对象表达。
+    """
+    return {
+        "tokenizer": "multilingual",
+        "stemmer": {"type": "none"},
+        "stopwords": "chinese" if STOPWORDS_ENABLED else {},
+        "ascii_folding": True,
+    }
 
 
 def history_to_messages(history):
@@ -601,6 +792,22 @@ def load_reranker_model(device=None):
     model = AutoModelForSequenceClassification.from_pretrained( model_path, torch_dtype=dtype ).to(device)
     model.eval()
     return tokenizer, model, device
+
+
+def load_rerank_tokenizer_only():
+    """http 重排后端下只加载 tokenizer（几十 MB），不加载权重。
+
+    steps 的 token 预算列需要它；拿不到就返回 None，由调用点把这几列留空 —— 不编造数字，
+    也不因为"算不出 trace 的辅助列"而让检索失败。
+    """
+    try:
+        from transformers import AutoTokenizer
+        if not _model_dir_ready(RERANK_MODEL_PATH):
+            return None
+        return AutoTokenizer.from_pretrained(RERANK_MODEL_PATH)
+    except Exception as exc:
+        log(f"⚠️  http 重排：本地重排 tokenizer 加载失败（steps 的 token 预算列将留空）: {type(exc).__name__}: {exc}")
+        return None
 
 
 def _embed_batch(texts, tokenizer, model, device, autocast=False):
@@ -1637,18 +1844,14 @@ def lexicon_fingerprint():
     parts.append(f"ALIASES_FILE={ALIASES_FILE}")
     parts.append(f"STOPWORDS_FILE={STOPWORDS_FILE}")
     parts.append(f"aliases={int(ALIASES_ENABLED)},stopwords={int(STOPWORDS_ENABLED)}")
-    try:
-        from importlib.metadata import version
-        parts.append("jieba=" + (version("jieba") or "unknown"))
-    except Exception:
-        parts.append("jieba=unknown")
-    parts.append("bm25=" + json.dumps(BM25_TEXT_OPTIONS, sort_keys=True))
-    # BM25 模型名、分词标点集与解析/归一链路源码同样决定稀疏词空间：漏掉会让换编码后
-    # 指纹不变、stages 误报 C 新鲜，稀疏索引静默错配。
+    # 分词/停用词已交给 Qdrant（bm25_options 的 tokenizer 与 stopwords 就是词空间的定义），
+    # 故不再有 jieba 版本项与标点集项；选项本身仍必须进指纹（改 tokenizer 就是改词空间）。
+    parts.append("bm25=" + json.dumps(bm25_options(), sort_keys=True))
+    # BM25 模型名与解析/归一链路源码同样决定稀疏词空间：漏掉会让换编码后指纹不变、
+    # stages 误报 C 新鲜，稀疏索引静默错配。
     parts.append("bm25_model=" + BM25_MODEL_NAME)
-    parts.append("punct=" + "".join(sorted(_PUNCT_AND_WHITESPACE)))
     import inspect
-    for name in ("parse_aliases", "parse_stopwords", "_read_aliases", "_read_stopwords", "load_lexicon", "normalize_aliases", "bm25_tokenize", "sparse_encode"):
+    for name in ("parse_aliases", "parse_stopwords", "_read_aliases", "_read_stopwords", "load_lexicon", "normalize_aliases", "sparse_text", "sparse_encode"):
         fn = globals().get(name)
         try:
             parts.append(f"{name}:" + inspect.getsource(fn))  # type: ignore[arg-type]
@@ -1667,42 +1870,37 @@ def normalize_aliases(text):
     return alias_re.sub(lambda m: alias_map[m.group(0)], text)
 
 
-def bm25_tokenize(text):
-    import jieba
-    _, _, stopwords = load_lexicon()
-    text = normalize_aliases(text or "")
-    tokens = []
-    for token in jieba.cut_for_search(text):
-        token = token.strip()
-        if not token or all(ch in _PUNCT_AND_WHITESPACE for ch in token):
-            continue
-        if stopwords and token in stopwords:
-            continue
-        tokens.append(token)
-    return " ".join(tokens)
+def sparse_text(text):
+    """稀疏通道的文本准备：**只做领域别名归一**，分词与停用词都交给 Qdrant。
+
+    改造前这里是 jieba 的 cut_for_search 分词 + 标点过滤 + 停用词过滤，并为此维护一把串行锁
+    （jieba 分词非线程安全，并发会产出被截断的分词 → 稀疏 Document 变空 → Qdrant 才回 422，
+    属"静默错配"）。现在切词在服务端（tokenizer=multilingual），Python 侧只剩"别名归一"
+    这一件真领域知识，分词器与锁一并删除。
+    """
+    normalized = normalize_aliases(text or "")
+    # 纯标点/空白：服务端切不出任何 term，空文档会让 BM25 静默失败 → 用哨兵占位
+    return normalized if any(ch.isalnum() for ch in normalized) else _EMPTY_SPARSE_TEXT
 
 
-_EMPTY_SPARSE_TEXT = "\u200b"  # bm25_tokenize 为空时 sparse_encode 的占位（见下）
+_EMPTY_SPARSE_TEXT = "\u200b"  # sparse_text 判空时的哨兵（零宽空格）
 
 
 def sparse_encode(text):
     from qdrant_client import models
-    tokenized = bm25_tokenize(text)
-    if not tokenized:
-        tokenized = _EMPTY_SPARSE_TEXT  # 零宽空格，避免空文档导致 BM25 静默失败
-    return models.Document(text=tokenized, model=BM25_MODEL_NAME, options=BM25_TEXT_OPTIONS)
+    return models.Document(text=sparse_text(text), model=BM25_MODEL_NAME, options=bm25_options())
 
 
 def sparse_terms_of(text):
-    """文本在稀疏通道里的**真实** term 列表（已滤掉停用词与纯标点）。
+    """稀疏通道**有没有可检索内容**（不再是"有哪些词"）。
 
-    为什么不能看 `sparse_encode` 返回的 `Document.text` 判空：空分词会被替换成零宽空格
-    哨兵 `_EMPTY_SPARSE_TEXT`，而 Python 的 `str.strip()` 不认为 U+200B 是空白，于是
-    哨兵让"是否为空"永远为真 —— 稀疏通道在整句命中停用词时既不产出召回、也不报错、
-    也不留任何痕迹（"静默"失效原型）。这里与 sparse_encode 共用 bm25_tokenize，
-    使"这个查询在稀疏通道有没有词"只有一个判据。
+    分词在服务端，Python 拿不到 term 列表，所以判据退一步：别名归一后还剩字母/数字就有
+    内容，纯标点/纯空白就没有。调用方（hybrid_search）据此既不融合也不召回 —— 与改造前
+    "分词为空即退化为纯稠密"是同一条判据口径，只是粒度从"逐词"变成"有没有"。
+    返回列表是为了保持调用方的形状不变（判真值 + 记进 steps）。
     """
-    return bm25_tokenize(text).split()
+    prepared = sparse_text(text)
+    return [] if prepared == _EMPTY_SPARSE_TEXT else [prepared]
 
 
 def _index_text(rec):
@@ -1903,19 +2101,30 @@ def _gc_embed_cache_tmp():
 
 
 # ── 索引构建 ──
-def _upsert_batch_with_retry(client: Any, collection_name: str, points: list, retries: int = 1, delay: float = 2.0) -> str | None:
-    """单批 upsert：瞬时故障重试 retries 次；仍失败返回错误串，由调用方记账后继续写其余批。
-    继续写只为更快暴露完整失败面 —— 末尾 write_failures 非空一律 raise、不切别名，旧集合继续服务。"""
+# qdrant-client 的本地推理器是**每客户端一份、且内部没有锁**的：
+# qdrant_client/embed/model_embedder.py 用 self._embed_storage[model_name] 暂存待发向量，
+# 同一客户端上两个线程同时走同名 Document 就会互相 drain，实测
+# IndexError: pop from empty list（另一批表现为 422 "dense vector must not be empty"）。
+# 触发点是任何带 Document 的请求：并发写批（index）与双通道检索的稀疏分支（query_points）。
+# 故所有会走到本地推理的写调用在此串行化 —— 推理本身是毫秒级 CPU，瓶颈在 HTTP。
+# 这条锁只串行化**调用**，不改变"稠密与稀疏取同一份 _index_text"这条不变量。
+_QDRANT_INFERENCE_LOCK = threading.Lock()
+
+
+def _upsert_batch_with_retry(client: Any, collection_name: str, points: list, retries: int = 1) -> str | None:
+    """单批 upsert：瞬时故障立即重试 retries 次；仍失败返回错误串，由调用方记账后继续写其余批。
+    继续写只为更快暴露完整失败面 —— 末尾 write_failures 非空一律 raise、不切别名，旧集合继续服务。
+    重试不睡眠：写批已并发发出，等待只会占住 worker 槽；瞬时故障立即重发反而更快。"""
     last: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            client.upsert(collection_name=collection_name, points=points)
+            with _QDRANT_INFERENCE_LOCK:
+                client.upsert(collection_name=collection_name, points=points)
             return None
         except Exception as exc:
             last = exc
             if attempt < retries:
-                log(f"    ⚠️  upsert 失败，{delay:.0f}s 后重试（{attempt + 1}/{retries}）: {type(exc).__name__}: {exc}")
-                time.sleep(delay)
+                log(f"    ⚠️  upsert 失败，立即重试（{attempt + 1}/{retries}）: {type(exc).__name__}: {exc}")
     return f"{type(last).__name__}: {last}"
 
 
@@ -1983,7 +2192,6 @@ def build_index():
                 tokenizer, model, use_gpu = None, None, False
         if use_gpu:
             batch_size = EMBED_BATCH_SIZE
-            cool_down_sleep = 0.1
             precision = "fp16"
             log(f"Embedding 设备: {device} (fp16, batch_size={batch_size})")
         else:
@@ -1991,7 +2199,6 @@ def build_index():
             tokenizer, model, device = load_embedding_model(device="cpu")
             torch.set_num_threads(6)
             batch_size = EMBED_BATCH_SIZE
-            cool_down_sleep = 0.05
             precision = "fp32"
             log(f"Embedding 设备: cpu (6线程, batch_size={batch_size})")
         cache_path = _embed_cache_file(precision)
@@ -2024,7 +2231,6 @@ def build_index():
             elapsed = time.time() - t0
             speed = done / elapsed if elapsed > 0 else 0
             log(f"  计算进度 {done / len(missing) * 100:5.1f}% ({done}/{len(missing)}) {speed:.0f} 条/秒")
-            time.sleep(cool_down_sleep)
     holes = [i for i, e in enumerate(embeddings) if e is None]
     if holes:
         raise RuntimeError(f"{len(holes)} 个槽位没有被填充（例如 {holes[:5]}）：缓存命中数与待计算集合不一致")
@@ -2071,20 +2277,38 @@ def build_index():
         except Exception as exc:
             log(f"    ⚠️  payload 索引 {field} 创建失败（过滤会退化为扫描）: {exc}")
     write_failures: list = []
-    for i in range(0, total, WRITE_BATCH):
+    batch_starts = list(range(0, total, WRITE_BATCH))
+    batch_sizes = {i: min(i + WRITE_BATCH, total) - i for i in batch_starts}
+
+    def _write_batch(i):
         batch_chunks = all_chunks[i:i + WRITE_BATCH]
         batch_embeddings = embeddings[i:i + WRITE_BATCH]
         points = []
         for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
             # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
             points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))  # type: ignore[union-attr]
-        err = _upsert_batch_with_retry(client, target_collection, points)
-        if err:
-            write_failures.append((i, err))
-            log(f"    ⚠️  写入批次 [{i}, {min(i + WRITE_BATCH, total)}) 失败，继续写其余批: {err}")
-        done = min(i + WRITE_BATCH, total)
-        if (i // WRITE_BATCH) % 5 == 0 or done >= total:
-            log(f"  Qdrant 写入进度: {done}/{total}")
+        return i, _upsert_batch_with_retry(client, target_collection, points)
+
+    # 各批彼此独立（point id 由 batch 起始下标决定，与写入先后无关），故并发发往 Qdrant：
+    # 墙钟 ≈ 批次往返 × 批数 ÷ 并发度，而非逐批之和；稀疏编码在各 worker 内并发（分词在
+    # 服务端，本地没有共享可变状态，故不再需要"并发前串行预热 jieba 词典"那一步）。
+    # 并发度封顶 4，控制"同时驻留的 points（每批最多 1000 条稠密向量）"的峰值内存。
+    max_workers = max(1, min(4, len(batch_starts)))
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    done_points = 0
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_write_batch, i) for i in batch_starts]
+        for fut in as_completed(futures):
+            i, err = fut.result()
+            completed += 1
+            done_points += batch_sizes[i]
+            if err:
+                write_failures.append((i, err))
+                log(f"    ⚠️  写入批次 [{i}, {min(i + WRITE_BATCH, total)}) 失败，其余批继续: {err}")
+            if completed % 5 == 0 or completed == len(batch_starts):
+                log(f"  Qdrant 写入进度: {min(done_points, total)}/{total}")
+    write_failures.sort()
     if write_failures:
         # 半截集合是本次失败留下的孤儿：别名没切、检索不读它，而下一次 index 会用新的
         # build_id 另起集合 —— 不清理就永久占盘，且当次失败日志里连名字都不留（直到某次
@@ -2125,7 +2349,7 @@ def build_index():
     if coll_dense_size != matrix.shape[1]:
         raise RuntimeError(f"集合稠密维度 {coll_dense_size} 与本次编码维度 {matrix.shape[1]} 不一致（集合名 {target_collection}）")
     log(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} (size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")  # type: ignore[union-attr]
-    log("  索引构建完成: 稠密向量 + 稀疏向量（jieba 分词 + Qdrant 内置 BM25 打分）")
+    log("  索引构建完成: 稠密向量 + 稀疏向量（Qdrant 内置 BM25，分词在服务端 multilingual）")
     if alias_ok:
         # 别名切换存在竞态窗口：get_aliases 到 update_collection_aliases 间其他进程可能修改别名。
         # 采用重试 + 验证策略：只重试一次（共 2 次尝试），每次切换后验证别名确实指向新集合。
@@ -2156,7 +2380,6 @@ def build_index():
                 log(f"  ⚠️  别名切换异常（尝试 {attempt + 1}/{max_retries}）：{exc}")
                 if attempt == max_retries - 1:
                     raise RuntimeError(f"别名切换失败：新集合 {target_collection} 已建好但检索端仍指向旧集合，请检查 Qdrant 别名支持: {exc}") from exc
-                time.sleep(0.5 * (attempt + 1))
         if old_collection and old_collection != target_collection:
             try:
                 client.delete_collection(collection_name=old_collection)
@@ -2371,33 +2594,9 @@ def context_sources(results):
     return out
 
 
-# system 只装**行为规则**（怎么答），不装领域知识：发给模型的参数化内容仍然是检索资料与
-# 本轮提问。规则默认开启，但拒答仍由模型自己决定 —— 检索为空照常生成，代码不介入。
-# 恢复"完全不发 system"的旧行为：RAG_SYSTEM_RULES=0（或 off/false/空串）。
-_DOMAIN_LINE = f"你是一个面向「{DOMAIN_NAME}」的知识库助手。"
-if DOMAIN_DESCRIPTION:
-    _DOMAIN_LINE += f"领域说明：{DOMAIN_DESCRIPTION}。"
-_DEFAULT_SYSTEM_RULES = (
-    "回答规则：\n"
-    "1. 只依据下方「资料」中的内容作答，不要引入资料之外的知识；\n"
-    "2. 资料不足以回答时直说资料中没有相关信息，不要猜测或编造；\n"
-    "3. 用与提问相同的语言，先给结论再给依据，必要时简短引用原文；\n"
-    "4. 资料带有 [n] 编号时，在回答末尾列出所依据的编号。"
-)
-_rules_raw = os.getenv("RAG_SYSTEM_RULES")
-if _rules_raw is None:
-    SYSTEM_RULES_PROMPT = "\n\n".join(p for p in (_DOMAIN_LINE, _DEFAULT_SYSTEM_RULES) if p)
-elif _rules_raw.strip().lower() in ("", "0", "off", "false", "no"):
-    SYSTEM_RULES_PROMPT = ""
-else:
-    SYSTEM_RULES_PROMPT = _rules_raw.strip()
+# 不发 system：system prompt 已整体移除，恒为空字符串（原回答规则与领域身份句不再可配）。
 CONTEXT_ROLE = env_choice("RAG_CONTEXT_ROLE", "user", ("user", "system"))  # 见 build_generation_messages：system 档并入首条 system；tool 档无 tool_call_id 配对，恒为孤儿消息，故不接受
 RAG_USE_CONTEXT = env_bool("RAG_USE_CONTEXT", True)
-
-
-def build_system_prompt(use_context=True):
-    """system 只有一条路径：开上下文注入给规则，关则不给（检索为空也照常生成，无拒答分支）。"""
-    return SYSTEM_RULES_PROMPT if use_context else ""
 
 
 GEN_INPUT_RESERVE = env_int("RAG_INPUT_RESERVE", 256)
@@ -2651,7 +2850,7 @@ def _cut_to_tokens(text, max_tokens, mark=_TRUNCATION_MARK):
 
 
 def plan_generation(results, history, query, num_ctx, use_context=True, context_role=None):
-    system = build_system_prompt(use_context=use_context)
+    system = ""  # 不发 system prompt（恒空字符串）；use_context 只决定检索资料是否注入
     # 资料正文与逐条对齐共用同一份块列表：一次构造。截到哪几条，诊断（sources/context_docs_kept）
     # 就只报哪几条 —— 不再有第二条拼资料的路径。
     ctx_blocks = (context_blocks(results) if use_context else [])
@@ -2687,7 +2886,7 @@ def plan_generation(results, history, query, num_ctx, use_context=True, context_
 
 
 STEP_BLANK_QUERY = "空查询"
-STEP_SPARSE_TERMS = "稀疏编码 (jieba + BM25)"
+STEP_SPARSE_TERMS = "稀疏查询文本 (服务端分词)"
 STEP_RECALL = "单通道召回"
 STEP_RRF = "RRF 融合"
 STEP_CANDIDATES = "候选落地分块表"
@@ -2725,6 +2924,8 @@ class RAGEngine:
     def __init__(self, client=None, embed=None, rerank=None):
         self._embed = embed
         self._rerank = rerank
+        self._rerank_tok = None          # http 重排下只留 tokenizer（steps 用），不加载权重
+        self._rerank_tok_failed = False
         self._client = client
         self._collection_name = COLLECTION_NAME
         self._lexicon_checked = False
@@ -2761,6 +2962,103 @@ class RAGEngine:
             if self._rerank is None:
                 self._rerank = load_reranker_model()
             return self._rerank
+    def _get_rerank_tokenizer_only(self):
+        """http 重排后端下只取 tokenizer（几十 MB）：steps 的 token 预算列要用它算，
+        但没有理由为它加载 2 G 的权重。拿不到就返回 None，调用点整列留空——不编造数字。"""
+        with self._model_init_lock:
+            if self._rerank_tok is None and not self._rerank_tok_failed:
+                self._rerank_tok = load_rerank_tokenizer_only()
+                self._rerank_tok_failed = self._rerank_tok is None
+            return self._rerank_tok
+    def release_models(self):
+        """单例模式：释放进程内检索模型，把内存让给生成阶段。
+
+        http 后端下模型不在本进程，直接返回 False（没什么可放）。torch 后端丢引用 +
+        gc + 清 MPS/CUDA 缓存；**不保证内存真还给系统**（CPU 上缓存分配器会留着），
+        所以这是 8G 机器上跑最高配的过渡手段，不是容量解。
+        """
+        if EMBED_BACKEND == "http" and RERANK_BACKEND == "http":
+            return False
+        with self._model_init_lock:
+            if self._embed is None and self._rerank is None:
+                return False
+            self._embed = None
+            self._rerank = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            log(f"⚠️  释放检索模型后清理缓存失败（不影响正确性）: {type(exc).__name__}: {exc}")
+        log("♻️  单例：已释放进程内检索模型（嵌入/重排），内存让给生成阶段")
+        return True
+    def _http_rerank(self, query, documents, top_k):
+        """Cohere 风格 /rerank（infinity 等）：客户端做排序与截断，服务端只出分数。
+
+        不变量：**对全体候选统一打分**。故请求 top_n = 候选总数，并强制校验返回条数与
+        index 齐全 —— 服务端少给一条、重复一条都直接报错，绝不在子集上排序。
+        """
+        if not documents:
+            return []
+        data = self._http_json( RERANK_URL + "/rerank", { "model": RERANK_MODEL_NAME, "query": query, "documents": documents, "top_n": len(documents), }, )
+        rows = data.get("results")
+        if not isinstance(rows, list) or len(rows) != len(documents):
+            _got = len(rows) if isinstance(rows, list) else "非列表"
+            raise RuntimeError(
+                f"重排服务 {RERANK_URL}/rerank 返回 {_got} 条 ≠ 候选 {len(documents)} 条"
+                "（重排必须对全体候选统一打分，服务端不得裁剪）"
+            )
+        scores: list = [None] * len(documents)
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RuntimeError(f"重排服务 {RERANK_URL}/rerank 返回了非对象条目: {row!r}")
+            idx = row.get("index")
+            score = row.get("relevance_score", row.get("score"))
+            if not isinstance(idx, int) or not (0 <= idx < len(documents)) or score is None:
+                raise RuntimeError(f"重排服务 {RERANK_URL}/rerank 条目缺 index/score: {row!r}")
+            if scores[idx] is not None:
+                raise RuntimeError(f"重排服务 {RERANK_URL}/rerank 重复返回候选下标 {idx}")
+            scores[idx] = float(score)
+        missing = [i for i, s in enumerate(scores) if s is None]
+        if missing:
+            raise RuntimeError(f"重排服务 {RERANK_URL}/rerank 缺少候选下标 {missing[:5]} 的分数（共 {len(missing)} 条）")
+        ranked = sorted(((i, s) for i, s in enumerate(scores) if s is not None), key=lambda p: (-p[1], p[0]))
+        return ranked[:top_k]
+    def _http_json(self, url, payload):
+        import requests
+        t0 = time.time()
+        r = requests.post(url, json=payload, timeout=MODEL_HTTP_TIMEOUT)
+        if r.status_code != 200:
+            raise RuntimeError(f"模型服务 {url} 返回 HTTP {r.status_code}: {r.text[:200]}")
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError(f"模型服务 {url} 响应不是合法 JSON: {r.text[:200]}") from None
+        if not isinstance(data, dict) or data.get("error"):
+            raise RuntimeError(f"模型服务 {url} 响应异常: {str(data)[:200]}")
+        log(f"  模型服务 {url} {round(time.time() - t0, 3)}s")
+        return data
+    def _http_embed(self, texts, is_query=False):
+        if is_query:
+            texts = [BGE_QUERY_INSTRUCTION + t for t in texts]
+        data = self._http_json(EMBED_URL + "/embeddings", {"input": texts, "model": EMBED_MODEL_NAME})
+        rows = data.get("data")
+        if not isinstance(rows, list) or len(rows) != len(texts):
+            off = EMBED_URL + "/embeddings"
+            raise RuntimeError(
+                f"模型服务 {off} 返回 {len(rows) if isinstance(rows, list) else '非列表'} 条向量 ≠ 输入 {len(texts)} 条"
+            )
+        vectors = []
+        for row in rows:
+            v = row.get("embedding") if isinstance(row, dict) else None
+            if not isinstance(v, list):
+                raise RuntimeError(f"模型服务 {off} 返回向量字段缺失")
+            vectors.append(v)
+        return vectors
     def _inference_lock(self):
         return self._model_infer_lock
     def _check_chunk_freshness(self, index_fp):
@@ -2899,29 +3197,34 @@ class RAGEngine:
         # 独立服务的检索整体失败，还会白白付一次冷加载。
         dense_query = None
         if RRF_DENSE_WEIGHT:
-            tokenizer, model, device = self._get_embed()
-            # 前向与 rerank 共用同一把推理锁：加载/重排都已按它串行，唯独查询侧前向裸跑
-            # —— ThreadingHTTPServer + 多会话 Streamlit 下会真并发前向同一模型（MPS 上
-            # 争抢命令缓冲，正是 AGENTS 点名的"永久阻塞"级风险）。先取模型再进锁，避免
-            # 与 _get_embed 内部的同一把锁重入死锁。
-            with self._inference_lock():
-                # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
-                q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
-            dense_query = q_emb[0].tolist()
+            if EMBED_BACKEND == "http":
+                # 现成的 OpenAI 兼容嵌入服务（infinity 容器）：查询指令前缀由客户端拼好
+                # （infinity 不知道本仓库的 RAG_EMBED_QUERY_INSTRUCTION），与入库侧同一条
+                # 依赖路径映射到同一向量空间，查询侧设备自选（部署机 CPU fp32）。
+                dense_query = self._http_embed([query], is_query=True)[0]
+            else:
+                tokenizer, model, device = self._get_embed()
+                # 前向与 rerank 共用同一把推理锁：加载/重排都已按它串行，唯独查询侧前向裸跑
+                # —— 多会话 Streamlit（每个浏览器标签一个脚本线程）下会真并发前向同一模型
+                # （MPS 上争抢命令缓冲，正是 AGENTS 点名的"永久阻塞"级风险）。先取模型再进锁，
+                # 避免与 _get_embed 内部的同一把锁重入死锁。
+                with self._inference_lock():
+                    # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
+                    q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
+                dense_query = q_emb[0].tolist()
         sparse_query = sparse_encode(query)
         # 判空走 sparse_terms_of：sparse_query.text 里的零宽空格是占位哨兵，不是词
         _sparse_terms = sparse_terms_of(query)
         if steps is not None:
             steps[STEP_SPARSE_TERMS] = _sparse_terms
-        # 稀疏通道"存在但不产出"原来完全静默：query 全是停用词/纯标点时
-        # bm25_tokenize 返回空串，dual_channel_recall 既不抛异常也不召回 → 没有降级标记，
-        # 分数概览也不体现，结果看起来是正常双通道融合，实际是纯稠密。必须点名。
+        # 稀疏通道"存在但不产出"原来完全静默：query 是纯标点/空白时稀疏侧既不召回、也不
+        # 报错、也不留痕 → 结果看起来是正常双通道融合，实际是纯稠密。必须点名。
         if bool(RRF_SPARSE_WEIGHT) and not _sparse_terms:
             if RRF_DENSE_WEIGHT:
-                _degraded(steps, "稀疏通道：查询分词后为空（整句命中停用词或纯标点），本次退化为纯稠密检索")
+                _degraded(steps, "稀疏通道：查询无可检索内容（纯标点/空白），本次退化为纯稠密检索")
             else:
-                _degraded(steps, "稀疏通道：查询分词后为空（整句命中停用词或纯标点），且稠密通道权重为 0，本次无可用召回")
-        # 无词不发稀疏查询：哨兵词会命中"同样分词为空"的入库文档（纯标点块），把垃圾召回
+                _degraded(steps, "稀疏通道：查询无可检索内容（纯标点/空白），且稠密通道权重为 0，本次无可用召回")
+        # 无内容不发稀疏查询：哨兵会命中"同样是空内容"的入库文档（纯标点块），把垃圾召回
         # 混进融合 —— 与上面"退化为纯稠密"的日志相反。通道开关与日志必须是同一个判据。
         _use_sparse = bool(RRF_SPARSE_WEIGHT) and bool(_sparse_terms)
         # 两种检索：稠密 + 稀疏各召回一次，随后统一加权 RRF 融合。
@@ -2968,26 +3271,36 @@ class RAGEngine:
             return _empty_search_result(steps)
         if top_k > RERANK_TOP_K:
             log(f"⚠️  top_k={top_k} 超过候选池上限 {RERANK_TOP_K}，最多返回 {RERANK_TOP_K} 条（可调大 RAG_RERANK_TOP_K）")
-        rr_tok, rr_model, rr_dev = self._get_rerank()
         cand_texts = [rerank_text_for(c) for c in candidates]
         rr_k = min(top_k, len(candidates))
-        with self._inference_lock():
-            reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
+        if RERANK_BACKEND == "http":
+            # 现成重排服务（与嵌入同一个 infinity 进程）：客户端排序、服务端只出分数。
+            # tokenizer 只为 trace 的 token 预算列，拿不到就整列留空（见 _get_rerank_tokenizer_only）。
+            rr_tok = self._get_rerank_tokenizer_only()
+            reranked = self._http_rerank(query, cand_texts, top_k=rr_k)
+        else:
+            rr_tok, rr_model, rr_dev = self._get_rerank()
+            with self._inference_lock():
+                reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
         if steps is not None:
-            rr_query_tokens = len(rr_tok.encode(query))
+            rr_query_tokens = len(rr_tok.encode(query)) if rr_tok is not None else None
             # 使用 tokenizer 实际的特殊 token 数，而非硬编码
-            special_tokens = rr_tok.num_special_tokens_to_add(pair=True)
-            rr_doc_budget = max(0, RERANK_MAX_LENGTH - rr_query_tokens - special_tokens)
+            special_tokens = rr_tok.num_special_tokens_to_add(pair=True) if rr_tok is not None else None
+            rr_doc_budget = None
+            if rr_query_tokens is not None and special_tokens is not None:
+                rr_doc_budget = max(0, RERANK_MAX_LENGTH - rr_query_tokens - special_tokens)
             rr_rows = []
             for idx, score in reranked:
                 text = cand_texts[idx]
-                full_tokens = len(rr_tok.encode(text))
+                full_tokens = len(rr_tok.encode(text)) if rr_tok is not None else None
                 # text 必须是**送进 rerank 的那段**（cand_texts[idx]），不是 child_text：
                 # RERANK_ON=parent 时两者不同，旧写法展示 child_text 却用 parent_text 算
                 # tokens/被截断，对外 steps 自相矛盾。scored_field 说明这段来自哪个字段。
                 row = { "id": candidates[idx]["id"], "fused_rank": candidate_fused_rank.get(candidates[idx]["id"]), "score": float(score), "tokens": full_tokens, "text": text, "scored_field": ("parent_text" if RERANK_ON == "parent" else "contextual_text") }
                 row["送入上限"] = rr_doc_budget
-                row["被截断"] = full_tokens > rr_doc_budget
+                # http 重排且本地没有 tokenizer 时这两列无从计算：写 None（明确"未知"），
+                # 不写 False —— 那会读成"没被截断"，是另一种静默。
+                row["被截断"] = (full_tokens > rr_doc_budget) if (full_tokens is not None and rr_doc_budget is not None) else None
                 rr_rows.append(row)
             steps[STEP_RERANK] = rr_rows
         output = []
@@ -3056,9 +3369,15 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     _raw_predict = int(NUM_PREDICT if num_predict is None else num_predict)
     request_predict = _raw_predict if _raw_predict > 0 else -1
     started = time.time()
+    # 单例（RAG_EXCLUSIVE_MODELS=1）：检索前先确认生成模型已卸，峰值才是 max(检索, 生成)
+    # 而不是两者之和。非单例下是空操作，行为与改造前逐字节一致。
+    ensure_generation_unloaded()
     results = engine.hybrid_search(query, top_k=top_k, source=source)
     confidence = results_confidence(results)
     elapsed = time.time() - started
+    # 检索已完成、生成将开始：放掉进程内检索模型（http 后端下模型不在本进程，是 no-op）
+    if EXCLUSIVE_MODELS:
+        engine.release_models()
     plan = plan_generation(results, history, query, num_ctx, use_context=use_context)
     # 唯一事件契约：首事件恒为 RETRIEVAL，之后 thinking/delta/error/done；检索为空也照常生成。
     # 诊断只报**实际发出**的内容：gen（plan["stats"]）就是装配真正执行后统计出来的
@@ -3252,6 +3571,20 @@ def _run_assistant_turn(engine, prompt, history):
         if msgs and msgs[-1].get("role") == "user" and msgs[-1].get("content") == prompt:
             msgs.pop()
 
+    def close_events():
+        # 中断时**主动**收掉上游流：关掉 events 会一路
+        # 触发 stream_chat 的 finally: r.close()，让 Ollama 端看到连接关闭。不主动 close
+        # 就只能等异常处理完、脚本栈解开后靠引用计数 GC 触发 GeneratorExit —— 那是不确定的，
+        # 断开的生成可能继续烧完 num_predict 才停，而这台 Ollama 是单槽的，期间后续请求全在排队。
+        # 已实测（2026-10-11）：close() 循 run_turn 的 for 转发链把 GeneratorExit 打进最内层
+        # stream_chat，其 finally 必然执行；生成器已闭/未起时 close() 是无害的 no-op。
+        if events is not None:
+            try:
+                events.close()
+            except Exception:
+                pass
+
+    events = None
     try:
         events = run_turn(engine, prompt, history, top_k=TOP_K)
         # 首事件恒为 retrieval，必须消费掉（drain_events 的事件契约），且消费时显式断言
@@ -3272,6 +3605,7 @@ def _run_assistant_turn(engine, prompt, history):
             f"出错位置: {where}\n"
             f"完整调用栈: {os.getenv('RAG_LOG_FILE', DEFAULT_LOG_FILE)}"
         )
+        close_events()
         rollback_orphan_user()
         return
     except BaseException:
@@ -3279,6 +3613,8 @@ def _run_assistant_turn(engine, prompt, history):
         # except Exception 接不住 —— 不回滚，孤儿 user 就永久留进会话历史（下一轮被当
         # 历史重发，同题被答两遍）。回滚后原样上抛：这个异常是 Streamlit 完成停止/重跑
         # 的通道，吞掉会把"停"变成"继续跑完"。
+        # 先 close_events 再回滚：停止要求**确定**中止生成（关连接），不能只停在 UI 层。
+        close_events()
         rollback_orphan_user()
         raise
     # 生成失败或空答案：不入历史（且 rollback 本轮 user）。gen_error 也进判据（不只依赖
@@ -3336,24 +3672,26 @@ def run_streamlit():
             _run_assistant_turn(engine, prompt, st.session_state.messages[:-1])
 
 
-# ── 交互入口：HTTP API ──
+# ── 检索引擎单例与预热（Streamlit 与任何进程内调用共用）──
 _ENGINE = None
 _ENGINE_LOCK = threading.RLock()
-MAX_BODY_BYTES = env_int_min("RAG_API_MAX_BODY", 64 * 1024, 1)
-# 可选 API 鉴权：未设 = 不校验（默认绑 127.0.0.1 本机自用）。对外监听（--host /
-# RAG_API_HOST 非回环）时设它，否则任何能连到端口的客户端都能检索、烧生成算力。
-API_KEY = (os.getenv("RAG_API_KEY") or "").strip() or None
 
 
 def _warm_engine(engine):
-    """后台预热：jieba 词典、嵌入/重排模型、生成模型常驻 Ollama；失败仅告警（首查询冷加载兜底）。"""
+    """后台预热：词表、嵌入/重排模型、生成模型常驻 Ollama；失败仅告警（首查询冷加载兜底）。"""
     def _warm():
         try:
-            import jieba
-            jieba.initialize()
+            # 词表仍要预热（别名归一是查询路径上的同步调用）；jieba 已随分词组件化整体移除
             load_lexicon()
-            engine._get_embed()
-            engine._get_rerank()
+            # 嵌入/重排模型按后端预热：torch=加载进本进程；http=探一发小请求，让独立模型
+            # 服务容器把冷加载提前到启动期（进程内不再持嵌入模型，rerank 仍在本进程）。
+            if EMBED_BACKEND == "http":
+                engine._http_embed([""], is_query=False)
+            else:
+                engine._get_embed()
+            # 重排走 http 时模型不在本进程，预热只需探活（那些由 _http_rerank 的首个真请求负责）
+            if RERANK_BACKEND == "torch":
+                engine._get_rerank()
             # 必须看状态码：对未拉取的模型 Ollama 返回 404 而 requests 不抛异常，
             # 旧写法丢弃返回值、直接打印"预热完成"。而 entrypoint 正是把生成模型拉取
             # 放在后台的，冷启动窗口内这次预热必然落在 404 上 —— 唯一的"已预热"信号
@@ -3363,8 +3701,20 @@ def _warm_engine(engine):
             # 故预热一律 think=false、给 8 token —— 它验的是链路能出字，不是验思维链。
             # 超时取 OLLAMA_TIMEOUT（不是硬编码 180）：慢冷启动（模型后台拉取/加载）下
             # 探针等得起，才不会把"还在加载"误报成"预热未完成"。
-            r = _ollama_session().post( API_URL, json={ "model": MODEL, "messages": [{"role": "user", "content": ""}], "stream": False, "think": False, "options": {"num_predict": 8, "temperature": TEMPERATURE}, }, timeout=TIMEOUT, )
+            _probe_options = {"num_predict": 8, "temperature": TEMPERATURE}
+            _ng_probe = _gen_num_gpu_effective()
+            if _ng_probe is not None:
+                # 让"这台机器起不起得来 GPU"在**预热期**就暴露：auto 模式下预热失败会翻转
+                # 回落状态，首个真实问答就不必再白等一次失败。
+                _probe_options["num_gpu"] = _ng_probe
+            _probe_payload = { "model": MODEL, "messages": [{"role": "user", "content": ""}], "stream": False, "think": False, "options": _probe_options, }
+            _ka = _keep_alive_value()
+            if _ka is not None:
+                # 单例模式下预热探针也必须答完即卸，否则"预热"本身就把生成模型常驻了
+                _probe_payload["keep_alive"] = _ka
+            r = _ollama_session().post( API_URL, json=_probe_payload, timeout=TIMEOUT, )
             if r.status_code != 200:
+                _gen_gpu_fallback(f"预热 HTTP {r.status_code} {r.text[:160]!r}")
                 raise RuntimeError(f"生成模型预热失败 HTTP {r.status_code}: {r.text[:200]}")
             data = r.json() if r.text else {}
             _reply = ((data or {}).get("message") or {}).get("content") if isinstance(data, dict) else None
@@ -3389,273 +3739,6 @@ def get_engine():
         return _ENGINE
 
 
-def _json_response(handler, status, payload, close=False):
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    if close:
-        handler.send_header("Connection", "close")
-        handler.close_connection = True
-    handler.end_headers()
-    handler.wfile.write(body)
-
-
-def _drain_body(handler, limit=None):
-    if limit is None:
-        limit = MAX_BODY_BYTES
-    try:
-        length = int(handler.headers.get("Content-Length") or 0)
-    except ValueError:
-        length = 0
-    if 0 < length <= limit:
-        try:
-            handler.rfile.read(length)
-        except Exception:
-            pass
-
-
-def _read_json(handler):
-    raw_length = handler.headers.get("Content-Length")
-    if raw_length is None:
-        if handler.headers.get("Transfer-Encoding"):
-            raise ValueError( "不支持 Transfer-Encoding（chunked）请求体：请带 Content-Length")
-        return {}
-    try:
-        length = int(raw_length)
-    except ValueError:
-        raise ValueError(f"Content-Length 非法: {raw_length!r}") from None
-    if length <= 0:
-        return {}
-    if length > MAX_BODY_BYTES:
-        raise ValueError(f"请求体过大: {length} > {MAX_BODY_BYTES} 字节")
-    raw = handler.rfile.read(length)
-    handler._body_consumed = True  # 读满后 body 已排空；后续失败不得二次 _drain_body
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"请求体不是合法 JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError("请求体必须是 JSON 对象")
-    return data
-
-
-def _search_params(data):
-    query = data.get("query")
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("参数 query 必填，且必须是非空字符串")
-    # data.get(key, 默认) 只在**键缺失**时用默认；键存在且值为 JSON null 时拿到 None。
-    # top_k 与 history/source 一样是可选字段，显式 null 应当等同"不传"（与下面三处
-    # 对 None 的处理保持一致），否则 {"query":"x","top_k":null} 会莫名 400。
-    top_k = data.get("top_k")
-    if top_k is None:
-        top_k = TOP_K
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
-        raise ValueError("参数 top_k 必须是正整数")
-    source = data.get("source")
-    if source is None:
-        source = data.get("book")  # 兼容旧客户端
-    if source is not None and not isinstance(source, str):
-        raise ValueError(f"参数 source 必须是字符串（兼容旧名 book；当前来源字段 {SOURCE_FIELD!r}）")
-    history = data.get("history")
-    if history is not None:
-        if not isinstance(history, list):
-            raise ValueError("参数 history 必须是消息数组")
-        for i, m in enumerate(history):
-            if not isinstance(m, dict):
-                raise ValueError(f"history[{i}] 必须是对象（含 role 与 content）")
-            role = m.get("role")
-            if role not in ("user", "assistant"):
-                raise ValueError( f"history[{i}].role 必须是 user 或 assistant，收到 {role!r}")
-            content = m.get("content")
-            if content is not None and not isinstance(content, str):
-                raise ValueError( f"history[{i}].content 必须是字符串，收到 {type(content).__name__}")
-    return query, top_k, source, history
-
-
-def _result_json(r):
-    source = _source_of(r)
-    out = { "id": r.get("id", ""), "source": source, "score": r.get("rerank_score"), "text": r.get("child_text", ""), "context": r.get("parent_text", "") }
-    if SOURCE_FIELD != "source":
-        out[SOURCE_FIELD] = source
-    return out
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "RAGKnowledgeBase/1.0"
-    protocol_version = "HTTP/1.1"
-    # socketserver 会把 timeout 设到 socket 上，**读和写都受管**。/ask 是 NDJSON 流式
-    # 回答，单轮生成最长可到 OLLAMA_TIMEOUT（默认 180s），写端若沿用 60s 会在客户端
-    # 读得慢（浏览器后台标签）时中途 socket.timeout 把流截断。故按生成超时留余量。
-    timeout = int(TIMEOUT) + 120
-    _body_consumed = False  # _read_json 成功排空 Content-Length 后置真，_reject 不得再读
-
-    def handle_one_request(self):
-        # handle() 在 keep-alive 连接上用**同一个实例**反复调用本方法
-        # （BaseHTTPRequestHandler 的既定行为），所以每请求状态必须在这里复位：
-        # 第一个成功 POST 置起的 _body_consumed 会一直为真，此后该连接上所有 _reject
-        # 都跳过 _drain_body，残留 body 留在缓冲区，被下一个请求当成请求行读走。
-        self._body_consumed = False
-        super().handle_one_request()
-
-    def log_message(self, fmt, *args):
-        logger.info("API %s - %s", self.address_string(), fmt % args)
-    def _reject(self, status, message):
-        if not self._body_consumed:
-            _drain_body(self)
-        _json_response(self, status, {"error": message}, close=True)
-    def do_GET(self):
-        if not self._authorized():
-            self._reject(401, "缺少或错误的 API key（头 X-API-Key 或 Authorization: Bearer <key>）")
-            return
-        self._reject(404, f"未知路径: {self.path}")
-    def do_POST(self):
-        path = self.path.split("?")[0]
-        if not self._authorized():
-            self._reject(401, "缺少或错误的 API key（头 X-API-Key 或 Authorization: Bearer <key>）")
-            return
-        if path not in ("/search", "/ask"):
-            self._reject(404, f"未知路径: {self.path}")
-            return
-        try:
-            data = _read_json(self)
-            query, top_k, source, history = _search_params(data)
-        except ValueError as exc:
-            self._reject(400, str(exc))
-            return
-        try:
-            history, history_stripped = strip_current_turn(history, query)
-        except Exception as exc:
-            # 参数已过 _search_params 校验，这里再炸就是服务侧缺陷 → 500，不裸抛断连接。
-            self._reject(500, f"历史裁剪失败: {type(exc).__name__}: {exc}")
-            return
-        if path == "/search":
-            self._handle_search(query, top_k, source, history_stripped)
-        else:
-            self._handle_ask(query, top_k, source, history, history_stripped)
-    def _authorized(self):
-        """RAG_API_KEY 未设 = 不鉴权（默认只绑回环）。设了就两处头都认：
-        X-API-Key 与 Authorization: Bearer。compare_digest 防时序侧信道。"""
-        if not API_KEY:
-            return True
-        import hmac
-        got = self.headers.get("X-API-Key") or ""
-        if not got:
-            auth = self.headers.get("Authorization") or ""
-            if auth.lower().startswith("bearer "):
-                got = auth[7:].strip()
-        # 转 bytes 再比：compare_digest 对 str 只收 ASCII，请求头里出现任何非 ASCII
-        # 字节就 TypeError —— 401 没有，客户端拿到的是裸断连（自崩形态）。
-        return hmac.compare_digest(got.encode("utf-8"), API_KEY.encode("utf-8"))
-    def _handle_search(self, query, top_k, source, history_stripped=False):
-        try:
-            engine = get_engine()
-            t0 = time.time()
-            results, steps = engine.hybrid_search( query, top_k=top_k, return_steps=True, source=source )
-            payload = { "query": query, "source": source, "source_field": SOURCE_FIELD, "elapsed": round(time.time() - t0, 3), "confidence": steps.get(STEP_CONFIDENCE), "history_stripped": history_stripped, "results": [_result_json(r) for r in results], "steps": steps, }
-        except Exception as exc:
-            _json_response(self, 500, {"error": f"检索失败: {type(exc).__name__}: {exc}"})
-            return
-        try:
-            _json_response(self, 200, payload)
-        except Exception as exc:
-            # 响应写入失败（客户端半路断开等）不能裸抛进 handle_one_request：
-            # 与 500 分支同理，服务侧问题必须落日志，而不是只留一个断掉的连接。
-            log(f"⚠️  /search 响应写入失败: {type(exc).__name__}: {exc}")
-            self.close_connection = True
-    def _handle_ask(self, query, top_k, source, history, history_stripped=False):
-        headers_sent = False
-        t0 = time.time()
-        events = None
-        try:
-            engine = get_engine()
-            events = run_turn(engine, query, history, top_k=top_k, source=source)
-            payload = first_retrieval(events)   # 首事件恒为 retrieval，没有第二种起始契约；断言在 helper 内
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.close_connection = True
-            self.end_headers()
-            headers_sent = True
-            def emit(obj):
-                self.wfile.write( (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
-            gen = payload["gen"]
-            kept_docs = gen.get("context_docs_kept")
-            ctx_sources = context_sources(payload["results"])
-            if kept_docs is not None:
-                ctx_sources = ctx_sources[:kept_docs]
-            emit({ "type": "retrieval", "query": query, "elapsed": round(payload["elapsed"], 3), "confidence": payload["confidence"], "source": source, "source_field": SOURCE_FIELD, "sources": ctx_sources, "context_docs_kept": kept_docs, "context_partial": gen.get("context_partial"), "history_stripped": history_stripped, "results": [_result_json(r) for r in payload["results"]], })
-            if gen["dropped_messages"] or gen["truncated"] or gen.get("over_window"):
-                emit({ "type": "history_trimmed", "dropped_messages": gen["dropped_messages"], "budget": gen["budget"], "used_tokens": gen["used_tokens"], "context_tokens": gen["context_tokens"], "truncated": gen["truncated"], "truncated_user": gen["truncated_user"], "query_tokens": gen.get("query_tokens"), "input_cap": gen.get("input_cap"), "cap_trimmed": gen.get("cap_trimmed"), "frame_truncated": gen.get("frame_truncated"), "context_truncated": gen.get("context_truncated"), "query_truncated": gen.get("query_truncated"), "over_window": bool(gen.get("over_window")), })
-            # 无拒答分支：首个事件恒为 retrieval，之后一律走 drain_events；检索为空也照常生成。
-            _thinking, _answer, _error, done = drain_events(
-                events,
-                on_thinking=(lambda chunk, _total: emit({"type": "thinking", "text": chunk})) if THINK else None,
-                on_delta=lambda chunk, _total: emit({"type": "delta", "text": chunk}),
-                on_error=lambda chunk, _total: emit({"type": "error", "error": chunk}),
-            )
-            # 生成失败时 stream_chat 只产出 error、不产出 done，故必须判空
-            if done:
-                emit({ "type": "done", "done_reason": done.get("done_reason"), "eval_count": done.get("eval_count"), "prompt_eval_count": done.get("prompt_eval_count"), "answer_chars": done.get("answer_chars"), "search_s": round(done["elapsed"], 3), "gen_s": round(time.time() - t0 - done["elapsed"], 3), })
-            else:
-                # 流没走到 done：显式补一个终止 error。旧写法只发 error 就结束连接，NDJSON
-                # 客户端只能靠"连接被关"判断本轮结束，无法与"正常收尾"区分。事件词表不新增
-                # 类型，error 本就是异常终止的既有词；terminal 字段标明这是收尾而非增量。
-                emit({ "type": "error", "terminal": True, "error": _error or "生成未正常结束（无 done 事件）" })
-        except Exception as exc:
-            # 头已发出后的失败（Ollama 中途断流、客户端断开、wfile broken pipe、socket 超时）
-            # 必须落盘：旧写法只往一个已经坏掉的 socket 写再 pass，rag.log 里什么都没有，
-            # "流断了一半"与"服务端崩了"在日志上完全无法区分。
-            log(f"⚠️  /ask 流中断（响应头已发出）: {type(exc).__name__}: {exc}")
-            log(traceback.format_exc().rstrip())
-            if not headers_sent:
-                if not self._body_consumed:
-                    _drain_body(self)
-                _json_response(self, 500, { "error": f"检索/装配失败: {type(exc).__name__}: {exc}"}, close=True)
-                return
-            try:
-                if not self._body_consumed:
-                    _drain_body(self)
-                self.wfile.write((json.dumps( {"type": "error", "terminal": True, "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
-            except Exception:
-                pass
-        finally:
-            # 客户端断开后必须**主动**收掉上游流：关掉 events 会一路触发 stream_chat 的
-            # finally: r.close()，让 Ollama 端看到连接关闭。不写 finally 就只能指望本函数
-            # 返回后 GC 触发 GeneratorExit —— 那是不确定的，断开的请求可能继续烧完
-            # num_predict 才停，而这台 Ollama 是单槽的，期间后续请求全在排队。
-            # （Ollama 是否立即中止生成未做实测，但连接关闭这一侧已变成确定行为。）
-            if events is not None:
-                try:
-                    events.close()
-                except Exception:
-                    pass
-
-
-def cmd_api(args=None):
-    if args is None:
-        args = _build_parser().parse_args(["api"])
-    _coll, count = _qdrant_gate()
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not API_KEY:
-        log(f"⚠️  API 监听 {args.host}（非回环）且未设 RAG_API_KEY：服务无鉴权，任何能连到该端口的客户端都能检索与生成。")
-    import socket as _socket
-    server_cls = ThreadingHTTPServer
-    if ":" in args.host:
-        server_cls = type("DualStackHTTPServer", (ThreadingHTTPServer,), {"address_family": _socket.AF_INET6})  # type: ignore[assignment]
-    server = server_cls((args.host, args.port), Handler)
-    _shown = f"[{args.host}]" if ":" in args.host else args.host
-    log(f"API 就绪: http://{_shown}:{args.port}  （{count} 条，模型 {MODEL}）")
-    log("  POST /search  {\"query\": \"<你的问题>\", \"top_k\": 5}")
-    log("  POST /ask     {\"query\": \"<你的问题>\"}  → NDJSON 流")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
 
 
 # 来源字段名可配置，兼容旧索引的 book / source 写法。
@@ -3778,7 +3861,7 @@ def cmd_sparse(args=None):
     COLL = resolve_collection_name(client)
     info = client.get_collection(COLL)
     total = info.points_count
-    log(f"集合 {COLL}: {total} 条（Qdrant 内置 BM25 + jieba 分词，options={BM25_TEXT_OPTIONS}）")
+    log(f"集合 {COLL}: {total} 条（Qdrant 内置 BM25，分词在服务端，options={bm25_options()}）")
     if not total:
         log(f"❌ 集合 {COLL} 为空，无事可做；请先运行: python chatbot.py process && python chatbot.py index")
         return 1
@@ -4298,7 +4381,7 @@ def cmd_stages(args=None):
 
 
 # ── 命令分发 ──
-COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "api": cmd_api, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
+COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
 
 
 def _build_parser():
@@ -4311,13 +4394,10 @@ def _build_parser():
     """
     parser = argparse.ArgumentParser(prog="chatbot.py", add_help=False)
     subs = parser.add_subparsers(dest="command")
-    descriptions = {"api": "RAG 知识库 HTTP API", "compare-chunks": "分块结果 A/B 比较"}
+    descriptions = {"compare-chunks": "分块结果 A/B 比较"}
     for name in COMMANDS:
         sub = subs.add_parser(name, add_help=True, description=descriptions.get(name))
-        if name == "api":
-            sub.add_argument("--host", default=os.getenv("RAG_API_HOST", "127.0.0.1"), help="监听地址（默认 127.0.0.1 仅本机；确需远程访问再显式设 --host 0.0.0.0 或 RAG_API_HOST，并设 RAG_API_KEY 启用鉴权）")
-            sub.add_argument("--port", type=int, default=env_int_min("RAG_API_PORT", 8000, 1))
-        elif name == "compare-chunks":
+        if name == "compare-chunks":
             sub.add_argument("a", help="基线文件（改动前存档的分块产物）")
             sub.add_argument("b", nargs="?", default=DEFAULT_B, help=f"对照文件（默认 {DEFAULT_B}）")
             sub.add_argument("--allow", action="append", default=[], help="允许不同的字段名，可重复指定，例如 --allow contextual_text")

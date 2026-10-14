@@ -8,10 +8,10 @@
 #   1. lexicon  —— 词表自检（纯本地，快）
 #   2. Qdrant   —— 连不上就不必谈 C/D；给出启动提示
 #   3. stages   —— A/B/C/D 四阶段指纹比对，退出码 0 才算全新鲜
-#   4. 冒烟      —— 仅当 API 已在跑时才查（启动 API 需加载嵌入/重排模型，不该塞进这个快闸门）
+#   4. 冒烟      —— 进程内直调 hybrid_search（会加载嵌入/重排模型；SMOKE=0 可跳过）
 #
 # 用法：tools/deploy-check.sh
-# 环境：PYTHON（默认 python）  SMOKE_URL（默认 http://127.0.0.1:8000，含协议）  SMOKE_QUERY（冒烟查询）
+# 环境：PYTHON（默认 python）  SMOKE_QUERY（冒烟查询）  SMOKE=0（跳过第 4 步）
 set -u
 
 # 定位到仓库根：脚本可能从任意 cwd 被调用，而下面所有命令都按根目录相对路径。
@@ -20,8 +20,7 @@ cd "${ROOT}" || exit 1
 
 PY="${PYTHON:-python}"
 QDRANT_URL="${QDRANT_URL:-http://127.0.0.1:6333}"
-SMOKE_URL="${SMOKE_URL:-http://127.0.0.1:8000}"
-SMOKE_QUERY="${SMOKE_QUERY:-红楼梦}"
+SMOKE_QUERY="${SMOKE_QUERY:-中国革命的对象是谁}"   # 按当前语料挑一句；换领域时改这里或设同名环境变量
 
 _fail=0
 _say() { printf '\033[1m[deploy-check]\033[0m %s\n' "$*"; }
@@ -60,21 +59,25 @@ else
     exit 1
 fi
 
-# ── 4. 冒烟（可选：仅当 API 已在跑）────────────────────────────────────────
-# 两段判据分开：curl 失败=API 没起（跳过，不是闸门失败）；curl 成功但 results 空=检索
-# 链路异常（真失败）。旧写法 grep '"results"' 会把空结果数组也判成通过（假通过）。
-_say "4/4 检索冒烟（/search）"
-_resp="$(curl -fsS -X POST "${SMOKE_URL}/search" \
-        -H 'Content-Type: application/json' \
-        --data "{\"query\": \"${SMOKE_QUERY}\", \"top_k\": 3}" 2>/dev/null)" || _resp=""
-if [ -z "${_resp}" ]; then
-    # API 没起不是闸门失败：起服务要加载嵌入/重排模型，属运行期的事，不该拖进这个快闸门。
-    # 但必须留下明确后续动作，否则「没冒烟」与「冒烟通过」在结果上无从区分。
-    _skip "API 未在 ${SMOKE_URL} 运行；冒烟未执行。发布后请确认：curl -X POST ${SMOKE_URL}/search -H 'Content-Type: application/json' -d '{\"query\":\"${SMOKE_QUERY}\"}'"
-elif printf '%s' "${_resp}" | "${PY}" -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get("results") else 1)'; then
-    _ok "/search 返回非空 results"
+# ── 4. 冒烟（进程内直调；HTTP API 已于 2026-10-14 移除）─────────────────────
+# 为什么改了：手写 HTTP API（约 350 行）已删除 —— 本项目前后端都在 Streamlit 里，那个
+# 服务端只服务"外部程序调用"；而**自动化验证**用进程内直调更直接（还能拿到 steps）。
+# 代价：这一步会加载嵌入/重排模型（数秒到数十秒）。想保持"快闸门"就设 SMOKE=0。
+_say "4/4 检索冒烟（进程内直调 hybrid_search）"
+if [ "${SMOKE:-1}" = 0 ]; then
+    _skip "SMOKE=0，跳过冒烟（会加载嵌入/重排模型）"
+elif "${PY}" - "${SMOKE_QUERY}" <<'PYSMOKE'
+import sys
+import chatbot as C
+q = sys.argv[1] if len(sys.argv) > 1 else ""
+res, steps = C.RAGEngine().hybrid_search(q, top_k=3, return_steps=True)
+print(f"    查询 {q!r} → {len(res)} 条（召回 {len(steps.get(C.STEP_RECALL, []))} 项）")
+sys.exit(0 if res else 1)
+PYSMOKE
+then
+    _ok "hybrid_search 返回非空结果"
 else
-    _bad "/search 返回空 results（查询=${SMOKE_QUERY}）—— 检索链路可能异常，排查后重跑"
+    _bad "hybrid_search 返回空结果（查询=${SMOKE_QUERY}）—— 检索链路可能异常，排查后重跑"
 fi
 
 echo

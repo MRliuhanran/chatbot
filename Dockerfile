@@ -132,6 +132,21 @@ RUN pip install --no-cache-dir \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
     && rm -rf /root/.cache
 
+# ── 检索模型服务（infinity）：魔搭是单容器平台，模型仍要与业务进程分开，故装进同一镜像 ──
+# 只被 entrypoint.sh 在 RAG_EMBED_BACKEND / RAG_RERANK_BACKEND = http 时拉起（容器内第二个
+# 进程，与 qdrant/ollama 同级）；compose 路径不用它（那边用更精简的 embed.Dockerfile）。
+# --constraint requirements.txt：infinity 若要求比锁定值更新的传递依赖，构建**失败**，
+# 而不是静默升级把"镜像 == 本地现役版本"这条锁定破掉（本仓库点名的静默失效原型）。
+ARG INFINITY_VERSION=0.0.77
+RUN uv pip install --system --break-system-packages --no-cache \
+        --index-strategy unsafe-best-match \
+        --constraint requirements.txt \
+        --index-url "${PIP_INDEX_URL}" \
+        --extra-index-url "${PIP_FALLBACK_INDEX}" \
+        "infinity-emb[server,torch]==${INFINITY_VERSION}" \
+    && python -c "import infinity_emb; print('infinity-emb', infinity_emb.__version__)" \
+    && uv pip check --system
+
 # ── 构建期烘焙模型（"构建完就能用"）────────────────────────────────────────────
 # ⚠️ 必须先把 RUN 的 shell 换成 bash：Docker 默认 /bin/sh，Debian 上是 dash，而
 # tools/fetch_models.sh 用了 bash 专有语法（declare -F / 数组 local -a / ${!arr[@]}），
