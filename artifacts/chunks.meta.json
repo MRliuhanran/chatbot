@@ -1,6 +1,6 @@
 {
   "meta_version": 1,
-  "fingerprint": "17bbcd2daf9dcce0",
+  "fingerprint": "7ff224a8c1743f96",
   "chunking_config": {
     "child_max_tokens": 128,
     "child_min_tokens": 32,
@@ -10,11 +10,14 @@
     "semantic_threshold": 0.6,
     "semantic_min_chars": 500,
     "normalize_quotes": true,
+    "text_opencc": "t2s",
+    "ftfy_fix": "{\"fix_character_width\": false, \"fix_encoding\": true, \"fix_latin_ligatures\": false, \"fix_line_breaks\": false, \"fix_surrogates\": false, \"remove_control_chars\": false, \"remove_terminal_escapes\": false, \"uncurl_quotes\": false, \"unescape_html\": false}",
     "embed_model": "./models/bge-m3",
     "embed_model_content": "e9914797a3fe",
     "sentencex": "1.0.30",
+    "splitter": "0.33.0",
     "sentence_lang": "zh",
-    "chunking_code": "b1dbc820ac07ecde",
+    "chunking_code": "764f53a2733fcbe0",
     "sentence_terminators": "。！？．…!?",
     "paragraph_gap_re": "\\r?\\n\\r?\\n",
     "soft_wrap_re": "\\s*\\r?\\n\\s*"
@@ -1018,8 +1021,8 @@
     "毛泽东选集 第5卷 228 党内团结的辩证方法.txt": "b2d15237f4165669",
     "毛泽东选集 第5卷 229 一切反动派都是纸老虎.txt": "e1667bc17f4032e0"
   },
-  "total_chunks": 21563,
-  "total_parents": 5052,
-  "reused_documents": 102,
-  "build_time": "2026-10-14T22:33:30"
+  "total_chunks": 21299,
+  "total_parents": 5221,
+  "reused_documents": 0,
+  "build_time": "2026-10-14T23:59:26"
 }

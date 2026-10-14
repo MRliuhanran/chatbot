@@ -844,6 +844,36 @@ _SOFT_WRAP_RE = re.compile(r"\s*\r?\n\s*")
 NORMALIZE_QUOTES = env_bool("NORMALIZE_QUOTES", True)
 
 
+# 文本归一化组件（2026-10-14 组件化）：
+#   · ftfy —— 修**编码层**的坏：mojibake（"ï¿½"这类）、错编码的引号/连字。
+#     只用它修编码，其余全部关掉：ftfy 默认还会 uncurl_quotes（把弯引号拉直，直接
+#     与 fix_quotes 打架）、fix_character_width（改全角宽度）、fix_line_breaks（动换行，
+#     与"不归一 CRLF"的决定冲突）。判据是"一个功能只能有一个实现"。
+#   · OpenCC —— 繁简/异体归一（t2s）。简化字语料上是恒等变换；作用是让**同一实体的
+#     两种写法**在稀疏与稠密两侧不再分叉。置空则跳过转换。
+FTFY_FIX = { "fix_encoding": True, "unescape_html": False, "remove_terminal_escapes": False, "fix_latin_ligatures": False, "fix_character_width": False, "uncurl_quotes": False, "fix_line_breaks": False, "fix_surrogates": False, "remove_control_chars": False, }
+TEXT_OPENCC = (os.getenv("RAG_TEXT_OPENCC") or "t2s").strip()
+_OPENCC_INSTANCE = None
+
+
+def _opencc():
+    """惰性取 OpenCC 转换器（首次调用才 import，符合"第三方依赖全部惰性"）。"""
+    global _OPENCC_INSTANCE
+    if _OPENCC_INSTANCE is None:
+        from opencc import OpenCC
+        _OPENCC_INSTANCE = OpenCC(TEXT_OPENCC)
+    return _OPENCC_INSTANCE
+
+
+def normalize_text(text):
+    """归一化组件入口：ftfy 修编码 → OpenCC 繁简归一。"""
+    import ftfy
+    text = ftfy.fix_text(text, **FTFY_FIX)
+    if TEXT_OPENCC:
+        text = _opencc().convert(text)
+    return text
+
+
 def fix_quotes(text):
     """把直引号 " 归一到弯引号：**单遍二值状态机，所有引号字符共同参与状态**。
 
@@ -897,135 +927,6 @@ def fix_quotes(text):
     return "".join(out)
 
 
-def _split_keep(text, terminators):
-    """在 terminators 中每个字符之后切开，终止符保留在左侧。"""
-    parts, cur = [], ""
-    for ch in text:
-        cur += ch
-        if ch in terminators:
-            parts.append(cur)
-            cur = ""
-    if cur:
-        parts.append(cur)
-    return [p for p in parts if p.strip()]
-
-
-def segment(lang, text):
-    """sentencex 的惰性转发壳：首次真正分句时才加载分句器。
-
-    必须留在模块级、且不要把 import 下推进 _split_sentences 的函数体 —— 那会让源码
-    逐字进切分指纹（_CHUNKING_CODE_UNITS）而与分句逻辑无关。语言码走 SENTENCE_LANG
-    （默认 zh）；换语言码会改指纹并触发重分块，这是有意的。
-    代价：改这个壳子的行为不进指纹（调用点与壳子分离），分句器版本变化靠 config 指纹兜。
-    """
-    from sentencex import segment as _segment
-    return _segment(lang, text)
-
-
-def _split_sentences(s, tokenizer=None, max_tokens=None):
-    """分句：sentencex 单层分句 → （可选）token 上限兜底。
-
-    **不预切 \\n\\n 段落**：sentencex 自身把 \\n\\n 与 \\r\\n\\r\\n 都当句边界，且从不跨段。
-    实测全量语料 66079 句，"先按段落预切再逐段分句"与"整篇一次分句"的输出序列
-    逐元素完全相同，跨段句恒为 0 —— 那一层是纯冗余。
-    "句子不跨段"这条性质改由下面的断言守护：它现在是 sentencex 的实现保证，
-    而不是本函数的代码保证，所以必须能被测试发现回归。
-
-    tokenizer/max_tokens 给出时，逐句保证不超过 max_tokens —— 语料里有
-    整段无标点的长文（单句最长可达 700 余字），
-    纯分句器对它们无能为力，不兜底就会撑破 CHILD_MAX_TOKENS。
-    """
-    parts = [p.strip() for p in segment(SENTENCE_LANG, s) if p.strip()]
-
-    # 段落硬边界的守护断言。sentencex 保证引语不可切分、不跨段；一旦这里失败，
-    # 说明分句器行为变了（换版本/换库），必须重新评估分块，不能静默继续。
-    #
-    # 判据必须是**空行**（\\n\\n），不能是"含任意 \\n"。旧写法后者恒真于一类
-    # 完全合法的输入：按 40/76 列硬折行的 txt（网上 txt 最常见的排版）里，
-    # 句内保留单个 \\n 是正常现象，而旧断言会把它判成"分句器跨段"并直接抛
-    # ValueError，于是新增这类文档会让 `python chatbot.py process` 整个崩掉，
-    # 报错还把原因误指成"sentencex 行为可能已变"。现有语料恰好没有句内换行
-    # （实测句内残留换行 = 0），所以这个缺陷一直被掩盖着。
-    # 注意只在 token 兜底之前断言：兜底会按句末标点等终止符切开长句，可能产生跨句碎片。
-    bad = next((p for p in parts if _PARAGRAPH_GAP_RE.search(p)), None)
-    if bad is not None:
-        raise ValueError(
-            f"分句器跨段了，段落硬边界保证已失效（sentencex 行为可能已变）：{bad[:60]!r}"
-        )
-
-    # 句内软换行归一成空格。它不影响语义，但会让"一个句子"在子块文本里分裂成
-    # 视觉上的两行，也会让下游的 token 兜底把句子切碎。
-    parts = [_SOFT_WRAP_RE.sub(" ", p) for p in parts]
-
-    if tokenizer is not None and max_tokens:
-        limited = []
-        for p in parts:
-            limited.extend(_enforce_token_limit(p, tokenizer, max_tokens))
-        parts = limited
-    return parts
-
-
-def _hard_split_by_tokens(text, tokenizer, max_tokens):
-    """最后兜底：无任何标点可用时按 token 硬切。
-
-    **必须逐字无损。** 不能用 `tokenizer.decode(ids[a:b])` 还原切片：BERT 式
-    分词器的 decode 会在 token 之间插入空格 —— 中文基本一字一 token，于是
-    "二尊者即开报"被还原成"二 尊 者 即 开 报"。实测在整段无标点的长文本里
-    共 9 个子块、6 个父块中招：文本被改坏会同时污染稠密向量与 BM25 稀疏向量，
-    而且肉眼极难察觉（看起来只是"多了些空格"）。
-
-    故改用 offset 映射把 token 边界还原成**原文切片**；末尾用
-    `"".join(out) == text` 校验，不满足才退回 decode 兜底。
-    """
-    ids = tokenizer.encode(text, add_special_tokens=False)
-    if len(ids) <= max_tokens:
-        return [text]
-
-    # 优先：offset 映射 → 原文切片（无损，且不引入分词器自带的空格）
-    try:
-        enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        offsets = enc.get("offset_mapping")
-        if offsets is not None and len(offsets) == len(ids):
-            out = []
-            for i in range(0, len(offsets), max_tokens):
-                window = offsets[i:i + max_tokens]
-                piece = text[window[0][0]:window[-1][1]]
-                if piece:
-                    out.append(piece)
-            if out and "".join(out) == text:
-                return out
-    except Exception:
-        # 分词器不支持 offset 映射（非 fast tokenizer）时走下面的兜底
-        pass
-
-    # 兜底：仍按 token 切片 decode（可能丢空白），但保证不超 token 上限
-    return [
-        tokenizer.decode(ids[i:i + max_tokens], skip_special_tokens=True)
-        for i in range(0, len(ids), max_tokens)
-    ]
-
-
-def _enforce_token_limit(text, tokenizer, max_tokens, depth=0):
-    """保证返回的每个片段都不超过 max_tokens。
-
-    逐级降级：句末标点 → 分号 → 逗号/顿号 → 硬切（换行在 _split_sentences 里已先归一）。
-    depth 与 len(parts)>1 双重判断是必需的：若唯一终止符恰好落在句尾，
-    _split_keep 会切出一个与输入等长的片段，不加判断就会无限自递归。
-    """
-    # 分块阶段不清理，避免 tokenizer 版本差异带来"空片段"歧义
-    if len(tokenizer.encode(text, add_special_tokens=False)) <= max_tokens:
-        return [text]
-    if depth < 32:
-        for terminators in (SENTENCE_TERMINATORS, "；", "，、"):
-            if not any(t in text for t in terminators):
-                continue
-            parts = _split_keep(text, terminators)
-            if len(parts) > 1:
-                out = []
-                for p in parts:
-                    out.extend(_enforce_token_limit(p, tokenizer, max_tokens, depth + 1))
-                return out
-    return _hard_split_by_tokens(text, tokenizer, max_tokens)
 _EMBED_MODEL = None
 _EMBED_TOKENIZER = None
 
@@ -1047,344 +948,36 @@ def _mps_empty_cache():
         log(f"    ⚠️  mps.empty_cache() 失败（忽略，不影响结果）: {type(exc).__name__}: {exc}")
 
 
-def _encode_sentences(sentences):
-    import numpy as np
-    import torch
-    tokenizer, model = _get_embed_model()
-    device = next(model.parameters()).device
-    vecs = []
-    for i in range(0, len(sentences), EMBED_BATCH_SIZE):
-        vecs.append(_embed_batch(sentences[i:i + EMBED_BATCH_SIZE], tokenizer, model, device))
-        if device.type == "mps":
-            _mps_empty_cache()
-    if not vecs:
-        return np.zeros((0, 0), dtype="float32")
-    return torch.cat(vecs).cpu().numpy()
-
-
-def _semantic_split(text, threshold=SEMANTIC_THRESHOLD):
-    """语义分块：在语义边界处切分，并保证每块不小于 SEMANTIC_MIN_CHARS 字符。
-
-    最小长度下限是必需的：叙事文本相邻句余弦相似度天然偏低（常低于 0.6），
-    只看阈值会把每 1~2 句切成一块（实测平均 30 字），等于没有分块。
-
-    不收 tokenizer：语义定界只用句级小批量嵌入（_encode_sentences 内部自取模型），
-    逐句 token 上限兜底在下游 _split_by_tokens / _split_into_children 里做。旧签名
-    收下它却从不使用，是死参数。
-    """
-    sentences = _split_sentences(text)
-    if len(sentences) <= 1:
-        return [text]
-
-    embeddings = _encode_sentences(sentences)
-    # 向量已归一化，逐元素相乘求和即为相邻句余弦相似度
-    sims = (embeddings[:-1] * embeddings[1:]).sum(axis=1)
-
-    chunks = []
-    current = [sentences[0]]
-    current_chars = len(sentences[0])
-
-    for i in range(1, len(sentences)):
-        sent = sentences[i]
-        is_boundary = sims[i - 1] < threshold
-        if is_boundary and current_chars >= SEMANTIC_MIN_CHARS:
-            chunks.append(" ".join(current))
-            current = [sent]
-            current_chars = len(sent)
-        else:
-            current.append(sent)
-            current_chars += len(sent)
-
-    if current:
-        chunks.append(" ".join(current))
-
-    # 小块并入相邻块。SEMANTIC_MIN_CHARS 只在"切分之前"检查**当前**块长度，
-    # 末尾剩下的残渣不受它保护 —— 实测语料里每个文档都会出现几十字的尾块。
-    # 并入后可能超过 PARENT_MAX_TOKENS，但那由下游 _split_by_tokens 的平衡切分兜住，
-    # 不会再退回成短块；而留在这里的小块会变成一个没有上下文的父块。
-    return _merge_small_texts(chunks, SEMANTIC_MIN_CHARS)
-
-
-def _merge_small_texts(chunks, min_chars):
-    """把长度低于 min_chars 的块并入相邻块，返回新列表。
-
-    两条不变量：
-      * **不丢内容** —— 合并只做拼接，任何输入都不会被丢弃；
-      * **不产生更小的块** —— 合并只会让块变长。
-
-    先向前合并（小块并入它的前一块），首块没有前一块则并入后一块；
-    最后再兜一次尾块。之所以要"兜多次"：合并本身可能让一个原本达标的
-    相邻块变成新的末尾小块，一次遍历处理不干净。
-    """
-    if len(chunks) <= 1:
-        return list(chunks)
-
-    merged = list(chunks)
-    i = 0
-    while i < len(merged) - 1:
-        if len(merged[i]) < min_chars:
-            merged[i] = merged[i] + " " + merged[i + 1]
-            del merged[i + 1]
-        else:
-            i += 1
-    if len(merged) > 1 and len(merged[-1]) < min_chars:
-        merged[-2] = merged[-2] + " " + merged[-1]
-        merged.pop()
-    return merged
+def _token_counter(tokenizer):
+    """容量回调：把"块 ≤ N"表达成 **token** 上限（与改造前同一把尺子）。"""
+    def _count(text):
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    return _count
 
 
 def _hierarchical_split(text, tokenizer):
-    """语义分块 + 分层组织：语义分块决定边界，父子结构提供上下文。
+    """父子分块：**机械部分交给 semantic-text-splitter**，父子契约不变。
 
-    返回 [(child_text, parent_text), ...]。按块长度分三档：
-    不超过子块上限时父子相同；不超过父块上限时整块作父块、内部按句切子块；
-    再长则先切父块、每个父块内部再切子块。
+    2026-10-14 组件化。改造前这里是"逐句嵌入 + 余弦阈值定界（_semantic_split）+ 平衡打包
+    + 小块合并"的一大套自研逻辑（process 的耗时大头也在那批逐句嵌入上）。现在：
+
+      · 父块：capacity=PARENT_MAX_TOKENS，按段落/句子结构递归切分
+      · 子块：在每个父块内部再切，capacity=CHILD_MAX_TOKENS、overlap=CHUNK_OVERLAP
+      · 容量用**本仓库的 tokenizer** 度量（from_callback），故"父≤512 / 子≤128 token"
+        与改造前同源同义；tokenizer 参数因此仍是必需的（旧实现只把它往下游传）
+      · trim=False —— 实测这是"**切分逐字无损**"不变量成立的必要条件：
+        trim=True 会吃掉块边界空白，join(chunks) != text
+
+    返回 [(child_text, parent_text), ...]。子块恒为父块子串（组件在父块**内部**再切，
+    天然成立）；纯空白块照旧原样产出，由调用方（build_chunks）统一丢弃并留痕。
     """
-    results = []
-    for chunk in _semantic_split(text):
-        chunk_tokens = len(tokenizer.encode(chunk, add_special_tokens=False))
-
-        if chunk_tokens <= CHILD_MAX_TOKENS:
-            results.append((chunk, chunk))
-        elif chunk_tokens <= PARENT_MAX_TOKENS:
-            for child in _split_into_children(chunk, tokenizer):
-                results.append((child, chunk))
-        else:
-            for parent_text in _split_by_tokens(chunk, tokenizer, PARENT_MAX_TOKENS):
-                for child in _split_into_children(parent_text, tokenizer):
-                    results.append((child, parent_text))
-
-    return results
-
-
-def _group_tokens(group, tok):
-    """一个句子下标分组的 token 总数。"""
-    return sum(tok[i] for i in group)
-
-
-def _split_two(indices, tok, max_tokens):
-    """把一组句子下标尽量均分成两组，**且两组都不超上限**。返回 (前, 后)。
-
-    用于"短块既并不过去、也并不过来"时的重新配平。
-
-    **实现要点（修过一个真 bug）**：旧实现只保证前半不超上限，然后把后半
-    原样返回、从不校验。实测可复现：句子长度
-    [14, 62, 346, 97, 58, 34]（合计 611，上限 512），按"装到 target=305 就切"
-    得到 [346] + [97,58,34]=189，两次配平后最终产出 **[2,3,4,5] = 535 > 512**
-    的父块（一次全量重建里共 31 条这样的父块、3 条超 128 的子块，而旧实现是 0 条）。
-    后果有两层：L1 的 512/128 上限不变量被破坏；超限子块在 embedding 时被
-    **静默截断**，检索到的其实是"半句话"——正是本项目一直在防的那类静默失效。
-
-    因此改为**枚举所有合法切点**（前后都不超上限），再取最接近均分的那一个；
-    没有任何合法切点时返回 (indices, [])，调用方据此放弃改写（而不是
-    产出一个越界的组）。
-    """
-    total = _group_tokens(indices, tok)
-    if len(indices) < 2:
-        return list(indices), []
-
-    best_pos, best_gap = None, None
-    head_tokens = 0
-    for pos in range(1, len(indices)):
-        head_tokens += tok[indices[pos - 1]]
-        tail_tokens = total - head_tokens
-        if head_tokens > max_tokens or tail_tokens > max_tokens:
-            continue
-        gap = abs(head_tokens - total / 2)
-        if best_gap is None or gap < best_gap:
-            best_pos, best_gap = pos, gap
-    if best_pos is None:
-        return list(indices), []
-    return indices[:best_pos], indices[best_pos:]
-
-
-def _enforce_group_cap(groups, tok, max_tokens):
-    """最后一道防线：把任何仍然超上限的分组强行切开。
-
-    为什么必须有它（而不是只修 `_split_two`）：上限是**硬不变量**（embedding
-    与 rerank 都按它截断），而下限只是质量偏好。两者会互相拉扯 ——
-    "合并小块"可能顶破上限，"遵守上限"可能留下小块。这里的取舍是明确的：
-    **上限优先**。小块只是上下文略少，超限则是静默截断，后者更糟。
-    两分不出合法切点（需要三分以上）时退回逐句贪心打包；只有单句本身就超限
-    （没经过逐句兜底，不该发生）才原样保留，由上游 `_split_sentences` 负责。
-    （旧实现只试两分，[117,141,28,194]/上限207 这类输入会被原样放过 = 上限被破坏。）
-    """
-    queue = [list(g) for g in groups]
-    out = []
-    guard = 0
-    while queue:
-        g = queue.pop(0)
-        guard += 1
-        if guard > 10 * len(groups) + 1000:
-            # 防御极端输入下的死循环；真发生说明切分逻辑不收敛 —— 剩余组原样保留
-            # 可能超上限，必须留痕（静默破硬上限 = embedding/rerank 端静默截断）。
-            log(f"⚠️  _enforce_group_cap 迭代上限触发（{guard} 次），剩余 {len(queue) + 1} 组未再切分，可能出现超过 {max_tokens} token 的块")
-            out.extend(queue + [g])
-            break
-        if _group_tokens(g, tok) <= max_tokens or len(g) <= 1:
-            out.append(g)
-            continue
-        head, tail = _split_two(g, tok, max_tokens)
-        if not tail:
-            # _split_two 只做两分：需要三分以上、且不存在「两半都不超限」的切点时它返回空。
-            # 逐句贪心打包兜底 —— 契约是每个元素都 ≤ 上限，顺序装填一定得到合法子组。
-            if len(g) > 1 and all(tok[i] <= max_tokens for i in g):
-                packed, cur, cur_tokens = [], [], 0
-                for i in g:
-                    if cur and cur_tokens + tok[i] > max_tokens:
-                        packed.append(cur)
-                        cur, cur_tokens = [], 0
-                    cur.append(i)
-                    cur_tokens += tok[i]
-                if cur:
-                    packed.append(cur)
-                out.extend(packed)
-            else:
-                # 单句本身就超限（没经过逐句兜底，不该发生）：原样保留，由上游负责。
-                # 保留可以，静默不行 —— 超限块到 embedding/rerank 端会被静默截断。
-                log(f"⚠️  _enforce_group_cap: 组内存在超过 {max_tokens} token 的单句，原样保留（组 {sum(tok[i] for i in g)} tokens）")
-                out.append(g)
-            continue
-        queue = [head, tail] + queue
-    return out
-
-
-def _merge_small_groups(groups, tok, max_tokens, min_tokens):
-    """把低于 min_tokens 的分组并入相邻分组；必要时重新配平。
-
-    迭代次数上界 = 分组数：每次成功改写都会让分组数减一，因此必然终止；
-    上界只是防住"重新配平后形态没变"这种原地打转。
-    """
-    if len(groups) <= 1 or min_tokens <= 0:
-        return groups
-    groups = [list(g) for g in groups]
-
-    for _ in range(len(groups)):
-        changed = False
-        for i in range(len(groups) - 1, -1, -1):
-            cur = _group_tokens(groups[i], tok)
-            if cur >= min_tokens:
-                continue
-            # 优先并入前一组（保持阅读顺序，且尾巴块的问题绝大多数在末尾）
-            if i > 0 and _group_tokens(groups[i - 1], tok) + cur <= max_tokens:
-                groups[i - 1] = groups[i - 1] + groups[i]
-                del groups[i]
-                changed = True
-                break
-            # 其次并入后一组（小块出现在开头时）
-            if (i < len(groups) - 1
-                    and cur + _group_tokens(groups[i + 1], tok) <= max_tokens):
-                groups[i] = groups[i] + groups[i + 1]
-                del groups[i + 1]
-                changed = True
-                break
-            # 两边都放不下：与前一组合并后重新均分
-            if i > 0:
-                merged = groups[i - 1] + groups[i]
-                head, tail = _split_two(merged, tok, max_tokens)
-                if tail and head != groups[i - 1]:
-                    groups[i - 1:i + 1] = [head, tail]
-                    changed = True
-                    break
-        if not changed:
-            break
-
-    return groups
-
-
-def _balanced_pack_groups(tok, max_tokens, min_tokens):
-    """把 token 计数序列切成若干分组（返回下标列表的列表）。
-
-    先按总量算出块数 n = ceil(total / max_tokens)，再以 total / n 为目标长度
-    逐句装填，最后调用 _merge_small_groups 收拾残块。每块因而天然 ≤ max_tokens。
-    """
-    n = len(tok)
-    if n == 0:
-        return []
-    total = sum(tok)
-    if total <= max_tokens:
-        return [list(range(n))]
-
-    parts = max(1, -(-total // max_tokens))  # ceil 除法
-    target = total / parts
-
-    groups, cur, cur_tokens = [], [], 0
-    for i, t in enumerate(tok):
-        if cur and cur_tokens + t > target:
-            groups.append(cur)
-            cur, cur_tokens = [], 0
-        cur.append(i)
-        cur_tokens += t
-    if cur:
-        groups.append(cur)
-
-    groups = _merge_small_groups(groups, tok, max_tokens, min_tokens)
-    # 上限优先于下限：合并小块的过程有可能顶破上限，这里兜住
-    return _enforce_group_cap(groups, tok, max_tokens)
-
-
-def _split_by_tokens(text, tokenizer, max_tokens, min_tokens=None):
-    """按 token 数分割文本，保持句子完整性。
-
-    逐句先做 token 上限兜底：单个超长句（无标点的长文本段）若不先切开，
-    会被原样当成一个父块，直接突破 max_tokens。
-    切分用平衡打包，故不会留下远短于 max_tokens 的尾块（见本节顶部注释）。
-    """
-    sentences = _split_sentences(text, tokenizer, max_tokens)
-    if not sentences:
-        return []
-    if min_tokens is None:
-        min_tokens = PARENT_MIN_TOKENS
-    tok = [len(tokenizer.encode(s, add_special_tokens=False)) for s in sentences]
-    groups = _balanced_pack_groups(tok, max_tokens, min(max_tokens, min_tokens))
-    return [" ".join(sentences[i] for i in group) for group in groups]
-
-
-def _split_into_children(parent_text, tokenizer):
-    """将父块分割成子块，带重叠。
-
-    逐句先做 CHILD_MAX_TOKENS 兜底：这是"子块不超限"的实际保证点 ——
-    语料中最长单句约 670 字（整段无标点的长文），不兜底就会产出
-    远超 128 token 的子块，embedding 时被 tokenizer 静默截断，
-    检索到的其实是"半句话"。
-
-    与旧实现的两点差别（都是有意的）：
-      1. 切分同样改为平衡打包，故不会出现"尾子块只有十几个 token"；
-      2. 重叠取自**上一个非重叠分组**的尾部，而不是上一个已带重叠的子块。
-         旧写法会让重叠逐块累积（第 3 块的重叠里含第 1 块的尾巴），
-         既不可预测又白占子块额度。
-    """
-    sentences = _split_sentences(parent_text, tokenizer, CHILD_MAX_TOKENS)
-    if not sentences:
-        return []
-    tok = [len(tokenizer.encode(s, add_special_tokens=False)) for s in sentences]
-    groups = _balanced_pack_groups(
-        tok, CHILD_MAX_TOKENS, min(CHILD_MAX_TOKENS, CHILD_MIN_TOKENS)
-    )
-
-    children = []
-    for gi, group in enumerate(groups):
-        if gi == 0:
-            current = list(group)
-        else:
-            group_tokens = _group_tokens(group, tok)
-            # 重叠：从上一个非重叠分组尾部回填 CHUNK_OVERLAP token
-            overlap, overlap_tokens = [], 0
-            for j in reversed(groups[gi - 1]):
-                if overlap_tokens + tok[j] > CHUNK_OVERLAP:
-                    break
-                overlap.insert(0, j)
-                overlap_tokens += tok[j]
-            # 重叠不能把子块顶过上限：兜底后的长句可达 128 token，叠加 32 token
-            # 重叠即 160（实测会有 254 个子块因此超限）。裁剪时从最旧的重叠句
-            # 丢起，保留离新句最近的上下文。
-            while overlap and overlap_tokens + group_tokens > CHILD_MAX_TOKENS:
-                oldest = overlap.pop(0)
-                overlap_tokens -= tok[oldest]
-            current = overlap + list(group)
-        children.append(" ".join(sentences[i] for i in current))
-
-    return children
+    from semantic_text_splitter import TextSplitter
+    count = _token_counter(tokenizer)
+    parent_splitter = TextSplitter.from_callback(count, PARENT_MAX_TOKENS, trim=False)
+    child_splitter = TextSplitter.from_callback(count, CHILD_MAX_TOKENS, overlap=CHUNK_OVERLAP, trim=False)
+    for parent_text in parent_splitter.chunks(text):
+        for child_text in child_splitter.chunks(parent_text):
+            yield (child_text, parent_text)
 
 
 def read_book_text(filepath):
@@ -1408,15 +1001,22 @@ def read_book_text(filepath):
             f"偏移 {e.start}-{e.end}，字节 {raw[e.start:e.end]!r}（已替换为 U+FFFD）"
         )
         text = raw.decode("utf-8", errors="replace")
+    text = normalize_text(text)
     if NORMALIZE_QUOTES:
         text = fix_quotes(text)
     return text
 
 
 read_document_text = read_book_text  # 通用别名；保留 read_book_text 以兼容分块指纹
-# 语义定界依赖句子嵌入（_encode_sentences→_embed_batch），必须纳入指纹：改嵌入代码会改变
-# 切分边界，漏掉就会让"切分产物过期"不被发现（_semantic_split 源码本身不含这些函数的实现）。
-_CHUNKING_CODE_UNITS = ( "fix_quotes", "_split_keep", "_split_sentences", "_enforce_token_limit", "_hard_split_by_tokens", "_semantic_split", "_merge_small_texts", "_hierarchical_split", "_balanced_pack_groups", "_group_tokens", "_split_two", "_merge_small_groups", "_enforce_group_cap", "_split_by_tokens", "_split_into_children", "read_book_text", "_encode_sentences", "_embed_batch", "_get_embed_model", "load_embedding_model", )
+# 指纹单元 = 真正决定切分结果的自研代码。2026-10-14 组件化后只剩四个：引号归一、
+# 文档读取（含 ftfy+OpenCC 归一化）、父子分块（semantic-text-splitter 的调用参数与
+# 容量回调）、以及 token 计数器。分块组件的**版本**另在 config 指纹里（splitter 项）。
+_CHUNKING_CODE_UNITS = (
+    "fix_quotes",
+    "read_book_text",
+    "_hierarchical_split",
+    "_token_counter",
+)
 
 
 def _package_version(name):
@@ -1442,7 +1042,9 @@ def _chunking_code_fingerprint():
 def _chunking_config_fingerprint():
     # embed_model_content：语义定界用的是**权重算出的句向量**，同路径换权重必须触发重分块。
     # 只存路径 = 静默沿用旧分块（稠密缓存 _embed_cache_file 已修同款洞，分块侧同步补上）。
-    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "child_min_tokens": CHILD_MIN_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "semantic_threshold": SEMANTIC_THRESHOLD, "semantic_min_chars": SEMANTIC_MIN_CHARS, "normalize_quotes": NORMALIZE_QUOTES, "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content_fingerprint(), "sentencex": _package_version("sentencex"), "sentence_lang": SENTENCE_LANG, "chunking_code": _chunking_code_fingerprint(), "sentence_terminators": SENTENCE_TERMINATORS, "paragraph_gap_re": _PARAGRAPH_GAP_RE.pattern, "soft_wrap_re": _SOFT_WRAP_RE.pattern, }
+    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "child_min_tokens": CHILD_MIN_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "semantic_threshold": SEMANTIC_THRESHOLD, "semantic_min_chars": SEMANTIC_MIN_CHARS, "normalize_quotes": NORMALIZE_QUOTES, "text_opencc": TEXT_OPENCC, "ftfy_fix": json.dumps(FTFY_FIX, sort_keys=True), "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content_fingerprint(), "sentencex": _package_version("sentencex"),
+        # 分块组件版本：升级它会改变切分边界，漏掉就会让"产物过期"不被发现（与 sentencex 同款理由）
+        "splitter": _package_version("semantic-text-splitter"), "sentence_lang": SENTENCE_LANG, "chunking_code": _chunking_code_fingerprint(), "sentence_terminators": SENTENCE_TERMINATORS, "paragraph_gap_re": _PARAGRAPH_GAP_RE.pattern, "soft_wrap_re": _SOFT_WRAP_RE.pattern, }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16], payload
 

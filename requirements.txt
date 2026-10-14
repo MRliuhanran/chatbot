@@ -13,7 +13,6 @@
 streamlit==1.62.0
 requests==2.32.4
 qdrant-client==1.19.0
-jieba==0.42.1
 # .env 加载（chatbot.py 顶部）。缺失即报错、不静默跳过 —— 静默跳过会让 .env 的
 # MODEL/OLLAMA_BASE_URL 全失效，程序悄悄跑在代码默认值上，极难定位。
 python-dotenv==1.1.1
@@ -24,7 +23,6 @@ numpy==1.26.4
 # （首次分句才 import，模块级不再 import）；语言码走 RAG_SENTENCE_LANG，默认 zh。
 # 曾经的"内置标点分句降级"会把闭合引号切给下一句且**静默**错（字符扫描不认引语边界：
 # 实测全库 24%~36% 的句子以 ” 开头，sentencex 下为 0%）。
-sentencex==1.0.30
 
 # --- 传递闭包（上述依赖解析出的间接包，同样锁定本地现役版本，56 个）---
 # 说明：pydantic 仍在此列，但身份已变 —— 不再是被批判的"直接声明"（配置走代码手写
@@ -86,3 +84,10 @@ typing-inspection==0.4.1
 urllib3==2.7.0
 uvicorn==0.48.0
 websockets==16.0
+
+# 2026-10-14 组件化：自研逻辑换成公开组件（全部零/低依赖，不动 numpy/transformers/torch 版本）
+semantic-text-splitter==0.33.0
+ftfy==6.3.1
+OpenCC==1.1.9
+pyahocorasick==2.3.1
+tenacity==9.1.4
