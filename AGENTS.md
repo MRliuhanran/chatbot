@@ -3,7 +3,7 @@
 **触发** rag、索引、embedding、向量、qdrant、bm25、稀疏、分块、分句、rerank、检索、知识库、process、index、hybrid_search
 
 ## 形态
-单文件 `chatbot.py`（约 3900 行，按依赖顺序分节），节顺序即流水线：配置 → 分块 → 索引 → 检索 → 生成 → 编排 → 入口（Streamlit）→ 离线工具 → 命令分发。入口命令：`process`、`index`、`serve`、`sparse`、`compare-chunks`、`lexicon`、`stages`（`api` 已于 2026-10-14 移除）；`streamlit run chatbot.py` 进界面。重型依赖一律惰性导入。**第三方依赖全部惰性**（2026-10-06 起）：模块级只剩标准库，`requests` 在各自使用点 import，`sentencex` 经模块级同名转发壳 `segment()` 首次分句才加载；唯一例外是 `dotenv` —— `load_dotenv()` 必须先于 155 行起的模块级配置常量。**约束**：`_split_sentences` 里的调用点是 `segment(SENTENCE_LANG, s)`（语言码默认 `zh`，可配 `RAG_SENTENCE_LANG`）；该函数源码进切分指纹，改语言码=指纹漂移=重分块（有意），不要把 import 下推进函数体。
+单文件 `chatbot.py`（约 3900 行，按依赖顺序分节），节顺序即流水线：配置 → 分块 → 索引 → 检索 → 生成 → 编排 → 入口（Streamlit）→ 离线工具 → 命令分发。入口命令：`process`、`index`、`serve`、`sparse`、`compare-chunks`、`lexicon`、`stages`（`api` 已于 2026-10-14 移除）；`streamlit run chatbot.py` 进界面。重型依赖一律惰性导入。**第三方依赖全部惰性**（2026-10-06 起）：模块级只剩标准库，`requests` 在各自使用点 import；唯一例外是 `dotenv` —— `load_dotenv()` 必须先于模块级配置常量。（2026-10-14 组件化后 `sentencex`/`jieba` 已彻底移除：分句与分词都不再由本仓库做，见下。）
 日志：`log()`/`logger` 同时写控制台与单一文件 `RAG_LOG_FILE`（默认 `rag.log`，10MB×3 轮转，`*.log` 与 `*.log.*` 已 gitignore）。
 
 ## 本地运行（原生，不用容器）
@@ -17,7 +17,7 @@
 `docker-compose.yml` 保留为**容器化路径**（本地 Docker / 自有服务器）；本地默认走 `tools/run_local.sh` 原生起（GPU 档），两者共用同一份 `qdrant_storage`，故版本必须一致（都锁 `v1.19.1`）。自有 NVIDIA 主机叠加 `docker-compose.gpu.yml`，**只**把生成模型交给 GPU（app/embed 镜像里装的是 CPU 版 torch，给设备也用不上，故不写任何占位开关）。**魔搭创空间不支持 compose**：docker 类型是"仓库根一个 Dockerfile → 一个容器"、端口只能 7860（平台 `deploy_schema.json` 里 `sdk_type=docker` 的定义，属性只有 sdk_type/resource_configuration/base_image/environment_variables/port），所以那边只能单容器三进程，发布走 `Dockerfile`（all-in-one 镜像）。
 
 ## 设备与最小重跑
-设备自动选型（MPS 优先、初始化失败回退 CPU）：`INDEX_DEVICE`/`SEMANTIC_EMBED_DEVICE` 留空即自动；批量重建前先 `ollama stop` 释放显存避免 Metal 争抢（`ollama stop` 需带模型名，空参报错；`ollama ps` 为空即无驻留）；水印 1.0/0.9 是内存缓冲，不要改小。**8GB 本机 process 的语义嵌入在默认 batch64+fp32 下会撞 MPS 工作集上限**（实测 5.33GB 触顶 OOM，发生在第一个文档内），批量重建前设 `RAG_EMBED_BATCH_SIZE=16`（不入任何指纹、只影响峰值内存）；同时尽量清场别的内存大户（Docker VM/游离容器）。`serve`（Streamlit）启动时后台预热（`RAG_PRELOAD`，默认开）：jieba 词典、嵌入/重排模型、生成模型常驻 Ollama —— 把首查询冷加载提前到启动期。`python chatbot.py stages` 给出四阶段指纹比对与最小重跑命令：A 分块（语料/切分变 → process）、B 稠密（换嵌入模型/新内容 → index，内容哈希缓存只算增量）、C 稀疏（词表/jieba/BM25/编码变 → sparse）、D 入库（集合缺失/点数不符 → index）。**退出码**：有阶段过期或有阶段未验证（Qdrant 不可达/产物损坏）= 1，全新鲜才 0（与 `lexicon`/`compare-chunks` 对齐，自动化可据此判断要不要重跑）。
+设备自动选型（MPS 优先、初始化失败回退 CPU）：`INDEX_DEVICE`/`SEMANTIC_EMBED_DEVICE` 留空即自动；批量重建前先 `ollama stop` 释放显存避免 Metal 争抢（`ollama stop` 需带模型名，空参报错；`ollama ps` 为空即无驻留）；水印 1.0/0.9 是内存缓冲，不要改小。**8GB 本机批量嵌入在默认 batch64+fp32 下会撞 MPS 工作集上限**（注：2026-10-14 组件化后 `process` 不再做逐句嵌入，分块本身是秒级；这条主要适用于 `index` 的批量嵌入）（实测 5.33GB 触顶 OOM，发生在第一个文档内），批量重建前设 `RAG_EMBED_BATCH_SIZE=16`（不入任何指纹、只影响峰值内存）；同时尽量清场别的内存大户（Docker VM/游离容器）。`serve`（Streamlit）启动时后台预热（`RAG_PRELOAD`，默认开）：词表、嵌入/重排模型、生成模型常驻 Ollama —— 把首查询冷加载提前到启动期。`python chatbot.py stages` 给出四阶段指纹比对与最小重跑命令：A 分块（语料/切分变 → process）、B 稠密（换嵌入模型/新内容 → index，内容哈希缓存只算增量）、C 稀疏（词表/jieba/BM25/编码变 → sparse）、D 入库（集合缺失/点数不符 → index）。**退出码**：有阶段过期或有阶段未验证（Qdrant 不可达/产物损坏）= 1，全新鲜才 0（与 `lexicon`/`compare-chunks` 对齐，自动化可据此判断要不要重跑）。
 
 **增量（增删改）**：`process` 在 `artifacts/docs/<doc>.json` 缓存**每个文档**的分块，内容 sha 与切分指纹都没变就整篇复用（不读文件、不跑句向量），文档删除会自动清理缓存 —— 所以加/改文档只重分块它自己；`index` 的稠密向量按 child_text 内容哈希复用（只嵌入新增/变化的块）。未变部分不重算、结果逐字一致（测试：不变重跑 chunks.json 与首次完全相同）。
 
@@ -33,7 +33,7 @@
 换领域：改 `.env` 领域块（或同名环境变量）→ `python chatbot.py process` → `python chatbot.py index`；词表不同则先跑 `python chatbot.py lexicon` 自检。
 
 ## 链路
-分块：归一 → 分句 → 语义定界 → 小块并入 → 父块打包(上限512) → 子块切分(128/重叠32)。
+分块：归一化（ftfy 修编码 + OpenCC 繁简）→ 引号归一 → **组件递归切分**（semantic-text-splitter：父块 capacity=512、子块在父块内 capacity=128/重叠32，容量用本仓库 tokenizer 计量，`trim=False` 保逐字无损）。2026-10-14 前这里是自研的"分句 + 逐句嵌入余弦定界 + 平衡打包 + 小块合并"。
 索引：校验指纹 → 向量化(内容哈希缓存) → 稠密+稀疏双写 → 建字段索引 → 切别名 → 删旧集合。
 检索：空查询守护 → 稠密/稀疏双通道召回(查询侧与入库同精度，MPS 上 fp16) → 客户端加权RRF → 按命中 id 惰性拉 payload(不全量滚动) → 父块去重 → rerank(对全体候选统一打分，默认单批 32) → 分数概览(置信度，只统计不判定)。
 生成：上下文装配(资料独立消息，parent_text + `<document>` 边界标签（`RAG_CONTEXT_TAGS`）+ `[n]（来源：xxx）` 标头（`RAG_CONTEXT_LABELS`），system prompt 恒为空字符串——不再发 system）→ 生成装配硬上界(整条 prompt 估算 token ≤ `RAG_NUM_CTX - RAG_INPUT_RESERVE`=输入上界，不做输出预留；历史先用满窗口余量，越界按**整轮**淘汰最旧（一条 user 及其后所有连续 assistant，整轮全部丢，不做 token 部分截断），锚点 system→资料→提问 才做 token 截取（资料按整条从尾部丢，提问只截前缀）) → 流式（**无长度/时间闸、无重试**：输出与思考都不限长，窗口是唯一上限；空答 / done_reason=length / 报错原样交给上层）。**无拒答**：检索为空也照常生成，代码不替模型做拒答决定。
