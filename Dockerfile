@@ -132,20 +132,11 @@ RUN pip install --no-cache-dir \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
     && rm -rf /root/.cache
 
-# ── 检索模型服务（infinity）：魔搭是单容器平台，模型仍要与业务进程分开，故装进同一镜像 ──
-# 只被 entrypoint.sh 在 RAG_EMBED_BACKEND / RAG_RERANK_BACKEND = http 时拉起（容器内第二个
-# 进程，与 qdrant/ollama 同级）；compose 路径不用它（那边用更精简的 embed.Dockerfile）。
-# --constraint requirements.txt：infinity 若要求比锁定值更新的传递依赖，构建**失败**，
-# 而不是静默升级把"镜像 == 本地现役版本"这条锁定破掉（本仓库点名的静默失效原型）。
-ARG INFINITY_VERSION=0.0.77
-RUN uv pip install --system --break-system-packages --no-cache \
-        --index-strategy unsafe-best-match \
-        --constraint requirements.txt \
-        --index-url "${PIP_INDEX_URL}" \
-        --extra-index-url "${PIP_FALLBACK_INDEX}" \
-        "infinity-emb[server,torch]==${INFINITY_VERSION}" \
-    && python -c "import infinity_emb; print('infinity-emb', infinity_emb.__version__)" \
-    && uv pip check --system
+# 检索模型服务（infinity）**不装进本镜像**：魔搭是 8G 单容器，运行档定为
+# RAG_EMBED_BACKEND/RAG_RERANK_BACKEND = torch（进程内），entrypoint 仅在 =http 时才拉起
+# infinity，故这层对云端是纯负担；且 infinity-emb[server]==0.0.77 要求 uvicorn<0.33.0，
+# 与 requirements.txt 锁定的 uvicorn==0.48.0 直接冲突，带 --constraint 的安装**必然构建失败**
+# （2026-10-15 构建实测）。compose 路径仍用独立的 embed.Dockerfile（不带本仓约束、可解析）。
 
 # ── 构建期烘焙模型（"构建完就能用"）────────────────────────────────────────────
 # ⚠️ 必须先把 RUN 的 shell 换成 bash：Docker 默认 /bin/sh，Debian 上是 dash，而
