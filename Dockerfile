@@ -149,20 +149,36 @@ SHELL ["/bin/bash", "-c"]
 # 并不等于"可服务"。烘焙进镜像层后，entrypoint 的清单判据直接判"已就绪"，启动即用，
 # 运行日志里不再有下载过程。清单与实现唯一来源 tools/fetch_models.sh（与运行期共用，
 # 避免两处清单漂移）；BAKE_MODELS / BAKE_OLLAMA 任一置 0 即可关掉对应烘焙、退回运行期下载。
-# 烘焙后 chmod a+rX 让平台以非 root 跑时也能读；_download_models 返回非 0 / ollama pull
-# 失败会让本层构建失败，避免产出"模型缺失却照样成功"的半成品镜像。
+# 烘焙后 chmod a+rX 让平台以非 root 跑时也能读；下载/拉取失败会让本层构建失败，
+# 避免产出"模型缺失却照样成功"的半成品镜像。
+# **按侧拆成三个 RUN（2026-10-16 实测强制）**：原单 RUN 产出 5.95G 单层，两次构建
+# 推镜像都卡死在该层（香港构建机 → 张家口 registry，>75 分钟无任何一层完成、无错误）；
+# 拆成 嵌入 2.1G / 重排 2.1G / 生成 2.6G 三层后单层推速回到分钟级，也恢复了可观测性。
 COPY .env ./
 COPY tools/fetch_models.sh ./tools/
 ARG BAKE_MODELS=1
 ARG BAKE_OLLAMA=1
 RUN set -eux; \
-    mkdir -p /app/models /app/ollama_models; \
+    mkdir -p /app/models; \
     . ./tools/fetch_models.sh; \
-    if [ "${BAKE_MODELS}" = "1" ]; then _download_models; fi; \
+    if [ "${BAKE_MODELS}" = "1" ]; then _download_side embed; fi; \
+    rm -f /tmp/model-download.status; \
+    chmod -R a+rX /app/models; \
+    du -sh /app/models
+RUN set -eux; \
+    mkdir -p /app/models; \
+    . ./tools/fetch_models.sh; \
+    if [ "${BAKE_MODELS}" = "1" ]; then _download_side rerank; fi; \
+    rm -f /tmp/model-download.status; \
+    chmod -R a+rX /app/models; \
+    du -sh /app/models
+RUN set -eux; \
+    mkdir -p /app/ollama_models; \
+    . ./tools/fetch_models.sh; \
     if [ "${BAKE_OLLAMA}" = "1" ]; then _pull_ollama_model "$(_env_get MODEL)"; fi; \
-    rm -f /tmp/model-download.status /tmp/ollama-pull.log /tmp/ollama-bake.log; \
-    chmod -R a+rX /app/models /app/ollama_models; \
-    du -sh /app/models /app/ollama_models
+    rm -f /tmp/ollama-pull.log /tmp/ollama-bake.log; \
+    chmod -R a+rX /app/ollama_models; \
+    du -sh /app/ollama_models
 
 # 本地数据全量进镜像：--chmod=0777 让平台以非 root 跑时也能写 qdrant_storage/artifacts/rag.log，
 # 且不额外产生整份文件的 chmod 层。models/ 已排除，由 entrypoint 运行时下载。

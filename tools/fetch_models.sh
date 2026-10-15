@@ -139,6 +139,23 @@ _spawn_model_download() {
     printf -v "${_target}" '%s' "$!"
 }
 
+# _download_side <embed|rerank> ──────────────────────────────────────────────
+# 只下载 .env 指定的**单侧**检索模型，模型名解析与 _download_models 同源（同上：知识
+# 只此一处）。Dockerfile 分层烘焙按侧各起一个 RUN 时用：两侧合成一个 RUN 会产出
+# 5.95G 单层，2026-10-16 两次构建实测推镜像都在该层卡死（>75 分钟无一层完成），
+# 拆成 ~2.1G/2.1G/2.6G 三层后每层都能在分钟级出现 `Pushed`。
+_download_side() {
+    local _side="$1" _name _p="" _rc=0
+    case "${_side}" in
+        embed)  _name="$(basename "${RAG_EMBED_MODEL_PATH:-$(_env_get RAG_EMBED_MODEL_PATH)}")" ;;
+        rerank) _name="$(basename "${RAG_RERANK_MODEL_PATH:-$(_env_get RAG_RERANK_MODEL_PATH)}")" ;;
+        *) _log "❌ _download_side 只接受 embed|rerank，收到: ${_side}"; return 1 ;;
+    esac
+    _spawn_model_download "${_name}" _p || return 1
+    wait "${_p}" || _rc=1
+    return "${_rc}"
+}
+
 # _download_models ───────────────────────────────────────────────────────────
 # 下载**当前 .env 指定的**两个检索模型（按 RAG_EMBED_MODEL_PATH / RAG_RERANK_MODEL_PATH
 # 的 basename 查 _model_spec）。旧写法把模型名写死在函数里：.env 换成 bge-m3 之后容器
