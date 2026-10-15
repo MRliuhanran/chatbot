@@ -2,5 +2,8 @@
   "$schema": "https://modelscope.cn/api/v1/studios/deploy_schema.json",
   "sdk_type": "docker",
   "resource_configuration": "platform/2v-cpu-8g-mem",
+  "environment_variables": [
+    { "name": "OLLAMA_KV_CACHE_TYPE", "value": "q8_0" }
+  ],
   "port": 7860
 }

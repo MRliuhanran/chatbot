@@ -1,6 +1,6 @@
 {
   "meta_version": 1,
-  "fingerprint": "3cb6d311bfb5e9dc",
+  "fingerprint": "88288b3912b9672f",
   "chunking_config": {
     "child_max_tokens": 128,
     "child_min_tokens": 32,
@@ -13,7 +13,7 @@
     "embed_model": "./models/bge-m3",
     "embed_model_content": "e9914797a3fe",
     "splitter": "0.33.0",
-    "chunking_code": "569259409b337bd7"
+    "chunking_code": "6ba8d3d4f6fc2172"
   },
   "sources": {
     "毛泽东文集 第1卷 001 在新民学会长沙会员大会上的发言.txt": "8cc28af58f799534",
@@ -1014,8 +1014,8 @@
     "毛泽东选集 第5卷 228 党内团结的辩证方法.txt": "b2d15237f4165669",
     "毛泽东选集 第5卷 229 一切反动派都是纸老虎.txt": "e1667bc17f4032e0"
   },
-  "total_chunks": 44588,
-  "total_parents": 6868,
+  "total_chunks": 21255,
+  "total_parents": 4852,
   "reused_documents": 0,
-  "build_time": "2026-10-15T21:34:38"
+  "build_time": "2026-10-15T21:37:14"
 }

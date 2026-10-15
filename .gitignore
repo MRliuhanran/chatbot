@@ -9,6 +9,10 @@ models/
 
 # ---- 索引与缓存（可重建：process + index）----
 qdrant_storage/
+# 说明：qdrant_storage 整体忽略，镜像所需部分用 git add -f 按路径入仓
+# （aliases/data.json、raft_state.json、集合目录含 wal/first-index）。
+# wal 的 open-*/closed-* 永不入仓 —— 与 .dockerignore 的排除保持一致（镜像里本来就没有），
+# 已实测：仅凭 first-index + segments 即可完整恢复（exact count=21255、别名可解析、green）。
 artifacts/
 *.pkl
 
