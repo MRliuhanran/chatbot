@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import threading
 import time
@@ -583,8 +582,6 @@ PARENT_MIN_TOKENS = env_int("RAG_PARENT_MIN_TOKENS", 192)
 CHILD_MIN_TOKENS = env_int("RAG_CHILD_MIN_TOKENS", 32)
 if CHILD_MAX_TOKENS > PARENT_MAX_TOKENS:
     raise ValueError(f"RAG_CHILD_MAX_TOKENS={CHILD_MAX_TOKENS} 不能大于 RAG_PARENT_MAX_TOKENS={PARENT_MAX_TOKENS}")
-SEMANTIC_THRESHOLD = env_float("RAG_SEMANTIC_THRESHOLD", 0.6)
-SEMANTIC_MIN_CHARS = env_int("RAG_SEMANTIC_MIN_CHARS", 500)
 EMBED_BATCH_SIZE = env_int_min("RAG_EMBED_BATCH_SIZE", 64, 1)
 SEMANTIC_EMBED_DEVICE = os.getenv("SEMANTIC_EMBED_DEVICE", "")  # 空=自动选设备（MPS 优先），见 get_device()
 INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
@@ -831,16 +828,10 @@ def embed(texts, tokenizer, model, device, is_query=False, autocast=False):
 
 
 # ── 分块：归一、分句、父子打包 ──
-SENTENCE_TERMINATORS = "。！？．…!?"
-# 分句器语言码（sentencex 的 lang 参数）。默认 zh；换非中文语料时按 sentencex 支持的语言码
-# 改这里。它进切分指纹，改它会触发重分块（这是有意的）。
-SENTENCE_LANG = (os.getenv("RAG_SENTENCE_LANG") or "zh").strip() or "zh"
 # 段落硬边界判据：只认**真正空行**（两个连续换行，允许 \r）。句内单个 \n 是软折行，
 # 属合法排版；而"行内只含空格/TAB 的空行"（\n[ \t]*\n）sentencex 并不当边界 ——
 # 旧正则把它也算作硬边界，于是"空行带尾随空格、空行后紧跟闭引号（”）"这类合法 txt
 # 会在这里直接抛错，把 process 整体打崩（与 D1 同类：报错还把原因误指成 sentencex 变了）。
-_PARAGRAPH_GAP_RE = re.compile(r"\r?\n\r?\n")
-_SOFT_WRAP_RE = re.compile(r"\s*\r?\n\s*")
 NORMALIZE_QUOTES = env_bool("NORMALIZE_QUOTES", True)
 
 
@@ -955,6 +946,27 @@ def _token_counter(tokenizer):
     return _count
 
 
+def _merge_tiny_parents(parents, tokenizer):
+    """把过短的父块并入相邻父块 —— 组件不做合并，这是旧 _merge_small_texts 的等价物。
+
+    只做**拼接**，且只在"合并后仍 <= PARENT_MAX_TOKENS"时合并：上限是硬不变量，块太短只是
+    质量问题（短父块没有上下文可给，9.8% 的父块曾短于 40 token）。trim=False 的块自带边界
+    空白，直接相加即逐字无损。
+    """
+    out = list(parents)
+    if not out:
+        return out
+    count = _token_counter(tokenizer)
+    i = 0
+    while i < len(out) - 1:
+        if count(out[i]) < PARENT_MIN_TOKENS and count(out[i] + out[i + 1]) <= PARENT_MAX_TOKENS:
+            out[i] = out[i] + out[i + 1]
+            del out[i + 1]
+        else:
+            i += 1
+    return out
+
+
 def _hierarchical_split(text, tokenizer):
     """父子分块：**机械部分交给 semantic-text-splitter**，父子契约不变。
 
@@ -973,9 +985,12 @@ def _hierarchical_split(text, tokenizer):
     """
     from semantic_text_splitter import TextSplitter
     count = _token_counter(tokenizer)
+    # **只给上限**：实测（40 篇）区间容量在这个组件里不是"合并小块"的意思 —— 父块区间
+    # (192,512) 会把父块从 411 涨到 672、短父块从 30 涨到 110，子块区间还会让子块翻倍
+    # （4240 vs 2014）；子块区间更会直接撞 ValueError(overlap >= 容量下界) 让 process 全量失败。
     parent_splitter = TextSplitter.from_callback(count, PARENT_MAX_TOKENS, trim=False)
     child_splitter = TextSplitter.from_callback(count, CHILD_MAX_TOKENS, overlap=CHUNK_OVERLAP, trim=False)
-    for parent_text in parent_splitter.chunks(text):
+    for parent_text in _merge_tiny_parents(parent_splitter.chunks(text), tokenizer):
         for child_text in child_splitter.chunks(parent_text):
             yield (child_text, parent_text)
 
@@ -1016,6 +1031,7 @@ _CHUNKING_CODE_UNITS = (
     "read_book_text",
     "_hierarchical_split",
     "_token_counter",
+    "_merge_tiny_parents",
 )
 
 
@@ -1042,9 +1058,8 @@ def _chunking_code_fingerprint():
 def _chunking_config_fingerprint():
     # embed_model_content：语义定界用的是**权重算出的句向量**，同路径换权重必须触发重分块。
     # 只存路径 = 静默沿用旧分块（稠密缓存 _embed_cache_file 已修同款洞，分块侧同步补上）。
-    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "child_min_tokens": CHILD_MIN_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "semantic_threshold": SEMANTIC_THRESHOLD, "semantic_min_chars": SEMANTIC_MIN_CHARS, "normalize_quotes": NORMALIZE_QUOTES, "text_opencc": TEXT_OPENCC, "ftfy_fix": json.dumps(FTFY_FIX, sort_keys=True), "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content_fingerprint(), "sentencex": _package_version("sentencex"),
-        # 分块组件版本：升级它会改变切分边界，漏掉就会让"产物过期"不被发现（与 sentencex 同款理由）
-        "splitter": _package_version("semantic-text-splitter"), "sentence_lang": SENTENCE_LANG, "chunking_code": _chunking_code_fingerprint(), "sentence_terminators": SENTENCE_TERMINATORS, "paragraph_gap_re": _PARAGRAPH_GAP_RE.pattern, "soft_wrap_re": _SOFT_WRAP_RE.pattern, }
+    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "child_min_tokens": CHILD_MIN_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "normalize_quotes": NORMALIZE_QUOTES, "text_opencc": TEXT_OPENCC, "ftfy_fix": json.dumps(FTFY_FIX, sort_keys=True), "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content_fingerprint(),         # 分块组件版本：升级它会改变切分边界，漏掉就会让"产物过期"不被发现（与 sentencex 同款理由）
+        "splitter": _package_version("semantic-text-splitter"), "chunking_code": _chunking_code_fingerprint(), }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16], payload
 
@@ -1308,7 +1323,11 @@ def load_lexicon():
             stopwords = _read_stopwords(STOPWORDS_FILE)
         if alias_map:
             surfaces = sorted(alias_map, key=len, reverse=True)
-            alias_re = re.compile("|".join(re.escape(s) for s in surfaces))
+            from ahocorasick import Automaton
+            alias_re = Automaton()
+            for _surface in sorted(set(surfaces)):
+                alias_re.add_word(_surface, _surface)
+            alias_re.make_automaton()
         else:
             alias_re = None
         state.lexicon = (alias_map, alias_re, stopwords)
@@ -1464,12 +1483,34 @@ def lexicon_fingerprint():
 
 
 def normalize_aliases(text):
+    """别名归一：Aho-Corasick **最长优先、从左到右不重叠**（与旧正则交替换逐字等价）。
+
+    2026-10-14 组件化：匹配引擎换成 pyahocorasick（C 实现）。等价性由 lexicon 自检的
+    「与线上实现对拍」守着 —— 那条判据拿参照实现与这里逐字比对，不一致就报错。
+    """
     if not text:
         return text
-    alias_map, alias_re, _ = load_lexicon()
-    if not alias_re:
+    alias_map, automaton, _ = load_lexicon()
+    if automaton is None:
         return text
-    return alias_re.sub(lambda m: alias_map[m.group(0)], text)
+    best = {}
+    for end, surface in automaton.iter(text):
+        start = end - len(surface) + 1
+        cur = best.get(start)
+        if cur is None or len(surface) > len(cur):
+            best[start] = surface
+    if not best:
+        return text
+    out, i, n = [], 0, len(text)
+    while i < n:
+        surface = best.get(i)
+        if surface is not None:
+            out.append(alias_map[surface])
+            i += len(surface)
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 def sparse_text(text):
