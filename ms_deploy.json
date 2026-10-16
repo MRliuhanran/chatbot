@@ -8,10 +8,6 @@
       "value": "q8_0"
     },
     {
-      "name": "RAG_NUM_CTX",
-      "value": "32768"
-    },
-    {
       "name": "RAG_PRELOAD",
       "value": "0"
     },

@@ -2629,6 +2629,15 @@ class RAGEngine:
             self._rerank = None
         import gc
         gc.collect()
+        # ★ CPU 上"释放"必须显式把空闲堆还给 OS：torch/glibc 默认只把内存退回自己的分配器，
+        #   RSS 只涨不落，单例于是名不副实（容器实测：检索模型释放后 python 仍占 ~1.9G，
+        #   生成模型一加载就叠加到 7.9G/8G）。malloc_trim(0) 把所有空闲堆页归还内核 ——
+        #   这是 CPU 容器上让单例真正生效的关键一步；macOS 无此符号（MPS 释放本就有效），跳过。
+        try:
+            import ctypes
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
         try:
             import torch
             if torch.backends.mps.is_available():
