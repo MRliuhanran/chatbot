@@ -86,7 +86,18 @@ _download_model() {
         done
     fi
     if [ "${_ok}" = 1 ]; then
-        if rm -rf "${_dir}" && mv "${_tmp}" "${_dir}"; then
+        # 安全落盘（评审 #1）：旧写法 `rm -rf 目标 && mv` 在目标是挂载点/半成品时会把既有权重
+        # 先删光、再因 rmdir 失败而整体失败，日志却还说"保留既有不动"——数据丢失且被日志误导。
+        # 改成"改名备份 -> 换入 -> 删备份"，任一步失败都能回退。
+        if [ -n "$(mount 2>/dev/null | grep -F " ${_dir} ")" ]; then
+            _ok=0; _miss="${_miss:-?}（目标是挂载点，不能整体替换；请改用挂载点内的子目录）"
+            rm -rf "${_tmp}" 2>/dev/null
+            _log "❌ 权重落盘失败: ${_name}（目标是挂载点；既有 ${_dir} 未被触碰）"
+            return 1
+        fi
+        rm -rf "${_dir}.old" 2>/dev/null
+        if { [ ! -e "${_dir}" ] || mv "${_dir}" "${_dir}.old"; } && mv "${_tmp}" "${_dir}"; then
+            rm -rf "${_dir}.old" 2>/dev/null
             _log "权重下载完成: ${_name}"
         else
             _ok=0

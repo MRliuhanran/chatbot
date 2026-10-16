@@ -42,3 +42,10 @@ qdrant_storage/**/wal/closed-*
 qdrant_storage/**/wal/open-*
 qdrant_storage/collections/*/*/wal/closed-*
 qdrant_storage/collections/*/*/wal/open-*
+
+# 不该进公开镜像（2026-10-16 白盒评审 #2）：
+.bin/
+.cache/
+gh1.json
+tools/_oc_api.py
+repo_tmp/

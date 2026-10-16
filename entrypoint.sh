@@ -244,7 +244,9 @@ _log "ollama 就绪（http://127.0.0.1:11434, models=${OLLAMA_MODELS}）"
 # KV 缓冲大小写进 ollama 日志，而 FC 只收 stdout —— 故此处把关键行转印到 stdout。
 # 判据：出现 `KV buffer size = xxx MiB` 即知道 KV 用了什么精度（q8_0 应明显小于 f16）。
 _kv_report() {
-    for _i in 1 2 3 4 5 6 7 8 9 10; do
+    # 窗口必须覆盖启动自检（RAG_BOOT_SELFTEST_DELAY 默认 45s）之后的首个请求：
+    # 原来只轮询 10x3=30s，默认档必然走"尚未产生"分支，等于该诊断永不生效（评审 #4）。
+    for _i in $(seq 1 50); do
         _line=$(grep -hoE "(KV buffer size = [0-9.]+ MiB|flash[- _]?attn[^ ]*|FLASH_ATTN[^ ]*)" /tmp/ollama.log 2>/dev/null | tail -3 | tr "\n" " ")
         if [ -n "$_line" ]; then _log "🔎 生成侧 KV/FA 实证: $_line"; return 0; fi
         sleep 3
@@ -358,7 +360,10 @@ fi
 # 默认只跑「生成探针」（不导入 torch，进程几十 MB，与真实查询重叠也不会撑爆 8G）；
 # 需要验收检索侧时再开 RAG_BOOT_SELFTEST_FULL=1。RAG_BOOT_SELFTEST=0 可整体关掉。
 if [ "${RAG_BOOT_SELFTEST:-1}" != 0 ]; then
-    if [ -f /app/models/bge-m3/config.json ] || [ -f /app/models/bge-reranker-v2-m3/config.json ]; then
+    # 目录名**从 .env 推导**（与下面 271-272 行同源）：写死 bge-m3/bge-reranker-v2-m3 会让
+    _sel_embed="${MODELS_DIR:-/app/models}/$(basename "${RAG_EMBED_MODEL_PATH:-bge-m3}")"
+    _sel_rerank="${MODELS_DIR:-/app/models}/$(basename "${RAG_RERANK_MODEL_PATH:-bge-reranker-v2-m3}")"
+    if [ -f "${_sel_embed}/config.json" ] || [ -f "${_sel_rerank}/config.json" ]; then
         (
             sleep "${RAG_BOOT_SELFTEST_DELAY:-45}"
             _log "启动自检开始（前缀 [自检]；服务已就绪，自检不阻塞端口）"
