@@ -124,7 +124,8 @@ else
 fi
 _load_dotenv
 
-# ── 0.2b 硬件适配参数：唯一实现 tools/hw_profile.sh（与本地 run_local.sh / run_ollama.sh 共用）──
+# ── 0.2b 硬件适配参数：唯一实现 tools/hw_profile.py（经 tools/hw_profile.sh 薄封装；与本地
+#         run_local.sh / run_ollama.sh 共用同一份）──
 # 线程数、MALLOC_ARENA_MAX、OLLAMA_NUM_PARALLEL 这些**硬件相关**的旋钮不再写死：容器里按
 # cgroup 的 quota/limit 派生（nproc 会报宿主核数，直接用会让 2 vCPU 的机器开几十个线程）。
 # **必须在 _load_dotenv 之后**：派生只填"没被显式设过"的键，而 .env / 平台注入正是"显式"；
@@ -135,9 +136,14 @@ _load_dotenv
 # 核数开线程 + 内存碎片化"，正是本模块要消除的那件事。故与 dotenv.sh 同规格 fail-closed。
 if [ -f /app/tools/hw_profile.sh ]; then
     . /app/tools/hw_profile.sh
-    _load_hw_profile
+    # 探测与派生都在 tools/hw_profile.py 里，本行只是 eval 它的 --sh 输出。任一步失败都必须
+    # 拦下来：线程数/arena 静默偏离正是这个模块要消除的那类问题（与"缺 dotenv.sh 就退出"同规格）。
+    _load_hw_profile || {
+        _log "❌ 硬件契约加载失败（见上一行 [hw] ❌）—— 线程数/内存旋钮会静默偏离，退出"
+        exit 1
+    }
 else
-    _log "❌ 缺少 /app/tools/hw_profile.sh（硬件适配参数的唯一实现）—— 线程数/内存旋钮会静默偏离，退出"
+    _log "❌ 缺少 /app/tools/hw_profile.sh（硬件适配参数的薄封装；实现是 tools/hw_profile.py）—— 退出"
     exit 1
 fi
 
@@ -220,9 +226,10 @@ export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 #   · 语义项（KV 量化 / flash attention / 槽位并发）—— 定义行为，与核数无关：
 #         .env → _load_dotenv → ollama serve
 #   · 硬件项（OLLAMA_NUM_THREADS 等线程数）—— 随机器而变：
-#         tools/hw_profile.sh 按 cgroup 探测派生 → ollama serve（见上方 [hw] 审计行）
+#         tools/hw_profile.py 按 cgroup 探测派生（经 hw_profile.sh 薄封装）→ ollama serve
+#         （见上方 [hw] 审计行）
 # 本机的对应机制：tools/run_ollama.sh / tools/run_local.sh，两者 source 的就是同一份
-# dotenv.sh 与 hw_profile.sh。
+# dotenv.sh 与 hw_profile.sh（后者只是 hw_profile.py 的薄封装）。
 #
 # ★ fail-closed（本次统一最容易引入的新静默点）★
 # KV_CACHE_TYPE 为空 = KV 退回 f16：65536 窗口下 KV 体积翻倍，8G 档 llama-server 必被
@@ -240,8 +247,8 @@ fi
 [ -n "${OLLAMA_NUM_THREADS:-}" ]     || _log "⚠️  OLLAMA_NUM_THREADS 为空：hw_profile 没生效？（启动早期应有一行 [hw]）"
 # 生效值留痕：OOM 现场要能一眼看出是不是 q8_0/1/1 **以及它们来自哪里**。这一行是
 # "唯一来源"改造的可证日志 —— 前三项只可能来自 .env 或平台注入的同名环境变量，
-# NUM_THREADS 只可能来自 tools/hw_profile.sh 的派生（或显式覆盖）。
-_log "生成侧服务端参数：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}〔以上三项来源 /app/.env〕 NUM_THREADS=${OLLAMA_NUM_THREADS:-<未设>}〔来源 tools/hw_profile.sh 派生，见上方 [hw] 行〕"
+# NUM_THREADS 只可能来自 tools/hw_profile.py 的派生（或显式覆盖）。
+_log "生成侧服务端参数：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}〔以上三项来源 /app/.env〕 NUM_THREADS=${OLLAMA_NUM_THREADS:-<未设>}〔来源 tools/hw_profile.py 派生，见上方 [hw] 行〕"
 # 拉起函数：首启与运行期自愈（4.5）复用同一份命令。
 _ollama_start() {
     ollama serve >>/tmp/ollama.log 2>&1 &

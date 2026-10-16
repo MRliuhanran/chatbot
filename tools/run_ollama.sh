@@ -35,7 +35,7 @@ if [ ! -f tools/dotenv.sh ]; then
 fi
 # shellcheck source=tools/dotenv.sh
 if [ ! -f tools/hw_profile.sh ]; then
-    echo "❌ 缺少 tools/hw_profile.sh（硬件适配参数的唯一实现）—— 拒绝在"线程数无依据"的状态下起服务" >&2
+    echo "❌ 缺少 tools/hw_profile.sh（硬件适配参数的薄封装；实现是 tools/hw_profile.py）—— 拒绝在"线程数无依据"的状态下起服务" >&2
     exit 1
 fi
 . tools/dotenv.sh
@@ -43,10 +43,10 @@ fi
 # （派生只填没被显式设过的键）。反过来 .env 会被派生值压掉 —— 静默原型。
 _load_dotenv .env
 . tools/hw_profile.sh
-_load_hw_profile
+_load_hw_profile || { echo "❌ 硬件契约加载失败（见上一行 [hw] ❌）—— 拒绝在"线程数无依据"的状态下起服务" >&2; exit 1; }
 
 # 服务端参数清单：前三项是**语义项**（定义行为，与核数无关，来自 .env），
-# 第四项是**硬件项**（随机器而变，由 tools/hw_profile.sh 按 cgroup 派生）。
+# 第四项是**硬件项**（随机器而变，由 tools/hw_profile.py 按 cgroup 派生）。
 _KEYS="OLLAMA_KV_CACHE_TYPE OLLAMA_FLASH_ATTENTION OLLAMA_NUM_PARALLEL OLLAMA_NUM_THREADS"
 
 # 取值不用 eval / 间接展开：bash 3.2 的 ${!name} 在 set -u 下有坑，且显式 case 更好审。

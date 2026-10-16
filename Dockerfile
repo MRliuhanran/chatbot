@@ -16,7 +16,7 @@
 #      又把 MALLOC_ARENA_MAX / OMP / MKL / OPENBLAS 也写成死值。现在**本文件一个 ENV 都不再
 #      承载这些旋钮**，改为按性质分两类、各自单一来源（见下方"服务端参数"）：
 #        · 语义项（KV 量化 / flash attention / 槽位并发）→ .env（定义行为，与机器无关）
-#        · 硬件项（线程数 / arena / 并行槽）→ tools/hw_profile.sh 按 cgroup 探测**派生**
+#        · 硬件项（线程数 / arena / 并行槽）→ tools/hw_profile.py 按 cgroup 探测**派生**
 #      收益：改任一项都只失效元数据层级的层，不碰 6.8G 模型层；且 8 核 Mac 与 2vCPU 容器
 #      各自算出各自最优值（写死必然有一边是错的）。
 #   B) 三段并行烘焙：bge-m3 / bge-reranker-v2-m3 / ollama 生成模型在**同一个 RUN** 里后台
@@ -41,12 +41,14 @@
 #     · 语义项（KV_CACHE_TYPE / FLASH_ATTENTION / NUM_PARALLEL）—— 定义行为，与核数无关：
 #           .env → _load_dotenv（tools/dotenv.sh，唯一实现） → 各自那份 ollama serve
 #     · 硬件项（OLLAMA_NUM_THREADS / OMP / MKL / OPENBLAS / MALLOC_ARENA_MAX）
-#           tools/hw_profile.sh 按 cgroup（v2 cpu.max/memory.max → v1 → nproc/meminfo/sysctl）
-#           探测后**派生** → 各自那份 ollama serve / torch
+#           tools/hw_profile.py 按 cgroup（v2 cpu.max/memory.max → v1 → nproc/meminfo/sysctl）
+#           探测后**派生** → 各自那份 ollama serve / torch（shell 侧只是一层薄封装：
+#           eval 它的 --sh 输出，因为导出必须在**当前 shell** 生效才能传给子进程）
 #   本地：tools/run_local.sh 与 tools/run_ollama.sh（纯原生）；容器：entrypoint.sh。
 #   三者都**先 _load_dotenv 再 _load_hw_profile**（显式覆盖优先），并各自打印一行 [hw] 审计。
 #   entrypoint 对 KV_CACHE_TYPE 为空做了 fail-closed：宁可起不来，也不静默退回 f16 KV 把 8G
-#   档 OOM 掉；对 hw_profile.sh 缺失同样 fail-closed（线程/arena 静默偏离是同一类风险）。
+#   档 OOM 掉；对 hw_profile.sh 缺失、或 _load_hw_profile 返回非 0，同样 fail-closed
+#   （线程/arena 静默偏离是同一类风险）。
 #
 # 环境一致性：
 #   - requirements.txt 全 == 锁定本地现役版本；基础镜像 python:3.10（本地 3.10.0，
@@ -395,7 +397,8 @@ RUN set -eux; \
 
 # 这里**故意没有任何 ENV**：MALLOC_ARENA_MAX / OMP_NUM_THREADS / MKL_NUM_THREADS /
 # OPENBLAS_NUM_THREADS / OLLAMA_NUM_THREADS / OLLAMA_NUM_PARALLEL 这些硬件相关旋钮全部由
-# tools/hw_profile.sh 在**运行期**按真实配额派生（entrypoint.sh 第 0.2b 节加载并导出）。
+# tools/hw_profile.py 在**运行期**按真实配额派生（entrypoint.sh 第 0.2b 节经 hw_profile.sh
+# 薄封装加载并导出）。
 # 为什么不写成 ENV：
 #   · 写死就是"同一份镜像只能适配一种机器"——2vCPU 容器与 8 核 Mac 必有一边被拖慢；
 #   · ENV 还在**构建期**生效，会让 pip/烘焙阶段也跟着变线程数（与产物无关的抖动）；
