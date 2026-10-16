@@ -113,6 +113,180 @@ def env_int_any(default, *names):
     return default
 
 
+# ── 机器规格探测：离线负载能用的核数与内存 ──
+# tools/hw_profile.sh 是 shell 侧的**唯一实现**，但它派生的是线程族（OMP/MKL/Ollama/torch）并把
+# THREADS 封顶 8 —— 那是在线推理的合理策略（再多线程只是互相争抢）；离线批处理（process 的
+# 分块池、index 的写批、sparse 的页更新）要的是**真实核数**：16 核机器上只开 8 路就是白丢
+# 一半算力。另外 chatbot.py 也可能被直接调用（不经 run_local.sh / entrypoint.sh），那时 shell
+# 侧的派生根本没跑过。故 Python 侧再探一次，规则与 hw_profile.sh 同源：
+#   CORES ：HW_CORES（契约值，不封顶）→ cgroup v2 cpu.max → cgroup v1 cpu.cfs_quota_us → nproc/sysctl
+#   MEM_MB：HW_MEM_MB → cgroup v2 memory.max → cgroup v1 memory.limit_in_bytes → sysconf/meminfo
+# 显式覆盖优先的语义一致：环境里写了就用，探测只当默认值。探测失败 → 安全回退（核数 4、内存未知）。
+_HW_PROBE: dict = {}
+
+
+def _probe_positive_int(name):
+    """环境变量的正整数读法；未设/空/非法都返回 None（探测失败不抛，由调用方回退）。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        return None
+    return val if val > 0 else None
+
+
+def _hw_profile_module():
+    """按文件路径 import tools/hw_profile.py（不依赖包结构与 CWD）；失败返回 None。
+
+    **机器事实只此一处实现**：容器 entrypoint 与 tools/run_local.sh 走它导出的 HW_*；
+    裸跑 `python chatbot.py process|index|sparse`（不经过那两个入口）时环境里没有 HW_*，
+    这里直接取同一份 detect() —— 两条路径同一份实现，不会各探一套而分叉。
+    """
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "hw_profile.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_rag_hw_profile", path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def _hw_facts():
+    """(核数, 内存MB, 来源串)。环境变量优先 → tools/hw_profile.detect() → 安全回退。"""
+    cached = _HW_PROBE.get("facts")
+    if cached:
+        return cached
+    cores = _probe_positive_int("HW_CORES")
+    mem = _probe_positive_int("HW_MEM_MB")
+    src = []
+    if cores:
+        src.append(f"HW_CORES={cores}")
+    if mem:
+        src.append(f"HW_MEM_MB={mem}")
+    if not cores or not mem:
+        facts: dict = {}
+        mod = _hw_profile_module()
+        if mod is not None:
+            try:
+                facts = mod.detect() or {}
+            except Exception:
+                facts = {}
+        if not cores and facts.get("cores"):
+            cores = int(facts["cores"])
+            src.append(f"hw_profile.detect()←{facts.get('src_cores', '?')}")
+        if not mem and facts.get("mem_mb"):
+            mem = int(facts["mem_mb"])
+            src.append(f"hw_profile.detect()←{facts.get('src_mem', '?')}")
+    if not cores:
+        # 最后兜底：线程族也是"这台机器能用几个核"的另一份结论，直接沿用
+        for name in ("HW_THREADS", "TORCH_NUM_THREADS", "OMP_NUM_THREADS"):
+            cores = _probe_positive_int(name)
+            if cores:
+                src.append(f"回退 {name}={cores}")
+                break
+    facts_out = (max(1, int(cores)) if cores else 4, mem if mem else None, " + ".join(src) or "探测失败→安全回退(4 核/内存按紧张)")
+    _HW_PROBE["facts"] = facts_out
+    return facts_out
+
+
+def hw_cores():
+    """离线负载可用核数（**不封顶**）。"""
+    return _hw_facts()[0]
+
+
+def hw_mem_mb():
+    """可用内存（MB）；未知返回 None（调用方按"内存紧张"处理，与 hw_profile 同一回退）。"""
+    return _hw_facts()[1]
+
+
+def hw_report():
+    """审计行：为什么是 N 路（与 hw_profile 的 [hw] 行同一意图，日志里要能一眼归因）。"""
+    cores, mem, src = _hw_facts()
+    return f"cores={cores} mem={str(mem) + 'MB' if mem else '未知(按内存紧张回退)'} 来源={src}"
+
+
+# 单路离线 worker 的常驻内存量级（解释器 + 库 + 一份工作集）；内存未知 → 只开 1 路（与
+# hw_profile.sh「内存未知按紧张处理」同一回退）。核数封顶、内存封底，两个都是机器事实。
+_OFFLINE_WORKER_MEM_MB = 768
+# 每一路写批在内存里驻留的点批（WRITE_BATCH 条稠密向量 + 序列化副本）量级
+_WRITE_WORKER_MEM_MB = 512
+
+
+def offline_workers(mem_mb=None, unit_mb=_OFFLINE_WORKER_MEM_MB):
+    """离线池并行度 = min(核数, 可用内存 / 单路常驻)。"""
+    mem = hw_mem_mb() if mem_mb is None else mem_mb
+    by_mem = max(1, mem // unit_mb) if mem else 1
+    return max(1, min(hw_cores(), by_mem))
+
+
+def embed_batch_size(device, mem_mb=None):
+    """嵌入批大小：**按设备与可用内存派生**（显式 RAG_EMBED_BATCH_SIZE 时不调用本函数）。
+
+    实测梯度（真语料；MPS = 本机 M2/8G/2048 块，CPU = 2 线程模拟 2vCPU 容器/128 块）：
+
+      MPS fp16 : bs   8    16    32    64    128
+                 块/秒 13.0  12.9  11.8  12.2  10.9
+                 峰值MB 2067  2067  2067  3091  3093
+      CPU fp32 : bs   8    16    32    64    128
+                 块/秒  4.7   4.7   5.2   5.0   3.0
+                 峰值MB 2174  2118  2245  2594  2100
+
+    结论：**两边都不是越大越好**。MPS 上 16 与 8 并列最快、比 64 快 6% 且少占 1GB 显存；
+    CPU 上 32 最快（每批的 python/padding 开销摊薄），而 128 在 8G 机器上因内存压力塌到
+    3.0 块/秒（fp32 激活随批线性涨）。故取各设备**实测最优点**，再按"内存不足退一档"收口。
+    """
+    mem = hw_mem_mb() if mem_mb is None else mem_mb
+    if device == "mps":
+        batch = 16
+    elif device == "cuda":
+        # 本机无 CUDA 设备可实测：按**显存**派生（fp16 权重 ~1.2GB、每样本激活 ~40MB 量级，
+        # 取显存 1/8 作批预算），显存读不到退回 64；仍可被 RAG_EMBED_BATCH_SIZE 覆盖。
+        try:
+            import torch
+            vram_mb = int(torch.cuda.get_device_properties(0).total_memory) // 1048576
+        except Exception:
+            vram_mb = 0
+        batch = max(8, min(128, (vram_mb // 8) // 40)) if vram_mb else 64
+    else:
+        batch = 32
+    if mem is not None and mem < 4096:
+        batch = max(8, batch // 2)
+    return batch
+
+
+# ── Qdrant 写批并发度：Little 定律 + 实测平台，不照抄核数 ──
+# 并发 = 目标吞吐 × 单批往返时延（RTT），两个数都是**实测**的（本机 Qdrant，21255 点 /
+# 22 批 × 1000 点，稠密 1024 维 + 稀疏 Document，与 index 写入路径同一套 points）：
+#   1 路：写批墙钟 37.0 / 42.1s（505~574 点/秒），单批 = 构造 0.10s + 往返 1.57s
+#   4 路：17.1 / 27.5 / 32.3s（658~1246 点/秒）
+#   8 路：21.4 / 21.6 / 29.1s（730~982 点/秒）      ← 平台
+#  12 路：21.5s（988 点/秒）                        ← 不再涨
+# 故 Little 下限（1000 点/秒 × 1.5s ÷ 1000 点/批 = 1.5 → 2 路）只是"把往返等待藏住"的
+# 下限；曲线要到 4~8 路才平，因为**客户端构造 points（emb.tolist + JSON）在 GIL 下也会
+# 排队**，需要额外线程互相搭桥。取 max(4, 2×Little) 为平台起点，再用核数/内存/批数收口。
+QDRANT_BATCH_RTT_S = 1.5        # 1 路并发时单批（1000 点）实测墙钟（秒）——原 1.0 是猜的
+QDRANT_TARGET_PPS = 1000        # 实测平台吞吐（点/秒）
+
+
+def qdrant_write_workers(batch_count, mem_mb=None):
+    """Qdrant 写批/页并发度：Little 下限 × GIL 搭桥系数，再按核数、内存、批数收口。"""
+    mem = hw_mem_mb() if mem_mb is None else mem_mb
+    by_little = (QDRANT_TARGET_PPS * QDRANT_BATCH_RTT_S + WRITE_BATCH - 1) // WRITE_BATCH
+    by_mem = max(1, mem // _WRITE_WORKER_MEM_MB) if mem else 1
+    return max(1, min(hw_cores(), by_mem, max(1, batch_count), max(4, by_little * 2)))
+
+
+def embed_batch_note(device):
+    """批大小的来源（日志要能一眼看出"值 + 依据"，不是新的黑盒）。"""
+    if EMBED_BATCH_SIZE:
+        return f"显式 RAG_EMBED_BATCH_SIZE={EMBED_BATCH_SIZE}"
+    return f"派生 device={device} {hw_report()}"
 
 
 class _StdoutHandler(logging.StreamHandler):
@@ -547,6 +721,29 @@ if SOURCE_FIELD in _RESERVED_SOURCE_FIELDS:
     )
 TOP_K = env_int_min("RAG_TOP_K", 5, 1)
 RERANK_TOP_K = env_int_min("RAG_RERANK_TOP_K", 20, 1)
+# 重排候选池的**延迟预算**（毫秒）：用户对"重排这一步"愿意等多久 —— 这是用户意图，故是配置项。
+# 候选池 = clamp(预算 ÷ 单候选实测耗时, 1, RERANK_TOP_K)：慢机器少排但保住延迟，快机器排满。
+# 实测（bge-reranker-v2-m3，候选=child 文本 ≈100 token，与线上 RERANK_ON=child 同口径）：
+#   MPS fp16 41.9 ms/候选（20 条 ≈ 0.84s）；CPU 2 线程 fp32 872 ms/候选（20 条 ≈ 17s！）
+# 默认 8000ms：本机 MPS 算出 190 → 封顶到配置的 20（**本机行为一字不变**）；
+# 2vCPU 容器算出 9 —— 既够 top_k=5 用，又把最坏 17s 压到 8s。
+RERANK_BUDGET_MS = env_int_min("RAG_RERANK_BUDGET_MS", 8000, 1)
+_RERANK_MS_PER_CAND = {"mps": 41.9, "cuda": 15.0, "cpu": 872.4}
+
+
+def rerank_pool_size(pool_max=None):
+    """重排候选池 = clamp(预算 ÷ 单候选实测耗时, 1, 上限)，返回 (池大小, 依据串)。
+
+    **只减不增**：配置的 RAG_RERANK_TOP_K 是质量上限，也是本机（快机器）的取值；
+    派生只在机器带不动时向下收 —— 于是"快机器"与"配置值"两条口径在本机完全一致。
+    """
+    top = RERANK_TOP_K if pool_max is None else int(pool_max)
+    if RERANK_BACKEND != "torch":
+        return top, f"http 重排后端：服务端算力不可知，不按预算截断（HTTP 超时兜底），池={top}"
+    device = get_device()
+    per = _RERANK_MS_PER_CAND.get(device, _RERANK_MS_PER_CAND["cpu"])
+    pool = max(1, min(top, int(RERANK_BUDGET_MS // per) or 1))
+    return pool, f"预算 {RERANK_BUDGET_MS}ms ÷ 实测单候选 {per}ms（device={device}）"
 RERANK_BATCH = env_int_min("RAG_RERANK_BATCH", 32, 1)  # padding 隔离下分数与批大小无关；候选<=20 单批一次过
 RERANK_MAX_LENGTH = env_int_min("RAG_RERANK_MAX_LENGTH", 384, 1)
 RERANK_ON = env_choice("RAG_RERANK_ON", "child", ("child", "parent"))
@@ -623,7 +820,11 @@ if CHUNK_OVERLAP >= CHILD_MAX_TOKENS:
         f"RAG_CHUNK_OVERLAP={CHUNK_OVERLAP} 必须小于 RAG_CHILD_MAX_TOKENS={CHILD_MAX_TOKENS}："
         f"子块切分要求 overlap < capacity，否则每篇文档都在 splitter 里抛 ValueError（process 全量失败）"
     )
-EMBED_BATCH_SIZE = env_int_min("RAG_EMBED_BATCH_SIZE", 64, 1)
+# 嵌入批大小：**显式值优先**（>0）；未设/留空 = 按设备与可用内存派生（embed_batch_size()，
+# 规则来自实测梯度，见该函数文档）。旧写法默认 64 —— 那是一个与设备、内存都无关的常数：
+# MPS 上 64 比 16 慢 6% 且多占 1GB，CPU 上 128 会因内存压力从 5.2 掉到 3.0 块/秒。
+_BATCH_RAW = (os.getenv("RAG_EMBED_BATCH_SIZE") or "").strip()
+EMBED_BATCH_SIZE = env_int_min("RAG_EMBED_BATCH_SIZE", 1, 1) if _BATCH_RAW else 0
 # （已删除）SEMANTIC_EMBED_DEVICE：组件化后不再有"分块期嵌入设备"这一路，全仓无引用；
 # 索引/检索的设备选型仍由 INDEX_DEVICE（空=自动，见 get_device）与各后端决定。
 INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
@@ -635,6 +836,9 @@ QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("RAG_QDRANT_API_KEY")
 # Qdrant 客户端超时（秒）：普通查询走它，批量重建（sparse）在调用点给 2 倍。
 # 0 之前由各调用点各自写死 60/30/120 —— 有的默认、有的没设，故障表现既不透明也不一致。
 QDRANT_TIMEOUT = env_int_min("RAG_QDRANT_TIMEOUT", 60, 1)
+# Qdrant 写批并发度（index）：0/未设 = 派生（见 qdrant_write_workers，规则来自实测 RTT +
+# Little 定律）；显式值只用来压测/限流，正常路径不该填。sparse 的页并发共用同一个派生。
+INDEX_WRITE_WORKERS = env_int_min("RAG_INDEX_WRITE_WORKERS", 0, 0)
 COLLECTION_BASE = os.getenv("RAG_COLLECTION_BASE", "rag_documents_v1")
 COLLECTION_NAME = COLLECTION_BASE
 COLLECTION_ALIAS = os.getenv("RAG_COLLECTION_ALIAS", "rag_current")
@@ -1269,6 +1473,88 @@ def _gc_doc_chunks(keep_names):
 
 
 # ── 分块产物与门禁 ──
+# 分块并行：**按文档分发、按原顺序收集**。每篇文档互相独立（读自己的文件、切自己的文本、
+# 写自己的 artifacts/docs/<name>.json 缓存），串行的唯一理由只是历史上只有一条 for 循环。
+# 主进程只做三件事：分发、按下标归位、按原顺序汇总 —— 故产物与串行逐字节相同。
+_CHUNK_WORKER: dict = {}
+_ORIGINAL_LOG = log  # 分块期 log 会被临时接管，这里留一份原件（接管函数用它兜底）
+
+
+def _chunk_capture_log(*parts):
+    """分块期的 log 落进缓冲区。worker 直接往 stdout/rag.log 写会让并行日志交错、顺序与
+    串行不一致；统一回主进程按文档顺序打印（顺序、内容与串行逐行相同）。"""
+    sink = _CHUNK_WORKER.get("messages")
+    if sink is None:
+        _ORIGINAL_LOG(*parts)
+    else:
+        sink.append(" ".join(str(part) for part in parts))
+
+
+def _chunk_worker_tokenizer():
+    """worker 进程内的 tokenizer 单例（懒加载）：全部命中缓存时一个 token 都不用分。"""
+    tok = _CHUNK_WORKER.get("tokenizer")
+    if tok is None:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
+        _CHUNK_WORKER["tokenizer"] = tok
+    return tok
+
+
+def _chunk_one_document(job):
+    """单文档分块（串行/并行共用**同一份实现**）：命中缓存即返回缓存块，缺失才分块并
+    **自己写自己那份缓存**（各自写各自的文件，主进程只汇总）。
+
+    返回 (文档下标, 块列表或 None, 是否命中缓存, 错误串或 None, 日志行列表)。
+    """
+    global log
+    i, filepath, source_name, sha, fingerprint, total = job
+    messages: list = []
+    prev_log = log
+    log = _chunk_capture_log
+    _CHUNK_WORKER["messages"] = messages
+    try:
+        cached = _load_doc_chunks(source_name, sha, fingerprint)
+        if cached is not None:
+            messages.append(f"[{i + 1}/{total}] 复用未变文档: {source_name}（{len(cached)} 块）")
+            return i, cached, True, None, messages
+        messages.append(f"[{i + 1}/{total}] 处理: {source_name} ...")
+        text = read_document_text(filepath)
+        pairs = []
+        for child_text, parent_text in _hierarchical_split(text, _chunk_worker_tokenizer()):
+            pairs.append((child_text, parent_text))
+        kept = [(c, p) for c, p in pairs if c.strip()]
+        dropped = len(pairs) - len(kept)
+        if dropped:
+            messages.append(f"    ⚠️  丢弃 {dropped} 个纯空白块（不含任何文字）")
+        if not kept:
+            # 空文档（0 字节/纯空白）是**合法边界**，不是本轮失败：按 0 块正常结算并留痕。
+            # 旧写法在此 raise -> failures 短路 -> 整轮拒绝写 chunks.json：一篇空文件就能让
+            # 其余文档的增改全都不入库，且 process 永远退出 1（卡死式静默）。
+            messages.append(f"    ⚠️  文档 {source_name} 分块后无有效内容（0 块）：按空文档结算，不影响其余文档")
+            _save_doc_chunks(source_name, sha, fingerprint, [])
+            return i, [], False, None, messages
+        # pairs 是整篇的 (child, parent) 文本对，kept 是它的子集 —— 两者并存就是
+        # 这篇文档的文本在峰值里翻倍。kept 起不再需要 pairs。
+        del pairs
+        parent_ids: dict = {}
+        for _, parent_text in kept:
+            if parent_text not in parent_ids:
+                parent_ids[parent_text] = f"{source_name}_p{len(parent_ids)}"
+        doc_chunks = []
+        for chunk_idx, (child_text, parent_text) in enumerate(kept):
+            chunk_dict = { "child_text": child_text, "parent_text": parent_text, "chunk_index": chunk_idx, "total_chunks": len(kept), "parent_id": parent_ids[parent_text], "parent_chunk_count": 0, "contextual_text": child_text, "id": f"{source_name}_{chunk_idx}", }
+            chunk_dict[SOURCE_FIELD] = source_name
+            doc_chunks.append(chunk_dict)
+        _save_doc_chunks(source_name, sha, fingerprint, doc_chunks)
+        return i, doc_chunks, False, None, messages
+    except Exception as exc:
+        # 逐文档兜底：单篇坏数据/异常不再拖垮整个 process（与串行逐句一致）
+        return i, None, False, f"{type(exc).__name__}: {exc}", messages
+    finally:
+        _CHUNK_WORKER["messages"] = None
+        log = prev_log
+
+
 def build_chunks():
     # 上次 process 中断留下的半截 tmp（原子写靠 os.replace 收尾）：进到这里说明本轮
     # 没有别的 writer 在跑（process 单进程串行），直接清掉，不让孤儿 tmp 永久占盘。
@@ -1277,8 +1563,9 @@ def build_chunks():
             os.remove(_stale_tmp)
         except OSError:
             pass
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
+    # tokenizer 不在这里预加载：分块 worker（串行路径也用同一个函数）按需在自己的进程里
+    # 加载一次；全部命中缓存时一个 token 都不用分（旧写法无条件加载，warm 路径白花几秒）。
+    t_start = time.time()
     paths = _document_paths()
     config_fp, config_snapshot = _chunking_config_fingerprint()
     sources_now = _sources_fingerprint(paths)
@@ -1298,52 +1585,68 @@ def build_chunks():
     all_chunks = []
     reused = 0
     failures: list = []
-    for i, filepath in enumerate(paths):
-        source_name = name_of[filepath]
-        # 逐文档兜底：单篇坏数据/异常不再拖垮整个 process。失败的只跳过自己、
-        # 其余照算；末尾因 failures 短路返回，不覆盖 chunks.json —— 残缺产物一旦
-        # 入库，索引就会静默少文档。语料/指纹变化仍会让 stages A 报 stale，不会假新鲜。
+    total = len(paths)
+    # 逐文档兜底语义不变：单篇坏数据/异常只跳过自己，末尾因 failures 短路返回、不覆盖
+    # chunks.json —— 残缺产物一旦入库，索引就会静默少文档。
+    jobs = [
+        (i, filepath, name_of[filepath], sources_now[os.path.relpath(filepath, DATA_DIR)], fingerprint, total)
+        for i, filepath in enumerate(paths)
+    ]
+    workers = min(total, offline_workers()) if total else 1
+    log(f"分块并行度: {workers} 路（{hw_report()}）；按文档分发、按原顺序收集，产物与串行逐字节一致")
+    done: list = [None] * total
+    cursor = 0
+
+    def _absorb_ready():
+        """把已完成的**前缀**按原顺序并入产物：日志顺序、all_chunks 顺序都与串行完全一致
+        （并行只改变"谁先算完"，不改变"按什么顺序汇总"）。"""
+        nonlocal cursor, reused
+        while cursor < total and done[cursor] is not None:
+            idx, chunks, was_reused, err, messages = done[cursor]
+            for line in messages:
+                log(line)
+            source_name = jobs[idx][2]
+            if err is not None:
+                log(f"[{idx + 1}/{total}] ❌ {source_name} 分块失败，继续下一篇: {err}")
+                failures.append((source_name, err))
+            else:
+                all_chunks.extend(chunks)
+                if was_reused:
+                    reused += 1
+            done[cursor] = None  # 已汇总：立刻放掉这条结果（块本身已并入 all_chunks）
+            cursor += 1
+
+    if workers > 1:
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
         try:
-            sha = sources_now[os.path.relpath(filepath, DATA_DIR)]
-            cached = _load_doc_chunks(source_name, sha, fingerprint)
-            if cached is not None:
-                all_chunks.extend(cached)
-                reused += 1
-                log(f"[{i + 1}/{len(paths)}] 复用未变文档: {source_name}（{len(cached)} 块）")
-                continue
-            log(f"[{i + 1}/{len(paths)}] 处理: {source_name} ...")
-            text = read_document_text(filepath)
-            pairs = []
-            for child_text, parent_text in _hierarchical_split(text, tokenizer):
-                pairs.append((child_text, parent_text))
-            kept = [(c, p) for c, p in pairs if c.strip()]
-            dropped = len(pairs) - len(kept)
-            if dropped:
-                log(f"    ⚠️  丢弃 {dropped} 个纯空白块（不含任何文字）")
-            if not kept:
-                # 空文档（0 字节/纯空白）是**合法边界**，不是本轮失败：按 0 块正常结算并留痕。
-                # 旧写法在此 raise -> failures 短路 -> 整轮拒绝写 chunks.json：一篇空文件就能让
-                # 其余文档的增改全都不入库，且 process 永远退出 1（卡死式静默）。
-                log(f"    ⚠️  文档 {source_name} 分块后无有效内容（0 块）：按空文档结算，不影响其余文档")
-                _save_doc_chunks(source_name, sha, fingerprint, [])
-                continue
-            # pairs 是整篇的 (child, parent) 文本对，kept 是它的子集 —— 两者并存就是
-            # 这篇文档的文本在峰值里翻倍。kept 起不再需要 pairs。
-            del pairs
-            parent_ids: dict = {}
-            for _, parent_text in kept:
-                if parent_text not in parent_ids:
-                    parent_ids[parent_text] = f"{source_name}_p{len(parent_ids)}"
-            doc_chunks = []
-            for chunk_idx, (child_text, parent_text) in enumerate(kept):
-                chunk_dict = { "child_text": child_text, "parent_text": parent_text, "chunk_index": chunk_idx, "total_chunks": len(kept), "parent_id": parent_ids[parent_text], "parent_chunk_count": 0, "contextual_text": child_text, "id": f"{source_name}_{chunk_idx}", }
-                chunk_dict[SOURCE_FIELD] = source_name
-                doc_chunks.append(chunk_dict)
-            _save_doc_chunks(source_name, sha, fingerprint, doc_chunks)
-            all_chunks.extend(doc_chunks)
+            pool = ProcessPoolExecutor(max_workers=workers)
         except Exception as exc:
-            log(f"[{i + 1}/{len(paths)}] ❌ {source_name} 分块失败，继续下一篇: {type(exc).__name__}: {exc}")
-            failures.append((source_name, f"{type(exc).__name__}: {exc}"))
+            log(f"    ⚠️  无法创建分块进程池（{type(exc).__name__}: {exc}），回退串行分块")
+            workers = 1
+    if workers > 1:
+        # 窗口化提交（在飞 ≤ 2×并行度）：结果不必全量驻留，Ctrl-C 也只需等在飞的那几篇，
+        # 不会把 997 篇一次性提交后再空等收尾。
+        with pool:
+            pending: dict = {}
+            next_job = 0
+            while next_job < total or pending:
+                while next_job < total and len(pending) < workers * 2:
+                    job = jobs[next_job]
+                    next_job += 1
+                    pending[pool.submit(_chunk_one_document, job)] = job[0]
+                finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+                for fut in finished:
+                    idx = pending.pop(fut)
+                    try:
+                        done[idx] = fut.result()
+                    except Exception as exc:
+                        # worker 崩溃/结果不可 pickle：按单篇失败结算，其余文档照算
+                        done[idx] = (idx, None, False, f"{type(exc).__name__}: {exc}", [])
+                    _absorb_ready()
+    else:
+        for job in jobs:
+            done[job[0]] = _chunk_one_document(job)
+            _absorb_ready()
     _gc_doc_chunks(names_now)
     if reused:
         log(f"增量：复用 {reused}/{len(paths)} 个未变文档，只重算了 {len(paths) - reused} 个")
@@ -1353,6 +1656,7 @@ def build_chunks():
         for fail_name, fail_err in failures:
             log(f"   - {fail_name}: {fail_err}")
         log("chunks.json 与 meta 保持上一版（残缺产物不入库），失败文档未写缓存；修复后重跑 process 即可增量续算。")
+        log(f"process 墙钟: {time.time() - t_start:.1f}s（复用 {reused}/{total}，失败 {len(failures)}；未写产物）")
         return 1
     if all_chunks and set(all_chunks[0]) != _RECORD_FIELDS:
         raise RuntimeError(f"分块记录字段与 _PAYLOAD_SPEC 不一致：多 {sorted(set(all_chunks[0]) - _RECORD_FIELDS)}、少 {sorted(_RECORD_FIELDS - set(all_chunks[0]))}，必须同步")
@@ -1379,6 +1683,11 @@ def build_chunks():
     log(f"  总计: {len(all_chunks)} 条，父块 {len(parent_counts)} 个")
     log(f"已保存: {CHUNKS_JSON}")
     log(f"元信息: {CHUNKS_META_JSON}（指纹 {fingerprint}）")
+    # 缓存命中 / 耗时可视化：一眼看出"这轮到底做了多少活、花了多久、卡在哪一段"。
+    log(
+        f"process 墙钟: {time.time() - t_start:.1f}s"
+        f"（复用 {reused}/{total} 篇，重算 {total - reused} 篇，并行 {workers} 路；{hw_report()}）"
+    )
     return 0
 
 
@@ -2027,16 +2336,20 @@ def build_index():
                 log(f"    ⚠️  {device.upper()} 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
                 tokenizer, model, use_gpu = None, None, False
         if use_gpu:
-            batch_size = EMBED_BATCH_SIZE
+            batch_size = EMBED_BATCH_SIZE or embed_batch_size(device)
             precision = "fp16"
-            log(f"Embedding 设备: {device} (fp16, batch_size={batch_size})")
+            log(f"Embedding 设备: {device} (fp16, batch_size={batch_size}；{embed_batch_note(device)})")
         else:
             import torch
             tokenizer, model, device = load_embedding_model(device="cpu")
-            torch.set_num_threads(6)
-            batch_size = EMBED_BATCH_SIZE
+            # 线程数 = **真实核数**（HW_CORES 优先，缺失才自探测，见 hw_cores）：旧写法在这里
+            # 写死 6 —— 8 核机器白丢 2 个核、16 核机器白丢 10 个，而且日志里的"6线程"还会
+            # 把"为什么是 6"包装成一个像是刻意的选择。
+            _threads = hw_cores()
+            torch.set_num_threads(_threads)
+            batch_size = EMBED_BATCH_SIZE or embed_batch_size(device)
             precision = "fp32"
-            log(f"Embedding 设备: cpu (6线程, batch_size={batch_size})")
+            log(f"Embedding 设备: cpu ({_threads} 线程, batch_size={batch_size}；{embed_batch_note(device)})")
         cache_path = _embed_cache_file(precision)
         expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
         if expected_dim is None:
@@ -2132,18 +2445,24 @@ def build_index():
             _worker_state.client = c
         return c
 
+    _write_times: list = []   # 每批的 (构造, 往返) 秒数：并发度就是按这两个数派生的（见下）
+
     def _write_batch(i):
         # 批次内任何异常（点构造 / 稀疏 Document 拆包 / MemoryError / KeyboardInterrupt…）
         # 都必须转成错误串交回调用方：从 fut.result() 抛出会**跳过整段 write_failures 收尾**
         # （不删孤儿集合、不报"谁在服务"、连集合名都不留 —— 失效原型：自崩）。
         try:
+            _t_construct = time.perf_counter()
             batch_chunks = all_chunks[i:i + WRITE_BATCH]
             batch_embeddings = embeddings[i:i + WRITE_BATCH]
             points = []
             for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
                 # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
                 points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))  # type: ignore[union-attr]
-            return i, _upsert_batch_with_retry(_worker_client(), target_collection, points)
+            _t_http = time.perf_counter()
+            _err = _upsert_batch_with_retry(_worker_client(), target_collection, points)
+            _write_times.append((_t_http - _t_construct, time.perf_counter() - _t_http))
+            return i, _err
         except BaseException as exc:  # noqa: BLE001 - 见上：必须转成错误串，不能越过收尾
             return i, f"{type(exc).__name__}: {exc}"
 
@@ -2154,9 +2473,13 @@ def build_index():
     # 旧修法用一把模块锁把整次 upsert（含 HTTP 往返）串行化 —— 4 路写批于是退化成 1 路，
     # 与"并发发往 Qdrant"这句注释相反。分开客户端后每份推理器只被自己的线程使用，
     # 本地推理天然串行，HTTP 往返真正并发。
-    # 并发度封顶 4，控制"同时驻留的 points（每批最多 1000 条稠密向量）"的峰值内存。
-    max_workers = max(1, min(4, len(batch_starts)))
+    max_workers = INDEX_WRITE_WORKERS or qdrant_write_workers(len(batch_starts))
+    log(
+        f"  Qdrant 写批并发: {max_workers} 路（{len(batch_starts)} 批 × {WRITE_BATCH} 点；"
+        f"Little: 目标 {QDRANT_TARGET_PPS} 点/秒 × 实测单批 {QDRANT_BATCH_RTT_S}s ÷ {WRITE_BATCH} 点/批；{hw_report()}）"
+    )
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    _write_t0 = time.time()
     done_points = 0
     completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -2170,6 +2493,15 @@ def build_index():
                 log(f"    ⚠️  写入批次 [{i}, {min(i + WRITE_BATCH, total)}) 失败，其余批继续: {err}")
             if completed % 5 == 0 or completed == len(batch_starts):
                 log(f"  Qdrant 写入进度: {min(done_points, total)}/{total}")
+    _write_wall = time.time() - _write_t0
+    if done_points:
+        log(f"  写批墙钟: {_write_wall:.1f}s / {done_points} 点（{done_points / max(_write_wall, 1e-9):.0f} 点/秒，{max_workers} 路并发）")
+    if _write_times:
+        # 分解：构造 = 纯 Python（emb.tolist + PointStruct + 服务端 Document 包装），往返 = HTTP。
+        # 两者之比正是"要几路并发"的依据 —— 构造被 GIL 串行，只有往返能真正重叠。
+        _c_avg = sum(c for c, _h in _write_times) / len(_write_times)
+        _h_avg = sum(h for _c2, h in _write_times) / len(_write_times)
+        log(f"  写批分解: 单批构造 {_c_avg:.2f}s + 往返 {_h_avg:.2f}s（并发 {max_workers} 路）")
     write_failures.sort()
     if write_failures:
         # 半截集合是本次失败留下的孤儿：别名没切、检索不读它，而下一次 index 会用新的
@@ -3182,7 +3514,11 @@ class RAGEngine:
         if steps is not None:
             steps[STEP_RECALL] = [ {"channel": ch, "rank": r, "point_id": pid} for ch, pids, _w in rankings for r, pid in enumerate(pids, 1) ]
         n_channels = max(1, len(rankings))
-        fuse_limit = RERANK_TOP_K * n_channels if DEDUP_BY_PARENT else RERANK_TOP_K
+        # 候选池先按"延迟预算 ÷ 实测单候选耗时"收口，再进 RRF 融合与重排：慢机器少排但保住延迟。
+        _pool, _pool_note = rerank_pool_size()
+        if _pool < RERANK_TOP_K:
+            log(f"  重排候选池: {_pool}/{RERANK_TOP_K}（{_pool_note}）")
+        fuse_limit = _pool * n_channels if DEDUP_BY_PARENT else _pool
         fused = weighted_rrf(rankings, k=RRF_K, limit=fuse_limit)
         chunks = self._fetch_chunks([point_id for point_id, _score, _res in fused], collection) if fused else {}
         if steps is not None:
@@ -3209,15 +3545,15 @@ class RAGEngine:
         # 候选池上限的截断与父块折叠分开计数：旧写法把两者合成一个 folded，被池上限
         # 吃掉的候选既不在 kept 也不在 folded，诊断上无法区分"折叠"与"截断"。
         pool_trimmed = 0
-        if len(candidates) > RERANK_TOP_K:
-            pool_trimmed = len(candidates) - RERANK_TOP_K
-            candidates = candidates[:RERANK_TOP_K]
+        if len(candidates) > _pool:
+            pool_trimmed = len(candidates) - _pool
+            candidates = candidates[:_pool]
         if steps is not None:
             steps[STEP_DEDUP] = { "enabled": DEDUP_BY_PARENT, "去重前候选": pre_dedup, "kept": len(candidates), "folded": len(folded) if DEDUP_BY_PARENT else 0, "folded_ids": [c["id"] for c in folded], "被候选池上限截断": pool_trimmed, "说明": (TRACE_NOTES["去重"] if DEDUP_BY_PARENT else "RAG_DEDUP_BY_PARENT=0：未做父块去重，同父兄弟子块会原样进入重排"), }
         if not candidates:
             return _empty_search_result(steps)
-        if top_k > RERANK_TOP_K:
-            log(f"⚠️  top_k={top_k} 超过候选池上限 {RERANK_TOP_K}，最多返回 {RERANK_TOP_K} 条（可调大 RAG_RERANK_TOP_K）")
+        if top_k > _pool:
+            log(f"⚠️  top_k={top_k} 超过候选池上限 {_pool}，最多返回 {_pool} 条（可调大 RAG_RERANK_TOP_K 或 RAG_RERANK_BUDGET_MS）")
         cand_texts = [rerank_text_for(c) for c in candidates]
         rr_k = min(top_k, len(candidates))
         if RERANK_BACKEND == "http":
@@ -3845,36 +4181,75 @@ def cmd_sparse(args=None):
     lexicon_id = lexicon_fingerprint(client)
     offset = None
     scroll_failures = 0
-    while True:
+    # 页更新与 scroll **互不依赖**：页内 id 互不相交，set_payload 写的是同一个 lexicon_id，
+    # 故主线程串行推进 scroll 游标（游标链本身必须串行），页更新交给线程池并发发 ——
+    # 墙钟从"每页 (scroll + update) 之和"压到"max(scroll, update) + 余量"。
+    # 每线程一个 client：带 Document 的请求走客户端私有的 ModelEmbedder，共用会互相 drain。
+    workers = INDEX_WRITE_WORKERS or qdrant_write_workers(-(-total // WRITE_BATCH))
+    log(f"  稀疏页并发: {workers} 路（每页 {WRITE_BATCH} 点；{hw_report()}）")
+    _sparse_worker_state = threading.local()
+
+    def _sparse_worker_client():
+        c = getattr(_sparse_worker_state, "client", None)
+        if c is None:
+            c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
+            _sparse_worker_state.client = c
+        return c
+
+    def _update_page(pts):
         try:
-            pts, offset = client.scroll( COLL, limit=WRITE_BATCH, offset=offset, with_payload=True, with_vectors=False, timeout=QDRANT_TIMEOUT )
-        except Exception as exc:
-            # scroll 失败推进不了页 → 同一页重试，只重试一次；连败 2 次即熔断。
-            scroll_failures += 1
-            if scroll_failures >= 2:
-                log(f"❌ scroll 连续失败 {scroll_failures} 次（{type(exc).__name__}: {exc}），无法推进，中止")
-                return 1
-            log(f"  ⚠️  scroll 失败（{scroll_failures}/2），重试同一页: {type(exc).__name__}: {exc}")
-            continue
-        scroll_failures = 0
-        if not pts:
-            break
-        ids = [p.id for p in pts]
-        try:
+            ids = [p.id for p in pts]
             # 与 build_index 同一份文本（_index_text），否则重算的稀疏向量与稠密侧错配
             points = [ models.PointVectors( id=p.id, vector={SPARSE_VECTOR_NAME: sparse_encode(_index_text(p.payload or {}))}, ) for p in pts ]
-            client.update_vectors(COLL, points=points)
-            client.set_payload(collection_name=COLL, payload={LEXICON_ID_FIELD: lexicon_id}, points=ids)
+            wc = _sparse_worker_client()
+            wc.update_vectors(COLL, points=points)
+            wc.set_payload(collection_name=COLL, payload={LEXICON_ID_FIELD: lexicon_id}, points=ids)
+            return len(pts), None
         except Exception as exc:
             # 单页失败跳页继续，末尾 done != total 照样返回 1（继续但不静默）。
-            log(f"  ⚠️  批量更新失败，跳过本页 {len(pts)} 条: {type(exc).__name__}: {exc}")
-            if offset is None:
+            return 0, f"{type(exc).__name__}: {exc}"
+
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    abort = False
+    eof = False
+    in_flight: dict = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while (not (eof or abort)) or in_flight:
+            # 窗口化：在飞页 ≤ 2×并发度（既不饿死 worker，也不把 21255 条 payload 全摊在内存里）
+            while (not eof) and (not abort) and len(in_flight) < workers * 2:
+                try:
+                    pts, offset = client.scroll( COLL, limit=WRITE_BATCH, offset=offset, with_payload=True, with_vectors=False, timeout=QDRANT_TIMEOUT )
+                except Exception as exc:
+                    # scroll 失败推进不了页 → 同一页重试，只重试一次；连败 2 次即熔断。
+                    scroll_failures += 1
+                    if scroll_failures >= 2:
+                        log(f"❌ scroll 连续失败 {scroll_failures} 次（{type(exc).__name__}: {exc}），无法推进，中止")
+                        abort = True
+                    else:
+                        log(f"  ⚠️  scroll 失败（{scroll_failures}/2），重试同一页: {type(exc).__name__}: {exc}")
+                    continue
+                scroll_failures = 0
+                if not pts:
+                    eof = True
+                    break
+                in_flight[pool.submit(_update_page, pts)] = len(pts)
+                if offset is None:
+                    # 游标走完 = EOF。**必须在这里判**：qdrant 的 scroll 在 offset=None 时是
+                    # "从头再来"，只看"空页"会绕回集合开头无限重扫（实测 done 涨到 130 万）。
+                    eof = True
+            if not in_flight:
                 break
-            continue
-        done += len(pts)
-        log(f"  {done}/{total}  ({time.time() - t0:.1f}s)")
-        if offset is None:
-            break
+            finished, _unfinished = wait(list(in_flight), return_when=FIRST_COMPLETED)
+            for fut in finished:
+                size = in_flight.pop(fut)
+                n_ok, err = fut.result()
+                if err:
+                    log(f"  ⚠️  批量更新失败，跳过本页 {size} 条: {err}")
+                else:
+                    done += n_ok
+                    log(f"  {done}/{total}  ({time.time() - t0:.1f}s)")
+    if abort:
+        return 1
     log(f"词表指纹已回写: {lexicon_id}（{done} 条）")
     if done != total:
         log(f"❌ 只更新了 {done}/{total} 条，请重跑")
