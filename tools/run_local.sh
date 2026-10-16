@@ -42,23 +42,30 @@ QDRANT_URL="http://127.0.0.1:6333"
 OLLAMA_URL="http://127.0.0.1:11434"
 APP_URL="http://127.0.0.1:${APP_PORT}"
 
-# .env 取值（进程环境优先，与 entrypoint 的规则一致）
-_env_val() {
-    local _k="$1" _v="${!1:-}"
-    if [ -n "${_v}" ]; then printf '%s' "${_v}"; return 0; fi
-    [ -f "${ROOT}/.env" ] || return 0
-    sed -n "s|^[[:space:]]*${_k}=||p" "${ROOT}/.env" | tail -n1 | tr -d '"'\'''
-}
+# ── .env → 进程环境：唯一实现在 tools/dotenv.sh（与 entrypoint.sh 共用同一份）────────
+# 旧写法在这里自带第三份解析器 _env_val：不认 export 前缀、不剥行内注释、同名键取**最后
+# 一次**出现、tr -d 还会把值里任意位置的引号删掉 —— 同一份 .env 在容器与本地读出不同结果
+# （失效原型：多份）。_env_val 已删除，改走 _load_dotenv；其语义（进程环境优先、同名重复
+# 以最后一次为准并与 python-dotenv 对齐、白名单前缀、MODELS_DIR 在列）逐条写在
+# tools/dotenv.sh 头注释里。触发场景：.env 里写 RAG_EMBED_MODEL_PATH="./models/x"、
+# MODEL="a b"、或同名键出现两次 —— 旧写法会把引号删掉/取错那次的值。
+# 位置很关键：_load_dotenv 只填**未设**的键（进程环境优先），故下面直接 ${VAR:-默认} 读，
+# 不再对每个变量各写一遍"进程环境优先"—— 那段重复逻辑本身就是下一个分叉点。
+if [ ! -f "${ROOT}/tools/dotenv.sh" ]; then
+    echo "[run_local] ❌ 缺少 ${ROOT}/tools/dotenv.sh（.env 解析的唯一实现）—— 退出" >&2
+    exit 1
+fi
+. "${ROOT}/tools/dotenv.sh"
+_load_dotenv
 
-EMBED_MODEL_PATH="${RAG_EMBED_MODEL_PATH:-$(_env_val RAG_EMBED_MODEL_PATH)}"
-RERANK_MODEL_PATH="${RAG_RERANK_MODEL_PATH:-$(_env_val RAG_RERANK_MODEL_PATH)}"
-EMBED_MODEL_NAME="${RAG_EMBED_MODEL_NAME:-$(_env_val RAG_EMBED_MODEL_NAME)}"
-RERANK_MODEL_NAME="${RAG_RERANK_MODEL_NAME:-$(_env_val RAG_RERANK_MODEL_NAME)}"
-EMBED_BACKEND="${RAG_EMBED_BACKEND:-$(_env_val RAG_EMBED_BACKEND)}"
-RERANK_BACKEND="${RAG_RERANK_BACKEND:-$(_env_val RAG_RERANK_BACKEND)}"
+EMBED_MODEL_PATH="${RAG_EMBED_MODEL_PATH:-}"
+RERANK_MODEL_PATH="${RAG_RERANK_MODEL_PATH:-}"
+EMBED_MODEL_NAME="${RAG_EMBED_MODEL_NAME:-}"
+RERANK_MODEL_NAME="${RAG_RERANK_MODEL_NAME:-}"
+EMBED_BACKEND="${RAG_EMBED_BACKEND:-}"
+RERANK_BACKEND="${RAG_RERANK_BACKEND:-}"
 # 端口单一来源：RAG_EMBED_URL（服务端 --port 由它派生，改一处即可）
-_embed_url="${RAG_EMBED_URL:-$(_env_val RAG_EMBED_URL)}"
-MODELS_PORT="$(printf '%s' "${_embed_url}" | sed -n 's|^[a-z]*://[^:/]*:\([0-9][0-9]*\).*|\1|p')"
+MODELS_PORT="$(printf '%s' "${RAG_EMBED_URL:-}" | sed -n 's|^[a-z]*://[^:/]*:\([0-9][0-9]*\).*|\1|p')"
 MODELS_PORT="${MODELS_PORT:-8001}"
 MODELS_URL="http://127.0.0.1:${MODELS_PORT}"
 
@@ -182,7 +189,7 @@ _start_models() {
     "${PY}" "${ROOT}/tools/prepare_infinity_view.py" "${_embed_dir}" "${_view_root}/$(basename "${_embed_dir}")" | sed 's/^/  /'
     # 重排还要对齐**截断长度**：应用侧按 RAG_RERANK_MAX_LENGTH（默认 384）截，infinity 默认按
     # tokenizer 的 model_max_length（bge-reranker-v2-m3 是 8192）—— 不对齐长候选的排序会变。
-    _rr_max="${RAG_RERANK_MAX_LENGTH:-$(_env_val RAG_RERANK_MAX_LENGTH)}"
+    _rr_max="${RAG_RERANK_MAX_LENGTH:-384}"
     "${PY}" "${ROOT}/tools/prepare_infinity_view.py" "${_rerank_dir}" "${_view_root}/$(basename "${_rerank_dir}")" --max-length "${_rr_max:-384}" | sed 's/^/  /'
     _embed_dir="${_view_root}/$(basename "${_embed_dir}")"
     _rerank_dir="${_view_root}/$(basename "${_rerank_dir}")"

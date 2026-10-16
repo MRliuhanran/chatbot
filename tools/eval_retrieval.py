@@ -68,7 +68,12 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "capture"
     path = sys.argv[2] if len(sys.argv) > 2 else "artifacts/eval/before.json"
     if mode == "capture":
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 裸文件名（如 before.json）时 dirname 是空串，而 os.makedirs("") 会抛
+        # FileNotFoundError —— 崩在"抓基线"这一步，而基线是后续 compare 的唯一锚点
+        # （失效原型：边界 + 自崩：越简单越常用的调用形态反而先炸）。只有确实带了目录才建。
+        _parent = os.path.dirname(path)
+        if _parent:
+            os.makedirs(_parent, exist_ok=True)
         r = _run(_sample())
         json.dump(r, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         _report("capture", r)
@@ -89,10 +94,26 @@ def main():
         print(f"由命中变未命中 {len(lost)} 条: {lost}")
         print(f"由未命中变命中 {len(gain)} 条: {gain}")
         print(f"已写入 {out_path}")
+        # 退出码是自动化闸门（评审 #3）：旧写法无论退化还是改善都 return 0 —— "检索变坏了"
+        # 只打在 stdout 里，CI / 发布闸门据此判成功（失效原型：静默退化被退出码洗白）。
+        # 判据（两条阈值，任一满足即退化，并逐条点名）：
+        #   ① lost 非空：原来能找回期望来源的查询现在找不回（逐条敏感，不靠均值）；
+        #   ② after 的来源命中率 < before 的（before 取基线文件里记录的生效值，不受本次重跑影响）。
+        _before_hit = float(before.get("source_hit_rate") or 0.0)
+        _after_hit = float(after.get("source_hit_rate") or 0.0)
+        _reasons = []
+        if lost:
+            _reasons.append(f"lost={len(lost)} 条（阈值：lost 必须为空）")
+        if _after_hit < _before_hit:
+            _reasons.append(f"来源命中率 {_before_hit:.0%} → {_after_hit:.0%}（阈值：不得低于 before 的 {_before_hit:.0%}）")
+        if _reasons:
+            print("❌ 检索退化：" + "；".join(_reasons))
+            return 1
+        print(f"✅ 无退化：lost=0，来源命中率 {_before_hit:.0%} → {_after_hit:.0%}")
         return 0
     print(__doc__)
     return 2
 
 
 if __name__ == "__main__":
-    raise SystemExit(main());
+    raise SystemExit(main())

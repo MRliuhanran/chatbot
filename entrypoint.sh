@@ -112,48 +112,21 @@ _supervise() {
     done
 }
 
-# ── 0.2 从 .env 补齐本脚本要用的变量（与 python-dotenv 同语义）───────────────
-# 旧写法只特判 MODEL 一行，于是 RAG_HTTP_PORT / RAG_SKIP_MODEL_PULL / HF_ENDPOINT 等
-# 写进 .env 对本脚本**静默无效**（端口仍是 7860）—— 而本项目配置的唯一入口就是 .env。
-# 规则：只认白名单前缀的键；进程环境优先（已设即跳过，含设为空串）；引号与 export 前缀
-# 都认。解析后的值与应用侧 load_dotenv 看到的完全一致，不会出现"脚本与应用各读一份"。
-_load_dotenv() {
-    [ -f .env ] || return 0
-    local _line _k _v
-    while IFS= read -r _line || [ -n "${_line}" ]; do
-        _line="${_line%$'\r'}"
-        case "${_line}" in
-            ''|\#*) continue ;;
-        esac
-        _line="$(printf '%s' "${_line}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        _line="${_line#export }"
-        case "${_line}" in
-            [A-Za-z_]*=*) ;;
-            *) continue ;;
-        esac
-        _k="${_line%%=*}"
-        _k="$(printf '%s' "${_k}" | sed -e 's/[[:space:]]*$//')"
-        case "${_k}" in
-            [A-Za-z_][A-Za-z0-9_]*) ;;
-            *) continue ;;
-        esac
-        case "${_k}" in
-            RAG_*|OLLAMA_*|QDRANT_*|SEMANTIC_*|INDEX_*|MODEL|HF_ENDPOINT|HF_HUB_*|PYTORCH_MPS_*|RAG_SKIP_MODEL_DOWNLOAD) ;;
-            *) continue ;;
-        esac
-        eval "[ -n \"\${${_k}+x}\" ]" && continue
-        _v="${_line#*=}"
-        _v="$(printf '%s' "${_v}" | sed -e 's/^[[:space:]]*//')"
-        # 引号值要按**首个闭合引号**截断，不能只看首尾字符：`KEY="v" # 注释` 的首尾
-        # 不是一对引号，旧写法会漏掉引号剥离、把引号带进变量（python-dotenv 不会）。
-        case "${_v}" in
-            \"*) _v="${_v#\"}"; _v="${_v%%\"*}" ;;
-            \'*) _v="${_v#\'}"; _v="${_v%%\'*}" ;;
-            *) _v="$(printf '%s' "${_v}" | sed -e 's/[[:space:]]\{1,\}#.*$//' -e 's/[[:space:]]*$//')" ;;
-        esac
-        export "${_k}=${_v}"
-    done < .env
-}
+# ── 0.2 从 .env 补齐本脚本要用的变量（唯一实现：tools/dotenv.sh）────────────────
+# 旧写法在本脚本里自带一份解析器，run_local.sh 又自带第三份、fetch_models.sh 另有一份取值
+# 器：三者对 export 前缀 / 行内注释 / 同名重复的处理各不相同，同一份 .env 在容器、本地
+# 一键起停、构建期读出三种结果（失效原型：多份）。现收敛成一份 —— 本脚本只 source + 调用。
+# 语义（进程环境优先、同名重复最后一次生效、引号与行内注释、白名单前缀、MODELS_DIR 在列）
+# 与各自触发场景逐条写在 tools/dotenv.sh 头注释里，此处不复述 —— 同一知识只留一处实现：
+# 复述一次就多一份会分叉的副本。
+# 这个文件缺失 = 镜像不完整：.env 里**每一个**键都会被静默忽略（端口/后端/模型路径全部
+# 退回代码默认值），正是本仓库点名的静默原型 —— 故 fail-closed 退出，不降级继续跑。
+if [ -f /app/tools/dotenv.sh ]; then
+    . /app/tools/dotenv.sh
+else
+    _log "❌ 缺少 /app/tools/dotenv.sh（.env 解析的唯一实现）—— .env 配置会全部失效，退出"
+    exit 1
+fi
 _load_dotenv
 
 # ── 0. 运行期目录与下载源 ────────────────────────────────────────────────────
@@ -165,7 +138,9 @@ export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 # 这是全脚本唯一不 exit 1 的启动前置条件（脚本没有 set -e）：磁盘满/配额超/只读挂载
 # 时 Ollama 与权重目录建不出来，后面却照常往下走，最后表现为"容器起来了但一个模型都
 # 没有"，且日志里没有任何一条指向根因。
-if ! mkdir -p "${OLLAMA_MODELS}" /app/models 2>/tmp/mkdir.log; then
+# 权重根目录与 fetch_models.sh / infinity / 自检门禁同源（MODELS_DIR 可被 .env 覆盖，
+# 见评审 #8；默认 /app/models 不变，只是不再写死）。
+if ! mkdir -p "${OLLAMA_MODELS}" "${MODELS_DIR:-/app/models}" 2>/tmp/mkdir.log; then
     _log "❌ 无法创建运行期目录（磁盘满 / 配额超 / 只读挂载？），详见 /tmp/mkdir.log："
     cat /tmp/mkdir.log
     exit 1
@@ -269,9 +244,34 @@ _download_models &
 # 注意：单例（RAG_EXCLUSIVE_MODELS=1）下 infinity 常驻它的两个模型且**没有卸载接口**，
 # 互斥只能从另一侧保证 —— 生成模型答完即卸（RAG_GEN_KEEP_ALIVE=0）。
 _infinity_pid=""
+# http 后端 = 需要 infinity。先算"要不要"，再单独做 command -v 判据（评审 #7），最后才进
+# 启动块 —— 启动块本体（argv/等待/自愈复用）一行不动，避免大段缩进带来的改错风险。
+_infinity_wanted=0
 if [ "${RAG_EMBED_BACKEND:-torch}" = "http" ] || [ "${RAG_RERANK_BACKEND:-torch}" = "http" ]; then
-    _embed_dir="/app/models/$(basename "${RAG_EMBED_MODEL_PATH:-./models/bge-m3}")"
-    _rerank_dir="/app/models/$(basename "${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-base}")"
+    _infinity_wanted=1
+fi
+# ── 前置判据（评审 #7）：本镜像**故意不装** infinity ──────────────────────────
+# 依据见 Dockerfile：8G 单容器运行档定为 torch 进程内；且 infinity-emb[server] 要求
+# uvicorn<0.33.0，与 requirements.txt 的锁定直接冲突（带约束安装必然构建失败）。
+# 旧写法不看命令在不在就起子 shell：exec infinity_emb 立刻 127 退出，被 4.5 的自愈当成
+# "运行期崩溃"，退避 5/10/20/40/80/120s 重启共 6 次才熔断 —— 日志里全是"运行期崩溃"，
+# **没有一条**说"infinity 没装"（失效原型：静默 + 自愈把根因放大成噪声）。
+# 修法：先 command -v 判据 + 具名报错，并让 _infinity_pid 保持空 —— 4.5 不会为它注册自愈，
+# 也就不会再有"假装崩溃"的重启风暴。触发场景：平台/部署方把两个 BACKEND 注入成 http
+# （仓库自带 .env 是 torch），或 RAG_EMBED_URL 其实指向外部 infinity 服务。
+# 不 exit 1：本容器还要服务 Qdrant/Ollama/Streamlit，且"外部 infinity"场景下退容器是误杀；
+# 真要本地 infinity 时日志已给两条可执行出路。
+if [ "${_infinity_wanted}" = 1 ] && ! command -v infinity_emb >/dev/null 2>&1; then
+    _log "❌ RAG_EMBED_BACKEND/RAG_RERANK_BACKEND 配了 http，但镜像里没有 infinity_emb（本镜像按 8G 单容器档不安装它）"
+    _log "   → 不拉起检索模型服务，也不注册自愈（避免被当成运行期崩溃反复重启）；嵌入/重排将全部失败"
+    _log "   出路：① RAG_EMBED_URL 指向外部 infinity 时本行即预期；② 否则把两个 BACKEND 改回 torch；③ 或换用带 infinity 的镜像"
+    _infinity_wanted=0
+fi
+if [ "${_infinity_wanted}" = 1 ]; then
+    # 模型根目录与下载（fetch_models.sh）、启动自检门禁同源：MODELS_DIR 现在真的会从 .env
+    # 生效（评审 #8），这里若继续写死 /app/models，"权重下到哪"与"infinity 去哪找"就会分叉。
+    _embed_dir="${MODELS_DIR:-/app/models}/$(basename "${RAG_EMBED_MODEL_PATH:-./models/bge-m3}")"
+    _rerank_dir="${MODELS_DIR:-/app/models}/$(basename "${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-base}")"
     _embed_served="${RAG_EMBED_MODEL_NAME:-$(basename "${_embed_dir}")}"
     _rerank_served="${RAG_RERANK_MODEL_NAME:-$(basename "${_rerank_dir}")}"
     # 端口从 RAG_EMBED_URL 派生（单一来源），解析不出来才退 8001

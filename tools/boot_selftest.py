@@ -160,7 +160,13 @@ def stage_full():
 
 
 def main():
-    model = os.environ.get("RAG_BOOT_SELFTEST_MODEL") or _env_get("MODEL") or "qwen3.5:4b-q4_K_M"
+    # 进程环境优先（与下面 OLLAMA_BASE_URL / RAG_NUM_CTX 同一条规则，评审 #2）：平台注入
+    # -e MODEL=... 或 MODEL=x python tools/boot_selftest.py 覆盖模型时，探针必须打**同一个**
+    # 模型。旧写法在这里只读 .env（RAG_BOOT_SELFTEST_MODEL 只管探针专用覆盖），于是探针去
+    # 打旧模型：旧模型还在 = 假通过（验的根本不是要用的那个），旧模型不在 = 报"未通过"；
+    # 两种结果都不指向真实原因（失效原型：静默 + 状态失步）。
+    model = os.environ.get("RAG_BOOT_SELFTEST_MODEL") or os.environ.get("MODEL") \
+        or _env_get("MODEL") or "qwen3.5:4b-q4_K_M"
     base_url = os.environ.get("OLLAMA_BASE_URL") or _env_get("OLLAMA_BASE_URL") or \
         "http://127.0.0.1:11434"
     try:
