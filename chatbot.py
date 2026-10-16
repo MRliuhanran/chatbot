@@ -2425,22 +2425,20 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
                 if kept:
                     # 逐块 token 预计算：去掉最后一块时同步扣掉它自己的 token 与间距
                     # 分隔符，O(1) 内联递减，避免每步重复 join+估算整条。
-                    kept_toks = [estimate_tokens(b) for b in kept]
-                    sep_tok = estimate_tokens("\n\n")
-                    cur = sum(kept_toks) + (len(kept) - 1) * sep_tok
+                    # ★ 判据必须用**真实拼接**的计数：estimate_tokens 不可加（BPE 会跨边界合并，
+                    #   估算档还逐块各自取整），所以 sum(块)+n*sep 与整条拼接的 token 数并不相等
+                    #   （实测本仓库 tokenizer：k=2 为 646/645、k=5 为 1731/1727）。旧写法用加性
+                    #   "运行计数"当判据、再把它与实际拼接比对后 raise —— 只要有 ≥2 条资料且触发裁剪，
+                    #   这条路径必然自崩，把整轮打成 RuntimeError（本质是记账自检先崩）。
+                    #   候选 ≤ RERANK_TOP_K(20) 条，每步重算一次 join+估算的成本可忽略。
                     k = len(kept)
                     while k > 1:
                         k -= 1
-                        cur -= kept_toks[k] + sep_tok
-                        if sys_tok + h_tok + q_tok + cur <= cap:
+                        if sys_tok + h_tok + q_tok + estimate_tokens("\n\n".join(kept[:k])) <= cap:
                             break
                     kept = kept[:k]
                     context = "\n\n".join(kept)
                     ctx_tokens = estimate_tokens(context)
-                    # 运行计数 cur 与实际拼接必须一致，否则"整条从尾部丢"的记账就是错的
-                    # （离一 bug 会让 kept 多留一条、cur 却已扣掉它）。raise 而非 assert：-O 下不失效。
-                    if ctx_tokens != cur:
-                        raise RuntimeError(f"资料裁剪记账不一致: 运行计数 cur={cur} 与整条拼接 {ctx_tokens}（块数 {len(kept)}）")
                     allow = max(0, cap - sys_tok - h_tok - q_tok)
                     if ctx_tokens > allow:
                         context = _cut_to_tokens(context, allow)
