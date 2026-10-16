@@ -87,7 +87,10 @@ _supervise() {
                 _pid_alive "${_pid}" || break
                 sleep 1
             done
-            [ "${_ok}" = 1 ] || _log "⚠️ ${_name} 拉起后 60 秒未就绪（pid=${_pid}），继续观察"
+            # 仅"进程活着但健康检查失败"才告警；进程已死由下面的崩溃分支说明，别重复喊。
+            if [ "${_ok}" != 1 ] && _pid_alive "${_pid}"; then
+                _log "⚠️ ${_name} 拉起后 60 秒未就绪（pid=${_pid}，进程在但健康检查失败），继续观察"
+            fi
         fi
         _t0="$(date +%s)"
         while _pid_alive "${_pid}"; do sleep 3; done
@@ -259,8 +262,8 @@ _download_models &
 # ── 3.5 检索模型服务（infinity）：嵌入 + 重排同一个进程、共享一份 torch ───────────
 # RAG_EMBED_BACKEND / RAG_RERANK_BACKEND 任一为 http 时才起。业务进程（Streamlit）因此
 # 不再持有检索模型；查询侧按 OpenAI /v1/embeddings 与 Cohere 风格 /v1/rerank 调它。
-# **必须在权重就绪之后**（infinity 启动时找不到模型目录会直接退出），故先用子 shell 轮询
-# 目录、再 exec 成 infinity —— exec 保住 pid，4.5 的存活哨兵才盯得住真进程。
+# **必须在权重就绪之后**（infinity 启动时找不到模型目录会直接退出），故先轮询目录再拉起。
+# 命令行只此一处（_infinity_argv 数组），首启与运行期自愈（4.5）共用，避免 argv 漂移。
 # 注意：单例（RAG_EXCLUSIVE_MODELS=1）下 infinity 常驻它的两个模型且**没有卸载接口**，
 # 互斥只能从另一侧保证 —— 生成模型答完即卸（RAG_GEN_KEEP_ALIVE=0）。
 _infinity_pid=""
@@ -272,55 +275,29 @@ if [ "${RAG_EMBED_BACKEND:-torch}" = "http" ] || [ "${RAG_RERANK_BACKEND:-torch}
     # 端口从 RAG_EMBED_URL 派生（单一来源），解析不出来才退 8001
     _inf_port="$(printf '%s' "${RAG_EMBED_URL:-}" | sed -n 's|^[a-z]*://[^:/]*:\([0-9][0-9]*\).*|\1|p')"
     _inf_port="${_inf_port:-8001}"
-    (
-        _i=0
+    _infinity_argv=(infinity_emb v2 \
+        --model-id "${_embed_dir}" --served-model-name "${_embed_served}" \
+        --model-id "${_rerank_dir}" --served-model-name "${_rerank_served}" \
+        --engine torch --device cpu --no-bettertransformer \
+        --url-prefix /v1 --host 127.0.0.1 --port "${_inf_port}")
+    _infinity_wait_models() {
+        local _i=0
         while [ "${_i}" -lt 300 ]; do
             [ -d "${_embed_dir}" ] && [ -d "${_rerank_dir}" ] && break
             _i=$((_i + 1))
             sleep 2
         done
         _log "检索模型服务启动中：embed=${_embed_served} rerank=${_rerank_served} port=${_inf_port}（日志 /tmp/infinity.log）"
-        exec infinity_emb v2 \
-            --model-id "${_embed_dir}" --served-model-name "${_embed_served}" \
-            --model-id "${_rerank_dir}" --served-model-name "${_rerank_served}" \
-            --engine torch --device cpu --no-bettertransformer \
-            --url-prefix /v1 --host 127.0.0.1 --port "${_inf_port}" \
-            >/tmp/infinity.log 2>&1
-    ) &
-    _infinity_pid=$!
-fi
-
-# ── 3.5 检索模型服务（infinity）：嵌入 + 重排同一个进程、共享一份 torch ───────────
-# RAG_EMBED_BACKEND / RAG_RERANK_BACKEND 任一为 http 时才起。业务进程（Streamlit）因此
-# 不再持有检索模型；查询侧按 OpenAI /v1/embeddings 与 Cohere 风格 /v1/rerank 调它。
-# **必须在权重就绪之后**（infinity 启动时找不到模型目录会直接退出），故先用子 shell 轮询
-# 目录、再 exec 成 infinity —— exec 保住 pid，4.5 的存活哨兵才盯得住真进程。
-# 注意：单例（RAG_EXCLUSIVE_MODELS=1）下 infinity 常驻它的两个模型且**没有卸载接口**，
-# 互斥只能从另一侧保证 —— 生成模型答完即卸（RAG_GEN_KEEP_ALIVE=0）。
-_infinity_pid=""
-if [ "${RAG_EMBED_BACKEND:-torch}" = "http" ] || [ "${RAG_RERANK_BACKEND:-torch}" = "http" ]; then
-    _embed_dir="/app/models/$(basename "${RAG_EMBED_MODEL_PATH:-./models/bge-m3}")"
-    _rerank_dir="/app/models/$(basename "${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-base}")"
-    _embed_served="${RAG_EMBED_MODEL_NAME:-$(basename "${_embed_dir}")}"
-    _rerank_served="${RAG_RERANK_MODEL_NAME:-$(basename "${_rerank_dir}")}"
-    # 端口从 RAG_EMBED_URL 派生（单一来源），解析不出来才退 8001
-    _inf_port="$(printf '%s' "${RAG_EMBED_URL:-}" | sed -n 's|^[a-z]*://[^:/]*:\([0-9][0-9]*\).*|\1|p')"
-    _inf_port="${_inf_port:-8001}"
-    (
-        _i=0
-        while [ "${_i}" -lt 300 ]; do
-            [ -d "${_embed_dir}" ] && [ -d "${_rerank_dir}" ] && break
-            _i=$((_i + 1))
-            sleep 2
-        done
-        _log "检索模型服务启动中：embed=${_embed_served} rerank=${_rerank_served} port=${_inf_port}（日志 /tmp/infinity.log）"
-        exec infinity_emb v2 \
-            --model-id "${_embed_dir}" --served-model-name "${_embed_served}" \
-            --model-id "${_rerank_dir}" --served-model-name "${_rerank_served}" \
-            --engine torch --device cpu --no-bettertransformer \
-            --url-prefix /v1 --host 127.0.0.1 --port "${_inf_port}" \
-            >/tmp/infinity.log 2>&1
-    ) &
+    }
+    # 自愈复用（4.5）：后台起并回填 pid。**不用 exec**——exec 会替换调用它的监督者进程。
+    _infinity_start() {
+        _infinity_wait_models
+        "${_infinity_argv[@]}" >>/tmp/infinity.log 2>&1 &
+        _svc_pid=$!
+    }
+    # 首启：等目录可能很久，放后台子 shell 不阻塞主流程；exec 保住 pid，自愈据此接管。
+    : > /tmp/infinity.log
+    ( _infinity_wait_models; exec "${_infinity_argv[@]}" >>/tmp/infinity.log 2>&1 ) &
     _infinity_pid=$!
 fi
 
@@ -338,30 +315,38 @@ else
     _pull_ollama_model "${_model}" &
 fi
 
-# ── 4.5 存活哨兵 ────────────────────────────────────────────────────────────
-# exec 让 Streamlit 当 PID 1，容器里没人 wait：qdrant/ollama 运行期崩了只会变成僵尸，
+# ── 4.5 运行期自愈：进程崩溃自动拉起 ─────────────────────────────────────────
+# exec 让 Streamlit 当 PID 1，容器里没人 wait：qdrant/ollama 运行期崩了只会变僵尸，
 # 既不重启也不告警 —— 上面两处存活检查只在启动期跑一次。表现为"页面照常 200、检索或
 # 生成全失败"，而日志里一条线索都没有（失效原型：状态失步 + 静默）。
-# 刻意只告警不自动重启：Qdrant 崩溃循环 + 反复打开损坏的 WAL 比直接停机更糟，重启策略
-# 该交给编排层（restart: unless-stopped）或人。每个进程只喊一次，避免刷屏。
-(
-    _said_q=0; _said_o=0; _said_m=0
-    while :; do
-        sleep 30
-        if [ "${_said_q}" = 0 ] && ! _pid_alive "${_qdrant_pid}"; then
-            _said_q=1
-            _log "🔴 qdrant 已死（pid=${_qdrant_pid}）→ 检索必然全部失败；容器不自动重启，详见 /tmp/qdrant.log"
-        fi
-        if [ "${_said_o}" = 0 ] && ! _pid_alive "${_ollama_pid}"; then
-            _said_o=1
-            _log "🔴 ollama 已死（pid=${_ollama_pid}）→ 生成必然失败；容器不自动重启，详见 /tmp/ollama.log"
-        fi
-        if [ -n "${_infinity_pid}" ] && [ "${_said_m}" = 0 ] && ! _pid_alive "${_infinity_pid}"; then
-            _said_m=1
-            _log "🔴 检索模型服务（infinity）已死（pid=${_infinity_pid}）→ 嵌入/重排全部失败、检索必挂；详见 /tmp/infinity.log"
-        fi
-    done
-) &
+# 现改为**受控自愈**：_supervise 指数退避 + 熔断（公式与顾虑见 0.1c 注释），默认开。
+#   RAG_SUPERVISE=0      退回旧的"只告警不重启"
+#   RAG_SUPERVISE_MAX/BASE/CAP/RESET  调熔断次数与退避参数
+if [ "${RAG_SUPERVISE:-1}" = 1 ]; then
+    _supervise qdrant   /tmp/qdrant.log   _qdrant_start   "${_qdrant_pid}"   &
+    _supervise ollama   /tmp/ollama.log   _ollama_start   "${_ollama_pid}"   &
+    [ -n "${_infinity_pid}" ] && \
+        _supervise infinity /tmp/infinity.log _infinity_start "${_infinity_pid}" &
+else
+    (
+        _said_q=0; _said_o=0; _said_m=0
+        while :; do
+            sleep 30
+            if [ "${_said_q}" = 0 ] && ! _pid_alive "${_qdrant_pid}"; then
+                _said_q=1
+                _log "🔴 qdrant 已死（pid=${_qdrant_pid}）→ 检索必然全部失败；容器不自动重启，详见 /tmp/qdrant.log"
+            fi
+            if [ "${_said_o}" = 0 ] && ! _pid_alive "${_ollama_pid}"; then
+                _said_o=1
+                _log "🔴 ollama 已死（pid=${_ollama_pid}）→ 生成必然失败；容器不自动重启，详见 /tmp/ollama.log"
+            fi
+            if [ -n "${_infinity_pid}" ] && [ "${_said_m}" = 0 ] && ! _pid_alive "${_infinity_pid}"; then
+                _said_m=1
+                _log "🔴 检索模型服务（infinity）已死（pid=${_infinity_pid}）→ 嵌入/重排全部失败、检索必挂；详见 /tmp/infinity.log"
+            fi
+        done
+    ) &
+fi
 
 # ── 4.6 冷启动自检：生成链路（默认）/ 完整检索+生成（可选）──────────────────────
 # 8G 档 llama-server 被 cgroup OOM 杀时（`signal: killed`），业务侧只表现为一次 500，
