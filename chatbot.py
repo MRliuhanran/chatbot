@@ -69,11 +69,28 @@ def env_float_min(name, default, minimum):
     return val
 
 
+_ENV_TRUE = ("1", "true", "yes", "on")
+_ENV_FALSE = ("0", "false", "no", "off")
+
+
 def env_bool(name, default):
+    """布尔配置：只认显式真/假集合，其余取值**报错**。
+
+    旧写法把 0/false/no/off 之外的一切都当真：RAG_EXCLUSIVE_MODELS=flase（拼错）、
+    =2、=禁用 都会静默取真，单例、缓存、别名这些开关于是"配了等于没配"，
+    且日志里看不出任何异常（失效原型：静默）。与 env_int/env_choice 一样具名报错。
+    """
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+    val = raw.strip().lower()
+    if val in _ENV_TRUE:
+        return True
+    if val in _ENV_FALSE:
+        return False
+    raise ValueError(
+        f"环境变量 {name}={raw!r} 不是合法布尔值（真: {'/'.join(_ENV_TRUE)}，假: {'/'.join(_ENV_FALSE)}）"
+    )
 
 
 def env_choice(name, default, allowed):
@@ -476,12 +493,18 @@ def ensure_generation_unloaded(timeout=None):
         _ollama_session().post( f"{OLLAMA_BASE_URL}/api/generate", json={ "model": MODEL, "keep_alive": 0, }, timeout=_timeout, )
     except Exception as exc:
         log(f"⚠️  单例：发送卸载请求失败（继续轮询）: {type(exc).__name__}: {exc}")
-    deadline = time.time() + _timeout
-    while time.time() < deadline:
+    # 轮询用 monotonic：同一文件里 _wait_for_weights 已是 monotonic，两处混用会让
+    # "超时"在系统时钟被调整（NTP/手动改时间）时表现不一致（time.time 会倒退或跳进）。
+    deadline = time.monotonic() + _timeout
+    while time.monotonic() < deadline:
         try:
             if not any(_model_name_matches(n, MODEL) for n in _ollama_loaded_models()):
                 return True
-        except Exception:
+        except Exception as exc:
+            # 读 /api/ps 失败 ≠ 已卸出：旧写法这里直接 return False 且**一个字都不打**，
+            # 与本文档"超时只告警、但这条告警必须显式"自相矛盾 —— 调用方看到的是
+            # "已释放"，实际峰值可能已是两者之和（失效原型：静默降级）。
+            log(f"⚠️  单例：轮询生成模型卸载状态失败，无法确认是否卸出，本轮按未卸出处理: {type(exc).__name__}: {exc}")
             return False
         time.sleep(0.5)
     log(f"⚠️  单例：生成模型 {_timeout:.0f} 秒内未卸出（/api/ps 仍显示它），本轮将与检索模型同时驻留，内存峰值可能超限")
@@ -585,13 +608,24 @@ if _gpu_raw:
             raise ValueError(f"RAG_GEN_NUM_GPU 不能小于 -1（-1=自动），收到 {GEN_NUM_GPU}")
 CHILD_MAX_TOKENS = env_int_min("RAG_CHILD_MAX_TOKENS", 128, 1)
 PARENT_MAX_TOKENS = env_int_min("RAG_PARENT_MAX_TOKENS", 512, 1)
-CHUNK_OVERLAP = env_int("RAG_CHUNK_OVERLAP", 32)
-PARENT_MIN_TOKENS = env_int("RAG_PARENT_MIN_TOKENS", 192)
-CHILD_MIN_TOKENS = env_int("RAG_CHILD_MIN_TOKENS", 32)
+# 以下三项旧写法是 env_int（无下限）：负的重叠/最小值能一路进到 splitter，
+# 每个文档都抛 ValueError 让 process 全量失败（报错点还落在组件内部，指不到配置）。
+CHUNK_OVERLAP = env_int_min("RAG_CHUNK_OVERLAP", 32, 0)
+PARENT_MIN_TOKENS = env_int_min("RAG_PARENT_MIN_TOKENS", 192, 0)
+# 死配置：子块最小长度由 overlap 与句子边界决定，当前**没有任何消费点**，且已从切分指纹
+# payload 移除（留在指纹里只会让"改它"触发一次无意义的全量重建）。保留解析只为对 .env 里
+# 的历史写入做具名校验；要真正接进子块合并逻辑时，必须同步把它放回指纹。
+CHILD_MIN_TOKENS = env_int_min("RAG_CHILD_MIN_TOKENS", 32, 0)
 if CHILD_MAX_TOKENS > PARENT_MAX_TOKENS:
     raise ValueError(f"RAG_CHILD_MAX_TOKENS={CHILD_MAX_TOKENS} 不能大于 RAG_PARENT_MAX_TOKENS={PARENT_MAX_TOKENS}")
+if CHUNK_OVERLAP >= CHILD_MAX_TOKENS:
+    raise ValueError(
+        f"RAG_CHUNK_OVERLAP={CHUNK_OVERLAP} 必须小于 RAG_CHILD_MAX_TOKENS={CHILD_MAX_TOKENS}："
+        f"子块切分要求 overlap < capacity，否则每篇文档都在 splitter 里抛 ValueError（process 全量失败）"
+    )
 EMBED_BATCH_SIZE = env_int_min("RAG_EMBED_BATCH_SIZE", 64, 1)
-SEMANTIC_EMBED_DEVICE = os.getenv("SEMANTIC_EMBED_DEVICE", "")  # 空=自动选设备（MPS 优先），见 get_device()
+# （已删除）SEMANTIC_EMBED_DEVICE：组件化后不再有"分块期嵌入设备"这一路，全仓无引用；
+# 索引/检索的设备选型仍由 INDEX_DEVICE（空=自动，见 get_device）与各后端决定。
 INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
 QDRANT_HOST = os.getenv("QDRANT_HOST") or os.getenv("RAG_QDRANT_HOST") or "localhost"
 QDRANT_PORT = env_int_any(6333, "QDRANT_PORT", "RAG_QDRANT_PORT")
@@ -630,14 +664,19 @@ CHUNK_FINGERPRINT_FIELD = "chunk_fingerprint"
 _PAYLOAD_SPEC = ( ("chunk_id", "id", ""), ("child_text", "child_text", ""), ("parent_text", "parent_text", ""), (SOURCE_FIELD, "source", ""), ("chunk_index", "chunk_index", 0), ("total_chunks", "total_chunks", 0), ("contextual_text", "contextual_text", ""), ("parent_id", "parent_id", ""), ("parent_chunk_count", "parent_chunk_count", 0), )
 # chunks.json 的记录字段：除来源字段用 payload 键（=RAG_SOURCE_FIELD）外，其余都用规范键 k。
 # 不能直接用 _PAYLOAD_SPEC 的 f：chunk_id 的 payload 键是 "chunk_id"、记录键却是 "id"。
-_RECORD_FIELDS = {k for _f, k, _d in _PAYLOAD_SPEC if k != "source"} | {SOURCE_FIELD}
+_RECORD_CORE_FIELDS = {k for _f, k, _d in _PAYLOAD_SPEC if k != "source"}
+_RECORD_FIELDS = _RECORD_CORE_FIELDS | {SOURCE_FIELD}
+# ★ 来源字段的**历史别名键**只有这一份定义：读取（_source_of）、检索过滤
+# （_source_filter）、比较器放行（_ALLOWED_CHUNK_FIELDS/_SOURCE_ALIASES）全部派生自它。
+# 旧写法是三份互不派生的字面量 —— 未来改一处漏两处，来源过滤会恒空命中且不报错（静默）。
+SOURCE_PAYLOAD_FIELDS = tuple(dict.fromkeys((SOURCE_FIELD, "source", "book")))
 
 
 def _source_of(record):
     """读来源字段，兼容配置字段与旧 book 字段。"""
     if not isinstance(record, dict):
         return ""
-    for key in (SOURCE_FIELD, "source", "book"):
+    for key in SOURCE_PAYLOAD_FIELDS:
         value = record.get(key)
         if value not in (None, ""):
             return str(value)
@@ -926,16 +965,9 @@ def fix_quotes(text):
     return "".join(out)
 
 
-_EMBED_MODEL = None
-_EMBED_TOKENIZER = None
-
-
-def _get_embed_model():
-    global _EMBED_MODEL, _EMBED_TOKENIZER
-    if _EMBED_MODEL is None:
-        # 语义分块嵌入设备自选（MPS 优先），构造统一走 load_embedding_model
-        _EMBED_TOKENIZER, _EMBED_MODEL, _ = load_embedding_model(device=SEMANTIC_EMBED_DEVICE)
-    return _EMBED_TOKENIZER, _EMBED_MODEL
+# （已删除）分块期嵌入单例 _get_embed_model/_EMBED_MODEL/_EMBED_TOKENIZER：2026-10-14
+# 组件化后语义定界改由 semantic-text-splitter 按结构递归切分，process 不再做逐句嵌入，
+# 这三个名字全仓已无任何调用点；留着只会让人以为"分块还要加载嵌入模型"。
 
 
 def _mps_empty_cache():
@@ -1031,12 +1063,17 @@ def read_book_text(filepath):
 
 
 read_document_text = read_book_text  # 通用别名；保留 read_book_text 以兼容分块指纹
-# 指纹单元 = 真正决定切分结果的自研代码。2026-10-14 组件化后只剩四个：引号归一、
-# 文档读取（含 ftfy+OpenCC 归一化）、父子分块（semantic-text-splitter 的调用参数与
-# 容量回调）、以及 token 计数器。分块组件的**版本**另在 config 指纹里（splitter 项）。
+# 指纹单元 = 真正决定切分结果的自研代码。引号归一、文档读取（含 ftfy+OpenCC 归一化）、
+# 父子分块（semantic-text-splitter 的调用参数与容量回调）、token 计数器与短父块合并。
+# 分块组件的**版本**另在 config 指纹里（splitter 项）。
+# normalize_text/_opencc 必须在这里：read_book_text 只是**调用**它们，改归一化实现
+# （换清洗项、换 OpenCC 配置语义）不改 read_book_text 的源码 —— 漏掉就是"改了归一化、
+# 指纹不动、旧分块静默沿用"（fix_quotes 早已在列，两者是同一层的实现）。
 _CHUNKING_CODE_UNITS = (
     "fix_quotes",
     "read_book_text",
+    "normalize_text",
+    "_opencc",
     "_hierarchical_split",
     "_token_counter",
     "_merge_tiny_parents",
@@ -1064,12 +1101,34 @@ def _chunking_code_fingerprint():
 
 
 def _chunking_config_fingerprint():
-    # embed_model_content：语义定界用的是**权重算出的句向量**，同路径换权重必须触发重分块。
-    # 只存路径 = 静默沿用旧分块（稠密缓存 _embed_cache_file 已修同款洞，分块侧同步补上）。
-    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "child_min_tokens": CHILD_MIN_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "normalize_quotes": NORMALIZE_QUOTES, "text_opencc": TEXT_OPENCC, "ftfy_fix": json.dumps(FTFY_FIX, sort_keys=True), "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content_fingerprint(),         # 分块组件版本：升级它会改变切分边界，漏掉就会让"产物过期"不被发现（与 sentencex 同款理由）
+    # embed_model_content：同路径换权重必须触发重分块/重建缓存；目录不可用时它是哨兵，
+    # 这时**单独报"嵌入模型目录缺失"**，而不是让指纹比对去打"请重跑 process+index"
+    # （那条路正需要这个目录，报错会把排查方向指反）。
+    _model_content = _model_content_fingerprint()
+    if _model_content == _MODEL_CONTENT_UNKNOWN:
+        raise RuntimeError(
+            f"嵌入模型目录缺失或为空: {EMBED_MODEL_PATH!r} —— 无法计算切分指纹，"
+            f"也就无法判断分块/索引是否新鲜（重跑 process 与 index 都需要这个目录，"
+            f"先恢复权重：本地看 RAG_EMBED_MODEL_PATH，创空间看运行日志的权重下载行）"
+        )
+    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "normalize_quotes": NORMALIZE_QUOTES, "text_opencc": TEXT_OPENCC, "ftfy_fix": json.dumps(FTFY_FIX, sort_keys=True), "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content,         # 分块组件版本：升级它会改变切分边界，漏掉就会让"产物过期"不被发现（与 sentencex 同款理由）
         "splitter": _package_version("semantic-text-splitter"), "chunking_code": _chunking_code_fingerprint(), }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16], payload
+
+
+def _chunking_fingerprint(sources, config_fp=None):
+    """**存盘与比对共用的唯一切分指纹** = 配置指纹 + 源文本 sha 指纹。
+
+    为什么必须把源文本并进来：索引 payload 里的 chunk_fingerprint 是检索侧 fail-closed
+    闸门的唯一判据（_check_chunk_freshness）。只算配置时，"改了语料 + 只跑 process"会让
+    索引里的旧指纹与"当前"仍然相等 —— 闸门恒等放行，serve 静默继续服务旧知识库，只有
+    stages 能发现（失效原型：静默 + 判据恒真）。两侧都调这一个函数，口径不可能分叉。
+    """
+    if config_fp is None:
+        config_fp = _chunking_config_fingerprint()[0]
+    blob = f"{config_fp}|{json.dumps(sources, sort_keys=True, ensure_ascii=False)}"
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
 def _sources_fingerprint(paths):
@@ -1097,23 +1156,48 @@ def _document_paths():
         p for p in glob.glob(os.path.join(DATA_DIR, DOC_GLOB), recursive=True)
         if os.path.isfile(p)
     )
-    if not paths:
+    if not paths and not glob.has_magic(DOC_GLOB):
+        # 区分两种"一个都没匹配"：glob 里**没有通配符**等于写死了文件名，匹配不到就是配置
+        # 指错了（保留 raise）；目录存在、通配符没命中则是**合法边界** —— 语料被清空，
+        # 必须返回空列表走 0 文档分支，否则空语料让 process/index 双双失败、知识库永远
+        # 清不掉（旧写法一律 raise：把"清空"这个正常操作变成不可达状态）。
         raise FileNotFoundError(
             f"{DATA_DIR} 中没有匹配 {DOC_GLOB!r} 的文档"
+            f"（该 glob 不含通配符，等于指定了单个文件名 —— 检查 RAG_DOC_GLOB 与 RAG_DATA_DIR）"
         )
     return paths
 
 
-def _document_name(path):
-    rel = os.path.relpath(path, DATA_DIR)
-    stem = os.path.splitext(rel)[0]
-    name = stem.replace(os.sep, "__")
-    # "__" 既用来编码路径分隔符、也可能原样出现在文件名里（a/b.txt 与 a__b.txt 会映射成
-    # 同一个名字，文档缓存与 source 字段互相覆盖）。名字里出现 "__" 就追加相对路径的短
-    # 哈希保证唯一；平铺语料不含 "__"，名字保持不变。
-    if "__" in name:
-        name = f"{name}_{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:16]}"
-    return name
+_DOC_NAME_CACHE: dict = {}
+
+
+def _document_names(paths):
+    """{绝对路径: source 名}（唯一化表）：**完整相对路径全量参与，只在冲突时加短哈希**。
+
+    候选名 = 相对路径去扩展名 + 路径分隔符编码成 "__"，与旧产物逐字相同 —— 未冲突时
+    source 名、point id、文档缓存名都不变（换名会让重建后的检索基线不可比）。旧实现只对
+    "名字里含 __"加哈希，于是**同 stem 不同扩展**（a.txt / a.md，放宽 RAG_DOC_GLOB 后很
+    常见）派生同一个 source/id/parent_id：两篇文档在 payload 与文档缓存里互相覆盖，而且
+    因名字相同、判据恒真，每次 process 都要重算这两篇（失效原型：多份 + 静默覆盖）。
+    冲突组内一律追加相对路径短哈希；含 "__" 的候选（路径分隔符编码与文件名撞名）照旧加。
+    """
+    key = (DATA_DIR, DOC_GLOB, tuple(paths))
+    names = _DOC_NAME_CACHE.get(key)
+    if names is None:
+        rels = {p: os.path.relpath(p, DATA_DIR) for p in paths}
+        groups: dict = defaultdict(list)
+        for p, rel in rels.items():
+            groups[os.path.splitext(rel)[0].replace(os.sep, "__")].append(p)
+        names = {}
+        for candidate, members in groups.items():
+            if len(members) == 1 and "__" not in candidate:
+                names[members[0]] = candidate
+                continue
+            for p in members:
+                names[p] = f"{candidate}_{hashlib.sha256(rels[p].encode('utf-8')).hexdigest()[:16]}"
+        _DOC_NAME_CACHE.clear()   # 表很小；只留最近一次（换 DATA_DIR/GLOB 时不残留旧映射）
+        _DOC_NAME_CACHE[key] = names
+    return names
 
 
 def _doc_cache_path(source_name):
@@ -1196,15 +1280,26 @@ def build_chunks():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
     paths = _document_paths()
-    fingerprint, config_snapshot = _chunking_config_fingerprint()
+    config_fp, config_snapshot = _chunking_config_fingerprint()
     sources_now = _sources_fingerprint(paths)
-    names_now = {_document_name(p) for p in paths}
-    log(f"找到 {len(paths)} 个文档: {', '.join(os.path.basename(p) for p in paths)}")
+    # ★ 存盘指纹 = 配置指纹 + 源文本 sha（见 _chunking_fingerprint）。旧写法只把配置算进
+    #   fingerprint，源文件 sha 单独躺在 meta['sources'] 里：改了语料只跑 process 不跑 index
+    #   时，索引 payload 里的 chunk_fingerprint 与"当前"仍然相等，serve 侧闸门恒等放行
+    #   → 用户静默拿到旧知识库（只有 stages 能发现）。
+    fingerprint = _chunking_fingerprint(sources_now, config_fp)
+    name_of = _document_names(paths)
+    names_now = set(name_of.values())
+    if paths:
+        log(f"找到 {len(paths)} 个文档: {', '.join(os.path.basename(p) for p in paths)}")
+    else:
+        # 目录存在、通配符一个都没命中 = 语料被清空（合法边界，见 _document_paths）：
+        # 按 0 文档结算，写出空的 chunks.json + 空 sources，知识库才有"清空"这条路。
+        log(f"⚠️  {DATA_DIR} 中没有匹配 {DOC_GLOB!r} 的文档：按空语料结算（chunks.json 写成 0 条）")
     all_chunks = []
     reused = 0
     failures: list = []
     for i, filepath in enumerate(paths):
-        source_name = _document_name(filepath)
+        source_name = name_of[filepath]
         # 逐文档兜底：单篇坏数据/异常不再拖垮整个 process。失败的只跳过自己、
         # 其余照算；末尾因 failures 短路返回，不覆盖 chunks.json —— 残缺产物一旦
         # 入库，索引就会静默少文档。语料/指纹变化仍会让 stages A 报 stale，不会假新鲜。
@@ -1296,18 +1391,20 @@ def verify_chunks_freshness():
         meta = json.load(f)
     if meta.get("meta_version") != CHUNKS_META_VERSION:
         raise RuntimeError(f"{CHUNKS_META_JSON} 的 meta_version={meta.get('meta_version')}，当前代码是 {CHUNKS_META_VERSION}，请重跑 process")
-    fingerprint, config_snapshot = _chunking_config_fingerprint()
-    if meta.get("fingerprint") != fingerprint:
-        diff = { k: (meta.get("chunking_config", {}).get(k), v) for k, v in config_snapshot.items() if meta.get("chunking_config", {}).get(k) != v }
-        raise RuntimeError(f"分块产物配置指纹 {meta.get('fingerprint')} 与当前 {fingerprint} 不一致，差异（旧→新）: {diff}，请重跑 process")
+    config_fp, config_snapshot = _chunking_config_fingerprint()
     paths = _document_paths()
     sources_now = _sources_fingerprint(paths)
+    # 与 build_chunks **同一个函数**算存盘指纹：配置 + 源文本一起进哈希，两侧不可能分叉。
+    fingerprint = _chunking_fingerprint(sources_now, config_fp)
     old_sources = meta.get("sources") if "sources" in meta else meta.get("books")
-    if old_sources != sources_now:
-        changed = sorted( set(old_sources or {}) ^ set(sources_now) ) or [
-            k for k in sources_now if (old_sources or {}).get(k) != sources_now[k]
-        ]
-        raise RuntimeError(f"{DATA_DIR}/ 中匹配 {DOC_GLOB!r} 的文档在分块之后发生了变化: {changed}，请重跑 process")
+    if meta.get("fingerprint") != fingerprint:
+        if old_sources != sources_now:
+            changed = sorted( set(old_sources or {}) ^ set(sources_now) ) or [
+                k for k in sources_now if (old_sources or {}).get(k) != sources_now[k]
+            ]
+            raise RuntimeError(f"{DATA_DIR}/ 中匹配 {DOC_GLOB!r} 的文档在分块之后发生了变化: {changed}，请重跑 process")
+        diff = { k: (meta.get("chunking_config", {}).get(k), v) for k, v in config_snapshot.items() if meta.get("chunking_config", {}).get(k) != v }
+        raise RuntimeError(f"分块产物的切分指纹 {meta.get('fingerprint')} 与当前 {fingerprint} 不一致，配置差异（旧→新）: {diff}，请重跑 process")
     return meta
 
 
@@ -1465,27 +1562,66 @@ def _distinct_lexicon_ids(client, collection, page_size=1000):
     return sorted(seen.items(), key=lambda kv: str(kv[0]))
 
 
-def lexicon_fingerprint():
-    """词表与稀疏编码器指纹；任一变 → 只需 sparse，不牵连稠密与分块。"""
+def qdrant_server_version(client=None):
+    """Qdrant 服务端版本；取不到就**抛错**（不让调用方拿到一个可能恒等的常量）。
+
+    真正的稀疏编码器在服务端：BM25 的分词器、停用词表、IDF 都由它实现。升级 Qdrant
+    就可能换词空间，而词表指纹是稀疏侧唯一的 fail-closed 判据 —— 版本不进指纹时，
+    升级后 stages 照报 C 阶段新鲜，稀疏向量静默错配（失效原型：静默）。
+    """
+    created = client is None
+    if created:
+        from qdrant_client import QdrantClient
+        client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+    try:
+        info = client.info()
+    finally:
+        if created:
+            try:
+                client.close()
+            except Exception:
+                pass
+    version = getattr(info, "version", None)
+    if not version:
+        raise RuntimeError(
+            "无法从 Qdrant 读取服务端版本（info().version 为空）：稀疏编码器在服务端，"
+            "版本未知则词表指纹无从判断（Qdrant 不可达时请先把它起起来）"
+        )
+    return str(version)
+
+
+def lexicon_fingerprint(client=None):
+    """词表与稀疏编码器指纹；任一变 → 只需 sparse，不牵连稠密与分块。
+
+    ★ 只哈希**真正参与运行期归一**的文件（ALIASES_FILE，load_lexicon 会读它）。
+      lexicon/stopwords.txt 运行期从不被使用 —— 停用词走 Qdrant 内置 chinese 表
+      （见 bm25_options），RAG_STOPWORDS_FILE 只服务于 python chatbot.py lexicon 自检。
+      旧写法无条件把它哈希进指纹：改这个文件检索行为一点不变，却会让闸门报"词表与索引
+      不一致"、拦住全部检索并强制跑一次 sparse（失效原型：判据与实现不同源）。
+      若将来把该文件真正下发到 bm25_options()["stopwords"]，必须把它（的内容）重新纳入
+      指纹，否则改停用词不动指纹 = 稀疏词空间静默错配。
+    """
     parts = []
-    for path in (ALIASES_FILE, STOPWORDS_FILE):
-        try:
-            with open(path, "rb") as f:
-                parts.append(hashlib.sha256(f.read()).hexdigest())
-        except OSError:
-            parts.append("missing")
+    try:
+        with open(ALIASES_FILE, "rb") as f:
+            parts.append(hashlib.sha256(f.read()).hexdigest())
+    except OSError:
+        parts.append("missing")
     # 显式加入解析后的运行时配置值，防止环境变量变更但文件内容相同时指纹不变
     parts.append(f"ALIASES_FILE={ALIASES_FILE}")
-    parts.append(f"STOPWORDS_FILE={STOPWORDS_FILE}")
     parts.append(f"aliases={int(ALIASES_ENABLED)},stopwords={int(STOPWORDS_ENABLED)}")
     # 分词/停用词已交给 Qdrant（bm25_options 的 tokenizer 与 stopwords 就是词空间的定义），
     # 故不再有 jieba 版本项与标点集项；选项本身仍必须进指纹（改 tokenizer 就是改词空间）。
     parts.append("bm25=" + json.dumps(bm25_options(), sort_keys=True))
+    # Qdrant 服务端版本：稀疏编码器在服务端，升级它就可能换词空间（见 qdrant_server_version）。
+    parts.append("qdrant_server=" + qdrant_server_version(client))
     # BM25 模型名与解析/归一链路源码同样决定稀疏词空间：漏掉会让换编码后指纹不变、
     # stages 误报 C 新鲜，稀疏索引静默错配。
     parts.append("bm25_model=" + BM25_MODEL_NAME)
     import inspect
-    for name in ("parse_aliases", "parse_stopwords", "_read_aliases", "_read_stopwords", "load_lexicon", "normalize_aliases", "sparse_text", "sparse_encode"):
+    # parse_stopwords/_read_stopwords 不在列表里：它们的产物只进 lexicon 自检，
+    # 不影响稀疏词空间（同"与实现同源"的理由）。
+    for name in ("parse_aliases", "_read_aliases", "load_lexicon", "normalize_aliases", "sparse_text", "sparse_encode"):
         fn = globals().get(name)
         try:
             parts.append(f"{name}:" + inspect.getsource(fn))  # type: ignore[arg-type]
@@ -1603,39 +1739,59 @@ def _embed_code_fingerprint():
     return _EMBED_CODE_FINGERPRINT
 
 
+# 模型目录不可用时的哨兵：表示"**无从判断**"，而不是某个哈希值。它进切分指纹后必然与
+# 任何真实产物都不相等（fail-closed），并由 _chunking_config_fingerprint 单独报"嵌入模型
+# 目录缺失"，而不是报"重跑 process+index" —— 那条路正需要这个目录（归因不能指反）。
+_MODEL_CONTENT_UNKNOWN = "unknown"
+_MODEL_FULL_HASH_MAX = 4 * 1024 * 1024   # 小文件（config/tokenizer/池化头/词表）全量哈希
+_MODEL_HEAD_BYTES = 4096
+_MODEL_TAIL_BYTES = 65536
+
+
 def _model_content_fingerprint():
-    """嵌入模型目录内容指纹（相对路径 + 大小 + 文件头哈希）。
+    """嵌入模型目录内容指纹（相对路径 + 大小 + 内容特征）。
 
     原实现用 mtime_ns：容器启动时下载模型会更新 mtime，导致切分指纹漂移，
-    进而触发「分块产物与索引不一致」闸门。改用内容特征（大小 + 文件头哈希），
-    同一份模型内容不变即指纹不变，容器重建/重新下载不再漂移。
+    进而触发「分块产物与索引不一致」闸门。改用内容特征，同一份模型内容不变即指纹不变，
+    容器重建/重新下载不再漂移。
 
-    同时**跳过隐藏文件/目录**（如 HF 的 `.cache/` 下载记账、`.part` 暂存）：这些是
-    下载器的元数据（含下载时间戳），与模型内容无关；容器走 curl 直下、宿主走 HF
-    下载，`.cache` 的有无会让指纹凭空分叉。清单文件（config/tokenizer/权重）才是内容身份。
+    · **跳过隐藏文件/目录**（HF 的下载记账目录、.part 暂存）：下载器元数据与模型内容
+      无关，有无会让指纹凭空分叉。清单文件（config/tokenizer/权重）才是内容身份。
+    · **目录不可用返回哨兵**（不存在/为空）：旧实现 except OSError 后对空列表求哈希，
+      静默返回常量 e3b0c44298fc —— "模型目录没了"因此看起来像一个正常指纹，一路走到
+      "请重跑 process+index"，而那条路正需要这个目录（失效原型：静默 + 归因错）。
+    · **小文件全量、大文件头 + 尾**：旧实现只读每个文件前 4096 字节，同大小、4KB 之后
+      的改动（换权重、截断、同尺寸不同版本）完全检测不到，指纹不变 → 稠密缓存与分块
+      指纹被静默复用。
     """
+    if not _model_dir_ready(EMBED_MODEL_PATH):
+        return _MODEL_CONTENT_UNKNOWN
     parts = []
-    try:
-        for root, dirs, files in os.walk(EMBED_MODEL_PATH):
-            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
-            for fn in sorted(files):
-                if fn.startswith("."):
-                    continue
-                path = os.path.join(root, fn)
-                rel = os.path.relpath(path, EMBED_MODEL_PATH)
-                try:
-                    st = os.stat(path)
-                    # 只读文件头算哈希，避免全量读大文件（权重文件可达 GB 级但头部足够区分版本）；
-                    # 不读字节则同路径同大小换权重会被静默复用。
-                    h = hashlib.sha256()
-                    with open(path, "rb") as f:
-                        h.update(f.read(4096))
-                    head = h.hexdigest()[:8]
-                    parts.append(f"{rel}:{st.st_size}:{head}")
-                except OSError:
-                    parts.append(f"{rel}:missing")
-    except OSError:
-        pass
+    for root, dirs, files in os.walk(EMBED_MODEL_PATH):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for fn in sorted(files):
+            if fn.startswith("."):
+                continue
+            path = os.path.join(root, fn)
+            rel = os.path.relpath(path, EMBED_MODEL_PATH)
+            try:
+                st = os.stat(path)
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    if st.st_size <= _MODEL_FULL_HASH_MAX:
+                        h.update(f.read())          # 小文件全量：一个字节都不放过
+                    else:
+                        h.update(f.read(_MODEL_HEAD_BYTES))
+                        if st.st_size > _MODEL_TAIL_BYTES:
+                            f.seek(st.st_size - _MODEL_TAIL_BYTES)
+                            h.update(f.read(_MODEL_TAIL_BYTES))
+                        # 长度也入哈希：头尾恰好相同、只有中段长度不同也能区分
+                        h.update(str(st.st_size).encode("ascii"))
+                parts.append(f"{rel}:{st.st_size}:{h.hexdigest()[:8]}")
+            except OSError:
+                parts.append(f"{rel}:missing")
+    if not parts:
+        return _MODEL_CONTENT_UNKNOWN
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
@@ -1758,30 +1914,47 @@ def _gc_embed_cache_tmp():
 
 # ── 索引构建 ──
 # qdrant-client 的本地推理器是**每客户端一份、且内部没有锁**的：
-# qdrant_client/embed/model_embedder.py 用 self._embed_storage[model_name] 暂存待发向量，
+# qdrant_client/embed/model_embedder.py 用 self._embed_storage[model_name] 暂存待发 Document，
 # 同一客户端上两个线程同时走同名 Document 就会互相 drain，实测
 # IndexError: pop from empty list（另一批表现为 422 "dense vector must not be empty"）。
-# 触发点是任何带 Document 的请求：并发写批（index）与双通道检索的稀疏分支（query_points）。
-# 故所有会走到本地推理的写调用在此串行化 —— 推理本身是毫秒级 CPU，瓶颈在 HTTP。
-# 这条锁只串行化**调用**，不改变"稠密与稀疏取同一份 _index_text"这条不变量。
+# 触发点是任何带 Document 的请求。
+# 这里只解决"多个线程共用同一个 client"的场景（检索侧双通道的稀疏分支，见
+# dual_channel_recall._sparse）；写批走 per-worker client（每个线程一份推理器），
+# 因此**不**在这把锁里 —— 否则 HTTP 往返会被串行化，4 路写批退化成 1 路。
 _QDRANT_INFERENCE_LOCK = threading.Lock()
 
 
 def _upsert_batch_with_retry(client: Any, collection_name: str, points: list, retries: int = 1) -> str | None:
     """单批 upsert：瞬时故障立即重试 retries 次；仍失败返回错误串，由调用方记账后继续写其余批。
     继续写只为更快暴露完整失败面 —— 末尾 write_failures 非空一律 raise、不切别名，旧集合继续服务。
-    重试不睡眠：写批已并发发出，等待只会占住 worker 槽；瞬时故障立即重发反而更快。"""
+    重试不睡眠：写批已并发发出，等待只会占住 worker 槽；瞬时故障立即重发反而更快。
+
+    **不持 _QDRANT_INFERENCE_LOCK**：调用方（build_index 的写批）给每个 worker 线程一个
+    自己的 client，Document 的本地拆包天然不会跨线程；在这里持锁会把 HTTP 往返也串行化，
+    4 路写批退化成 1 路（注释宣称的并发不存在）。持锁版留给共用同一 client 的调用点。"""
     last: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            with _QDRANT_INFERENCE_LOCK:
-                client.upsert(collection_name=collection_name, points=points)
+            client.upsert(collection_name=collection_name, points=points)
             return None
         except Exception as exc:
             last = exc
             if attempt < retries:
                 log(f"    ⚠️  upsert 失败，立即重试（{attempt + 1}/{retries}）: {type(exc).__name__}: {exc}")
     return f"{type(last).__name__}: {last}"
+
+
+def _current_alias_target(client, alias=COLLECTION_ALIAS):
+    """别名当前**实际**指向的集合；读不到返回 None。
+
+    失败路径的文案与恢复动作都以此为准：旧写法在 catch 里凭空断言"检索端仍指向旧集合"，
+    而 DeleteAlias 成功、CreateAlias 失败时别名其实已经被删空 —— 报错把排查方向指反。
+    """
+    try:
+        return next((a.collection_name for a in client.get_aliases().aliases if a.alias_name == alias), None)
+    except Exception as exc:
+        log(f"    ⚠️  读取别名 {alias} 失败，无法判定其实际指向: {type(exc).__name__}: {exc}")
+        return None
 
 
 def build_index():
@@ -1909,7 +2082,10 @@ def build_index():
         # 命中且无冗余时整份重写是纯浪费：np.savez 在峰值里再摊一份 zip 缓冲，
         # 磁盘上 73MB 也原地重写一遍。判据要两条一起看才严 —— missing==0 保证每个
         # key 都在缓存里，条数相等才排除"缓存里残留已删文档的旧条目"（那种仍需重写清理）。
-        if missing or cache_entries != len(keys):
+        # ★ 两侧口径必须都去重：cache 是 dict（键天然唯一），keys 是逐块列表 —— 只要两条
+        #   分块正文逐字相同（重复段落/重复标题很常见），len(keys) 就恒大于 len(cache)，
+        #   判据恒真，index 每次都整份重写 npz（判据恒真式浪费，日志却写"全部命中"）。
+        if missing or cache_entries != len(set(keys)):
             _save_embed_cache(cache_path, keys, matrix)
             log(f"向量缓存已更新: {cache_path}（重算 {len(missing)} 条）")
         else:
@@ -1925,7 +2101,8 @@ def build_index():
         except Exception as exc:
             log(f"    ⚠️  Qdrant 不支持集合别名，回退为 delete+create 全量重建: {exc}")
             alias_ok = False
-    old_collection = None
+    # 旧集合名不再在这里占位：别名分支用 prev_alias_target（本轮之前的目标），
+    # 非别名分支的目标集合就是 COLLECTION_NAME 本身。
     target_collection = f"{COLLECTION_NAME}__{build_id[:8]}" if alias_ok else COLLECTION_NAME
     if not alias_ok:
         try:
@@ -1943,18 +2120,40 @@ def build_index():
     batch_starts = list(range(0, total, WRITE_BATCH))
     batch_sizes = {i: min(i + WRITE_BATCH, total) - i for i in batch_starts}
 
+    # 线程本地客户端：ModelEmbedder 每客户端一份，per-worker 客户端 = per-worker 推理器，
+    # 于是本地推理不需要跨线程互斥（见上方注释）。只用公开 API，不碰 qdrant-client 私有成员；
+    # 客户端随 worker 线程存活到本次 index 结束（进程退出即回收）。
+    _worker_state = threading.local()
+
+    def _worker_client():
+        c = getattr(_worker_state, "client", None)
+        if c is None:
+            c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+            _worker_state.client = c
+        return c
+
     def _write_batch(i):
-        batch_chunks = all_chunks[i:i + WRITE_BATCH]
-        batch_embeddings = embeddings[i:i + WRITE_BATCH]
-        points = []
-        for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
-            # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
-            points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))  # type: ignore[union-attr]
-        return i, _upsert_batch_with_retry(client, target_collection, points)
+        # 批次内任何异常（点构造 / 稀疏 Document 拆包 / MemoryError / KeyboardInterrupt…）
+        # 都必须转成错误串交回调用方：从 fut.result() 抛出会**跳过整段 write_failures 收尾**
+        # （不删孤儿集合、不报"谁在服务"、连集合名都不留 —— 失效原型：自崩）。
+        try:
+            batch_chunks = all_chunks[i:i + WRITE_BATCH]
+            batch_embeddings = embeddings[i:i + WRITE_BATCH]
+            points = []
+            for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
+                # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
+                points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))  # type: ignore[union-attr]
+            return i, _upsert_batch_with_retry(_worker_client(), target_collection, points)
+        except BaseException as exc:  # noqa: BLE001 - 见上：必须转成错误串，不能越过收尾
+            return i, f"{type(exc).__name__}: {exc}"
 
     # 各批彼此独立（point id 由 batch 起始下标决定，与写入先后无关），故并发发往 Qdrant：
-    # 墙钟 ≈ 批次往返 × 批数 ÷ 并发度，而非逐批之和；稀疏编码在各 worker 内并发（分词在
-    # 服务端，本地没有共享可变状态，故不再需要"并发前串行预热 jieba 词典"那一步）。
+    # 墙钟 ≈ 批次往返 × 批数 ÷ 并发度，而非逐批之和。**每 worker 一个客户端**是这里的
+    # 并发前提：qdrant-client 的 ModelEmbedder（Document 的本地拆包器）是每客户端一份且
+    # 内部无锁的，共用一份客户端时多线程会互相 drain _embed_storage（IndexError / 422），
+    # 旧修法用一把模块锁把整次 upsert（含 HTTP 往返）串行化 —— 4 路写批于是退化成 1 路，
+    # 与"并发发往 Qdrant"这句注释相反。分开客户端后每份推理器只被自己的线程使用，
+    # 本地推理天然串行，HTTP 往返真正并发。
     # 并发度封顶 4，控制"同时驻留的 points（每批最多 1000 条稠密向量）"的峰值内存。
     max_workers = max(1, min(4, len(batch_starts)))
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1996,16 +2195,30 @@ def build_index():
             f"失败示例 {write_failures[0][1]}{orphan_hint}。网络/Qdrant 恢复后重跑 index（稠密走缓存增量）。"
         )
     info = client.get_collection(collection_name=target_collection)
-    # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages 事后发现：
-    # 非别名路径下 delete_collection 被 except: pass 吞掉时，旧集合点数多于本次 total
-    # 会留下 id >= total 的残留点（写入只覆盖 0..total-1），而它们永远不会被检索命中。
+    # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages 事后发现。
+    # 非别名路径下旧集合若没删掉（delete_collection 失败/集合不存在时报错被吞），写入只覆盖
+    # id 0..total-1，旧点会以 id >= total 残留。**它们不是"检索不到"**：检索是做向量搜索、
+    # 没有任何 id 过滤，残留点会被正常召回并返回陈旧正文（旧文案把方向说反了）。
+    # 所以这里不是报错了事，而是**按实现清理**：先删 id >= total 的残留点，再复核点数。
     written = client.count(collection_name=target_collection, exact=True).count
     log(f"  Qdrant 写入完成: {written} 条")
     if written != total:
+        residual = []
+        offset = None
+        while True:
+            pts, offset = client.scroll( collection_name=target_collection, limit=WRITE_BATCH, offset=offset, with_payload=False, with_vectors=False )
+            residual.extend(p.id for p in pts if isinstance(p.id, int) and p.id >= total)
+            if offset is None:
+                break
+        if residual:
+            client.delete(collection_name=target_collection, points_selector=residual)
+            written = client.count(collection_name=target_collection, exact=True).count
+            log(f"  已清理 {len(residual)} 个 id >= {total} 的残留点（旧集合未删净），复核点数: {written}")
+    if written != total:
         raise RuntimeError(
             f"集合 {target_collection} 点数 {written} != 分块记录数 {total}："
-            "非别名模式下旧集合可能未被删净（残留 id 检索不到）；"
-            "请删掉该集合后重跑 index，或启用 RAG_USE_COLLECTION_ALIAS"
+            "残留点（id >= 分块记录数）会被检索正常召回并返回陈旧正文（检索不做 id 过滤）；"
+            "清理后仍不一致，请删掉该集合后重跑 index，或启用 RAG_USE_COLLECTION_ALIAS"
         )
     coll_dense_size = next(iter(info.config.params.vectors.values())).size  # type: ignore[union-attr]
     # 显式 raise 而非 assert（-O 会剥离 assert，维度错配就静默放行了）
@@ -2016,16 +2229,26 @@ def build_index():
     if alias_ok:
         # 别名切换存在竞态窗口：get_aliases 到 update_collection_aliases 间其他进程可能修改别名。
         # 采用重试 + 验证策略：只重试一次（共 2 次尝试），每次切换后验证别名确实指向新集合。
+        # 但 DeleteAlias + CreateAlias 是**两个非事务操作**：Delete 成功而 Create 失败（重试
+        # 耗尽）会把别名删空 —— 检索端下一个请求全线挂，而旧文案写的是"检索端仍指向旧集合"，
+        # 方向正好相反（失效原型：状态 + 报错指错方向）。故：①失败分支按"本轮之前的目标"
+        # 先发一次恢复性 CreateAlias（失败仅告警）；②文案按 client.get_aliases() 的**实际**
+        # 结果组织；③成功路径用"本轮之前的目标"删旧集合 —— 重试后循环内变量可能已变成
+        # 本次的 target（切成功但读回旧缓存），那时真正的旧集合就永远不会被删。
+        prev_alias_target = None   # 本轮之前别名指向的集合，只在第一次尝试前读一次
+        switched = False
         max_retries = 2
         for attempt in range(max_retries):
             try:
-                old_collection = next(
+                current_target = next(
                     (a.collection_name for a in client.get_aliases().aliases if a.alias_name == COLLECTION_ALIAS),
                     None,
                 )
+                if attempt == 0:
+                    prev_alias_target = current_target
                 # 空别名冷启动不能对不存在的 alias 提交 Delete（部分 Qdrant 版本整批失败）；有旧别名才删，Create 恒提交。
                 ops: list = []
-                if old_collection is not None:
+                if current_target is not None:
                     ops.append(DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION_ALIAS)))
                 ops.append(CreateAliasOperation(create_alias=CreateAlias(collection_name=target_collection, alias_name=COLLECTION_ALIAS)))
                 client.update_collection_aliases(change_aliases_operations=ops)
@@ -2033,22 +2256,34 @@ def build_index():
                 aliases_after = client.get_aliases().aliases
                 new_target = next((a.collection_name for a in aliases_after if a.alias_name == COLLECTION_ALIAS), None)
                 if new_target == target_collection:
-                    log(f"  别名已切换: {COLLECTION_ALIAS} → {target_collection}" + (f"（原 {old_collection}）" if old_collection else "（冷启动，无旧别名）"))
+                    switched = True
+                    log(f"  别名已切换: {COLLECTION_ALIAS} → {target_collection}" + (f"（原 {prev_alias_target}）" if prev_alias_target else "（冷启动，无旧别名）"))
                     break
-                else:
-                    log(f"  ⚠️  别名切换验证失败（尝试 {attempt + 1}/{max_retries}）：别名指向 {new_target}，期望 {target_collection}")
-                    if attempt == max_retries - 1:
-                        raise RuntimeError(f"别名切换失败：尝试 {max_retries} 次后别名仍指向 {new_target}，期望 {target_collection}")
+                log(f"  ⚠️  别名切换验证失败（尝试 {attempt + 1}/{max_retries}）：别名指向 {new_target}，期望 {target_collection}")
             except Exception as exc:
                 log(f"  ⚠️  别名切换异常（尝试 {attempt + 1}/{max_retries}）：{exc}")
-                if attempt == max_retries - 1:
-                    raise RuntimeError(f"别名切换失败：新集合 {target_collection} 已建好但检索端仍指向旧集合，请检查 Qdrant 别名支持: {exc}") from exc
-        if old_collection and old_collection != target_collection:
+        if not switched:
+            actual = _current_alias_target(client)
+            if actual is None and prev_alias_target:
+                # 别名此刻可能是被本轮 DeleteAlias 删掉的：先把它指回旧集合，别让检索裸奔。
+                try:
+                    client.update_collection_aliases(change_aliases_operations=[CreateAliasOperation(create_alias=CreateAlias(collection_name=prev_alias_target, alias_name=COLLECTION_ALIAS))])
+                    actual = prev_alias_target
+                    log(f"  ♻️  别名已恢复到 {prev_alias_target}（本轮切换失败，先保证检索端有可用集合）")
+                except Exception as exc:
+                    log(f"  ⚠️  恢复别名到 {prev_alias_target} 失败: {type(exc).__name__}: {exc}")
+                    actual = _current_alias_target(client)
+            raise RuntimeError(
+                f"别名切换失败：新集合 {target_collection} 已建好；别名 {COLLECTION_ALIAS} 实际指向 "
+                f"{actual if actual else '（不存在 —— 检索端当前不可用，需人工恢复）'}。"
+                f"修好后重跑 index（稠密走缓存增量），或直接用 Qdrant 别名 API 指回可用集合。"
+            )
+        if prev_alias_target and prev_alias_target != target_collection:
             try:
-                client.delete_collection(collection_name=old_collection)
-                log(f"  旧集合已清理: {old_collection}")
+                client.delete_collection(collection_name=prev_alias_target)
+                log(f"  旧集合已清理: {prev_alias_target}")
             except Exception as exc:
-                log(f"    ⚠️  旧集合 {old_collection} 删除失败（仅占磁盘，检索不受影响）: {exc}")
+                log(f"    ⚠️  旧集合 {prev_alias_target} 删除失败（仅占磁盘，检索不受影响）: {exc}")
         try:
             stragglers = [ x.name for x in client.get_collections().collections if x.name != target_collection and x.name.split("__")[0] == COLLECTION_NAME ]
         except Exception:
@@ -2267,7 +2502,9 @@ CONTEXT_ROLE = env_choice("RAG_CONTEXT_ROLE", "user", ("user", "system"))  # 见
 RAG_USE_CONTEXT = env_bool("RAG_USE_CONTEXT", True)
 
 
-GEN_INPUT_RESERVE = env_int("RAG_INPUT_RESERVE", 256)
+# 下限 0：负值会让输入上界 I = NUM_CTX - RESERVE **超过真实窗口**（下面的交叉校验只拦
+# I ≤ 0，拦不住"上界比窗口还大"），装配于是把超长 prompt 发出去，由服务端移位悄悄丢前文。
+GEN_INPUT_RESERVE = env_int_min("RAG_INPUT_RESERVE", 256, 0)
 # 交叉校验（启动即报错）：输入上界 I = NUM_CTX - RESERVE。I ≤ 0 时装配会把提问截成
 # 空串，最后一条 user 消息内容为空 —— 模型收到空提问，而启动时没有任何人报错。
 if NUM_CTX <= GEN_INPUT_RESERVE:
@@ -2605,9 +2842,14 @@ class RAGEngine:
     def collection_name(self):
         return self._collection_name
     def _get_client(self):
-        from qdrant_client import QdrantClient
+        # 本类唯一没加锁的懒加载单例（检查与赋值之间是双建窗口）：两个线程各建一个
+        # QdrantClient，各自带一份连接池与**一份本地推理器**（ModelEmbedder 是每客户端
+        # 一份、内部无锁），稀疏 Document 推理会跨实例错配。与另两个单例同款双检。
         if self._client is None:
-            self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT, )
+            with self._model_init_lock:
+                if self._client is None:
+                    from qdrant_client import QdrantClient
+                    self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT, )
         return self._client
     def _resolve_collection(self):
         self._collection_name = resolve_collection_name(self._get_client())
@@ -2618,12 +2860,26 @@ class RAGEngine:
         if not client.collection_exists(self._collection_name):
             return 0
         return client.count(collection_name=self._collection_name).count
+    def _await_weights_outside_lock(self, path):
+        """把「等待权重就绪」（最长 RAG_MODEL_WAIT_SECS=900s）挪出 _model_init_lock。
+
+        持初始化锁等后台下载，会让**所有**并发回合整轮阻塞在一把只该保护"是否已加载"
+        的锁上（预热线程持锁等待时，首查询线程也一起等满 900s）。这里只做前置等待，
+        目录最终不可用时仍由锁内的 _require_model_dir 报同一条具名错误（错误文案单点）。
+        **模型加载本身必须留在锁内**：那是"同一模型两份驻留"的唯一防线，不能为并发让步。
+        """
+        if not WEIGHTS_BACKGROUND or MODEL_WAIT_SECS <= 0 or _model_dir_ready(path):
+            return
+        _wait_for_weights(path)
+
     def _get_embed(self):
+        self._await_weights_outside_lock(EMBED_MODEL_PATH)
         with self._model_init_lock:
             if self._embed is None:
                 self._embed = load_embedding_model()
             return self._embed
     def _get_rerank(self):
+        self._await_weights_outside_lock(RERANK_MODEL_PATH)
         with self._model_init_lock:
             if self._rerank is None:
                 self._rerank = load_reranker_model()
@@ -2645,11 +2901,18 @@ class RAGEngine:
         """
         if EMBED_BACKEND == "http" and RERANK_BACKEND == "http":
             return False
-        with self._model_init_lock:
-            if self._embed is None and self._rerank is None:
-                return False
-            self._embed = None
-            self._rerank = None
+        # 必须与**在途前向**互斥：旧写法只取 _model_init_lock 就把引用置 None，而查询
+        # 线程是"先取模型 → 再进推理锁"的两段式 —— 前向可能正拿着刚被清掉的那份跑：
+        # ①释放无效（对象仍被引用，内存不会还，日志却报"已释放"）②另一线程随即重载同一
+        # 模型 = 同模型双份驻留，8G 档"峰值 = max(检索, 生成) 而非两者之和"的前提被打穿。
+        # 先取推理锁（等在途前向结束）再取 init 锁清引用；两把锁的获取顺序在本类里
+        # 只有这一种（init → infer 的路径不存在），不会死锁。
+        with self._model_infer_lock:
+            with self._model_init_lock:
+                if self._embed is None and self._rerank is None:
+                    return False
+                self._embed = None
+                self._rerank = None
         import gc
         gc.collect()
         # ★ CPU 上"释放"必须显式把空闲堆还给 OS：torch/glibc 默认只把内存退回自己的分配器，
@@ -2750,7 +3013,11 @@ class RAGEngine:
                 "可能在服务过期分块，请运行 `python chatbot.py index` 重建后再检索。"
             )
         try:
-            current, _ = _chunking_config_fingerprint()
+            # 与 build_chunks / verify_chunks_freshness 用**同一个**函数：配置 + 源文本 sha。
+            # 只算配置时，"改语料 + 只跑 process"会让索引里的旧指纹与"当前"仍然相等，
+            # 闸门恒等放行 —— 用户静默吃到旧知识库（失效原型：静默 + 判据恒真）。
+            paths = _document_paths()
+            current = _chunking_fingerprint(_sources_fingerprint(paths))
         except Exception as exc:
             log(f"⚠️  无法计算当前切分指纹，暂缓分块新鲜度检查: {type(exc).__name__}: {exc}")
             return
@@ -2771,7 +3038,7 @@ class RAGEngine:
                 "请运行 `python chatbot.py sparse` 重建后再检索。"
             )
         try:
-            current = lexicon_fingerprint()
+            current = lexicon_fingerprint(self._get_client())
         except Exception as exc:
             log(f"⚠️  无法计算当前词表指纹，暂缓词表一致性检查: {type(exc).__name__}: {exc}")
             return
@@ -2884,6 +3151,11 @@ class RAGEngine:
                 # （MPS 上争抢命令缓冲，正是 AGENTS 点名的"永久阻塞"级风险）。先取模型再进锁，
                 # 避免与 _get_embed 内部的同一把锁重入死锁。
                 with self._inference_lock():
+                    # 取到推理锁后复核手里这份仍是当前引用：release_models 会在
+                    # "已取模型、未进锁"的窗口里清引用（见 release_models），不复核就会拿
+                    # 一个内存已交还给系统的对象跑前向，随后再加载第二份。
+                    if self._embed is None or self._embed[1] is not model:
+                        tokenizer, model, device = self._get_embed()
                     # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
                     q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
                 dense_query = q_emb[0].tolist()
@@ -2956,6 +3228,11 @@ class RAGEngine:
         else:
             rr_tok, rr_model, rr_dev = self._get_rerank()
             with self._inference_lock():
+                # 复核：release_models 可能在"已取模型、未进锁"的窗口里把引用清掉，此刻
+                # 手里这份已是孤儿对象（内存正在回收）—— 继续用 = 释放无效 + 随后重载出
+                # 第二份同模型（双份驻留）。取到推理锁后按当前引用核对，不一致就重取。
+                if self._rerank is None or self._rerank[1] is not rr_model:
+                    rr_tok, rr_model, rr_dev = self._get_rerank()
                 reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
         if steps is not None:
             rr_query_tokens = len(rr_tok.encode(query)) if rr_tok is not None else None
@@ -3046,7 +3323,11 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     started = time.time()
     # 单例（RAG_EXCLUSIVE_MODELS=1）：检索前先确认生成模型已卸，峰值才是 max(检索, 生成)
     # 而不是两者之和。非单例下是空操作，行为与改造前逐字节一致。
-    ensure_generation_unloaded()
+    # 返回值必须消费：False = 卸载确认没做成（/api/ps 读不到，或超时仍未卸出），本轮
+    # 检索与生成模型会同时驻留、峰值超限。既有取舍是**不阻断**本轮，所以只记日志；
+    # 旧写法直接丢掉返回值，这条告警在调用链上无处可查（失效原型：静默）。
+    if not ensure_generation_unloaded():
+        log("⚠️  单例：本轮未能确认生成模型已卸出，检索与生成模型可能同时驻留，内存峰值可能超限（不阻断本轮）")
     results = engine.hybrid_search(query, top_k=top_k, source=source)
     confidence = results_confidence(results)
     elapsed = time.time() - started
@@ -3416,19 +3697,18 @@ def get_engine():
 
 
 
-# 来源字段名可配置，兼容旧索引的 book / source 写法。
-SOURCE_PAYLOAD_FIELDS = tuple(dict.fromkeys((SOURCE_FIELD, "source", "book")))
-
-
 # ── 工具：分块 A/B 比较 ──
 DEFAULT_B = CHUNKS_JSON
-# 字段名以产物实际结构为准；source 是来源字段，旧产物里叫 book，按 source 归一比较。
-FIELDS = [ "child_text", "parent_text", "source", "chunk_index", "total_chunks", "contextual_text", "id", "parent_id", "parent_chunk_count", ]
-_LEGACY_CHUNK_FIELDS = {"book"}
+# 比对列**由 _PAYLOAD_SPEC 派生**（不再手写）：来源字段那一项在产物里的键名由
+# RAG_SOURCE_FIELD 决定，比对时统一按规范名 "source" 走 _source_of 读取。
+# 手写清单是"多份字段契约表示"里最容易分叉的一份：少一列时比较器遍历不到它，
+# 两边都缺就一路打"✅ 完全一致"，字段静默消失无人知（check_schema 现在双向校验兜底）。
+FIELDS = [("source" if k == "source" else k) for _f, k, _d in _PAYLOAD_SPEC]
 # 记录里来源字段的键名由 RAG_SOURCE_FIELD 决定（可能不是 "source"），比较器必须一并放行。
-# 差异比对仍按规范名 "source" 走 _source_of，故这里是"合法的记录键"，不是"参与比对的列"。
+# SOURCE_PAYLOAD_FIELDS 是这三键的**唯一定义处**（_source_of / _source_filter 共用）。
+_LEGACY_CHUNK_FIELDS = {"book"}
 _ALLOWED_CHUNK_FIELDS = set(FIELDS) | _LEGACY_CHUNK_FIELDS | {SOURCE_FIELD}
-_SOURCE_ALIASES = {SOURCE_FIELD, "source", "book"}
+_SOURCE_ALIASES = set(SOURCE_PAYLOAD_FIELDS)
 
 
 def load(path):
@@ -3447,6 +3727,12 @@ def show(text, limit=90):
 
 
 def check_schema(a, b, path_a, path_b):
+    """记录字段契约的**双向**校验：多字段（未登记）与少字段都必须报错。
+
+    旧实现只拦"未登记字段"（多），不拦"缺字段"（少）：产物少一列时比较器按 FIELDS
+    逐列取值，两列都缺就都取到 None、一路打「✅ 完全一致」—— 字段静默消失被报成通过
+    （失效原型：判据只覆盖一半）。这里对两个文件各自的键集各查一次。
+    """
     seen = set()
     for rows in (a, b):
         for r in rows:
@@ -3455,6 +3741,20 @@ def check_schema(a, b, path_a, path_b):
     unknown = sorted(seen - _ALLOWED_CHUNK_FIELDS)
     if unknown:
         sys.exit(f"❌ 分块产物出现未登记字段 {unknown}（{path_a} / {path_b}）：比较器只遍历 FIELDS，未登记字段会被静默忽略。请先登记进 FIELDS。")
+    for label, rows in ((path_a, a), (path_b, b)):
+        keys: set = set()
+        for r in rows:
+            if isinstance(r, dict):
+                keys |= set(r)
+        if not keys:
+            continue   # 空文件没有记录可查（总量行已给结论），不当成"缺全部字段"
+        missing = sorted(_RECORD_CORE_FIELDS - keys)
+        if missing or not (keys & set(SOURCE_PAYLOAD_FIELDS)):
+            sys.exit(
+                f"❌ {label} 的分块记录缺字段 {missing}"
+                f"（来源键需是 {sorted(SOURCE_PAYLOAD_FIELDS)} 之一）——"
+                f"比较器按 FIELDS 逐列比对，缺列会被静默当成 None 与空值比较，打出假的「完全一致」。"
+            )
 
 
 def compare_chunks_diff(a, b, allow, path_a, path_b):
@@ -3542,7 +3842,7 @@ def cmd_sparse(args=None):
         return 1
     t0 = time.time()
     done = 0
-    lexicon_id = lexicon_fingerprint()
+    lexicon_id = lexicon_fingerprint(client)
     offset = None
     scroll_failures = 0
     while True:
@@ -3607,16 +3907,18 @@ def load_documents():
     预处理保持一致——两处各写一套读取逻辑，同一文档在两个入口读出两种文本，词表与
     入库正文就描述的不是同一份语料。坏字节转成的 \ufffd 这里剥掉（统计词面无意义）。"""
     docs = []
-    for p in _document_paths():
+    name_of = _document_names(_document_paths())
+    for p in name_of:
         text = read_document_text(p).replace("\ufffd", "")
-        docs.append((_document_name(p), text))
+        docs.append((name_of[p], text))
     return docs
 
 
 def raw_byte_report():
     lines = []
-    for p in _document_paths():
-        name = _document_name(p)
+    _name_of = _document_names(_document_paths())
+    for p in _name_of:
+        name = _name_of[p]
         with open(p, "rb") as fh:
             data = fh.read()
         try:
@@ -4004,7 +4306,7 @@ def cmd_stages(args=None):
             log("  [D] ❌ 集合不存在 -> 需要: python chatbot.py index")
         else:
             qd_count = client.count(collection_name=coll, exact=True).count
-            lex_now = lexicon_fingerprint()
+            lex_now = lexicon_fingerprint(client)
             if qd_count == 0:
                 # 空集合没有点可比：报"旧索引/不一致"会把根因指错（真正的问题是没入库，
                 # D 段已给出 index；词表指纹也随下次 index 一并写入）。
