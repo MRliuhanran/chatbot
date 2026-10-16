@@ -34,12 +34,19 @@ if [ ! -f tools/dotenv.sh ]; then
     exit 1
 fi
 # shellcheck source=tools/dotenv.sh
+if [ ! -f tools/hw_profile.sh ]; then
+    echo "❌ 缺少 tools/hw_profile.sh（硬件适配参数的唯一实现）—— 拒绝在"线程数无依据"的状态下起服务" >&2
+    exit 1
+fi
 . tools/dotenv.sh
+# 顺序不能反：_load_dotenv 先（把 .env 里显式写了的键放进环境），_load_hw_profile 后
+# （派生只填没被显式设过的键）。反过来 .env 会被派生值压掉 —— 静默原型。
 _load_dotenv .env
+. tools/hw_profile.sh
+_load_hw_profile
 
-# .env 里定义的**服务端**四项。此清单与 .env 中那段注释、Dockerfile 末尾的"容器专有"段
-# 一一对应；增删任何一项都要三处同步（这是本仓库"同一知识只留一处"的已知例外：
-# 变量名清单无法从 .env 自动发现，只能显式列出）。
+# 服务端参数清单：前三项是**语义项**（定义行为，与核数无关，来自 .env），
+# 第四项是**硬件项**（随机器而变，由 tools/hw_profile.sh 按 cgroup 派生）。
 _KEYS="OLLAMA_KV_CACHE_TYPE OLLAMA_FLASH_ATTENTION OLLAMA_NUM_PARALLEL OLLAMA_NUM_THREADS"
 
 # 取值不用 eval / 间接展开：bash 3.2 的 ${!name} 在 set -u 下有坑，且显式 case 更好审。
@@ -61,8 +68,12 @@ _show() {
     printf '%-26s %-10s %s\n' "变量" "值" "来源"
     for _k in ${_KEYS}; do
         _v="$(_val_of "${_k}")"
+        case "${_k}" in
+            OLLAMA_NUM_THREADS) _src="hw_profile 派生（见上方 [hw] 行；可显式覆盖）" ;;
+            *)                  _src=".env（或调用时已在进程环境里，进程环境优先）" ;;
+        esac
         if [ -n "${_v}" ]; then
-            printf '%-26s %-10s %s\n' "${_k}" "${_v}" ".env（或调用时已在进程环境里，进程环境优先）"
+            printf '%-26s %-10s %s\n' "${_k}" "${_v}" "${_src}"
         else
             printf '%-26s %-10s %s\n' "${_k}" "<空>" "未设 —— 见下方告警"
         fi

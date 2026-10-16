@@ -11,15 +11,14 @@
 #      整份文件复制层（旧构建该层 ~1.2G）。
 #
 # ★ 构建压榨（2026-10-16）★ —— 只改「怎么构建」，不改「构建出什么」
-#   A) 易变 ENV 后移：原 OLLAMA_KV_CACHE_TYPE/FLASH_ATTENTION/NUM_PARALLEL 曾在任何模型层
-#      **之前**，改一个数值就让其后全部层失效、重下 7.7G（实测每次部署约 10 分钟）。现在：
-#      · 前三项 + OLLAMA_NUM_THREADS **从本文件移除**，唯一来源改成 .env（见下方"服务端参数"），
-#        本地 tools/run_ollama.sh 与容器 entrypoint.sh 走**同一个** _load_dotenv 解析器；
-#      · 只剩 4 个容器专有的线程/分配器旋钮，已移到文件**末尾**（所有模型层之后）。
-#      安全性依据：ENV 对**整个镜像**生效（含运行期），位置只决定"哪些构建期 RUN 看得见它"。
-#      这 4 个变量只在 entrypoint.sh 启动的 ollama serve / streamlit 进程里被读，而它们全部
-#      在 ENV 之后启动 —— 运行期语义逐字不变；构建期差异仅"pip/烘焙阶段不再看到线程限制"，
-#      不影响任何产物字节。
+#   A) ENV 全部退场：原先 OLLAMA_KV_CACHE_TYPE/FLASH_ATTENTION/NUM_PARALLEL 站在任何模型层
+#      **之前**，改一个数值就让其后全部层失效、重下 7.7G（实测每次部署约 10 分钟）；后来
+#      又把 MALLOC_ARENA_MAX / OMP / MKL / OPENBLAS 也写成死值。现在**本文件一个 ENV 都不再
+#      承载这些旋钮**，改为按性质分两类、各自单一来源（见下方"服务端参数"）：
+#        · 语义项（KV 量化 / flash attention / 槽位并发）→ .env（定义行为，与机器无关）
+#        · 硬件项（线程数 / arena / 并行槽）→ tools/hw_profile.sh 按 cgroup 探测**派生**
+#      收益：改任一项都只失效元数据层级的层，不碰 6.8G 模型层；且 8 核 Mac 与 2vCPU 容器
+#      各自算出各自最优值（写死必然有一边是错的）。
 #   B) 三段并行烘焙：bge-m3 / bge-reranker-v2-m3 / ollama 生成模型在**同一个 RUN** 里后台
 #      同时跑、最后一次 wait 收口 → 关键路径从 sum(2.1G, 2.1G, 2.6G) 变 max(...)。
 #      ⚠️ 为什么不直接合成一个 RUN：一个 RUN = 一层，三段合一 = ~6.8G 单层，而 2026-10-16
@@ -36,13 +35,18 @@
 #   D) 同层清理 + 度量：apt lists / pip+uv 缓存 / .part 暂存 / /tmp/*.log 都在**创建它们的
 #      同一个 RUN** 里删；每个阶段打印耗时与 du -sh，构建日志可直接判读关键路径。
 #
-# ★ 服务端参数：两边同源（2026-10-16 统一）★
-#   Ollama 服务端四项（KV 量化 / flash attention / 槽位并发 / 线程）过去是**两套注入机制**
-#   —— 本地 launchctl setenv、容器 Dockerfile ENV；效果相同、来源不同。现统一为：
-#       .env  →  _load_dotenv（tools/dotenv.sh，唯一实现）  →  各自那份 ollama serve
-#   本地走 tools/run_ollama.sh（纯原生，不用 Docker）；容器走 entrypoint.sh（它 source 同一个
-#   tools/dotenv.sh，且在启动 ollama serve 之前）。entrypoint 对 KV_CACHE_TYPE 为空做了
-#   fail-closed：宁可起不来，也不静默退回 f16 KV 把 8G 档 OOM 掉。
+# ★ 服务端参数：两边同源、且按性质分两类（2026-10-16 统一）★
+#   过去是**两套注入机制** —— 本地 launchctl setenv、容器 Dockerfile ENV；效果相同、来源不同，
+#   改一处必漏另一处。现在两条链，本地与容器**走的是同一份实现**：
+#     · 语义项（KV_CACHE_TYPE / FLASH_ATTENTION / NUM_PARALLEL）—— 定义行为，与核数无关：
+#           .env → _load_dotenv（tools/dotenv.sh，唯一实现） → 各自那份 ollama serve
+#     · 硬件项（OLLAMA_NUM_THREADS / OMP / MKL / OPENBLAS / MALLOC_ARENA_MAX）
+#           tools/hw_profile.sh 按 cgroup（v2 cpu.max/memory.max → v1 → nproc/meminfo/sysctl）
+#           探测后**派生** → 各自那份 ollama serve / torch
+#   本地：tools/run_local.sh 与 tools/run_ollama.sh（纯原生）；容器：entrypoint.sh。
+#   三者都**先 _load_dotenv 再 _load_hw_profile**（显式覆盖优先），并各自打印一行 [hw] 审计。
+#   entrypoint 对 KV_CACHE_TYPE 为空做了 fail-closed：宁可起不来，也不静默退回 f16 KV 把 8G
+#   档 OOM 掉；对 hw_profile.sh 缺失同样 fail-closed（线程/arena 静默偏离是同一类风险）。
 #
 # 环境一致性：
 #   - requirements.txt 全 == 锁定本地现役版本；基础镜像 python:3.10（本地 3.10.0，
@@ -238,7 +242,7 @@ RUN set -eux; \
     _load_dotenv; \
     . ./tools/fetch_models.sh; \
     echo "[bake] 检索模型（来自 .env）：embed=$(basename "$(_env_get RAG_EMBED_MODEL_PATH)") rerank=$(basename "$(_env_get RAG_RERANK_MODEL_PATH)") 生成模型=$(_env_get MODEL)"; \
-    echo "[bake] 生成侧服务端参数（唯一来源 .env，与运行期同一解析器）：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-<未设>} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>} NUM_THREADS=${OLLAMA_NUM_THREADS:-<未设>}"; \
+    echo "[bake] 生成侧语义参数（来源 .env，与运行期同一解析器）：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-<未设>} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}（线程数/arena 是**运行期**按目标机 cgroup 派生的，构建期无法预知，故此处不打）"; \
     echo "[bake] ==================== 三段并行下载（最后一次 wait 收口）===================="; \
     _pids=(); _tags=(); \
     if [ "${BAKE_MODELS}" = "1" ]; then \
@@ -377,18 +381,15 @@ RUN set -eux; \
     echo "[layer] /app 顶层："; ls -la /app; \
     du -sh /app/models /app/ollama_models /app/artifacts /app/qdrant_storage /app/corpus
 
-# ── 容器专有旋钮（**不在 .env 里**，见文件头"服务端参数"）──────────────────────
-# 放在文件末尾：改它们只失效本元数据层，不碰任何模型/数据层。
-# 为什么只属于容器（逐项理由见交付表）：
-#   MALLOC_ARENA_MAX=2   —— glibc 专有；macOS 的 malloc 没有 arena 概念，本地无对应物。
-#   OMP/MKL/OPENBLAS_NUM_THREADS=2 —— 按 2 vCPU 收敛 OpenMP 线程；本地 Mac 多核，且这些
-#                          变量会直接改变本地 torch 的并行度，写进 .env 会改本地行为。
-# 它们只被 entrypoint.sh 启动的 ollama serve / streamlit 读，全部发生在 ENV 之后，
-# 故后移不影响运行期语义（ENV 对整镜像生效，位置只影响构建期可见性）。
-ENV MALLOC_ARENA_MAX=2 \
-    OMP_NUM_THREADS=2 \
-    MKL_NUM_THREADS=2 \
-    OPENBLAS_NUM_THREADS=2
+# 这里**故意没有任何 ENV**：MALLOC_ARENA_MAX / OMP_NUM_THREADS / MKL_NUM_THREADS /
+# OPENBLAS_NUM_THREADS / OLLAMA_NUM_THREADS / OLLAMA_NUM_PARALLEL 这些硬件相关旋钮全部由
+# tools/hw_profile.sh 在**运行期**按真实配额派生（entrypoint.sh 第 0.2b 节加载并导出）。
+# 为什么不写成 ENV：
+#   · 写死就是"同一份镜像只能适配一种机器"——2vCPU 容器与 8 核 Mac 必有一边被拖慢；
+#   · ENV 还在**构建期**生效，会让 pip/烘焙阶段也跟着变线程数（与产物无关的抖动）；
+#   · 改成派生后，本文件的层不再随这些数值变化，缓存命中率最高。
+# ⚠️ 若将来确实要固定某个值：写进 .env（语义项）或用平台环境变量注入（进程环境优先，
+#   hw_profile 会尊重它）—— **不要**在这里加回去，那会把"单一来源"重新劈成两条。
 
 EXPOSE 7860
 

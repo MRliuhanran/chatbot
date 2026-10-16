@@ -124,6 +124,23 @@ else
 fi
 _load_dotenv
 
+# ── 0.2b 硬件适配参数：唯一实现 tools/hw_profile.sh（与本地 run_local.sh / run_ollama.sh 共用）──
+# 线程数、MALLOC_ARENA_MAX、OLLAMA_NUM_PARALLEL 这些**硬件相关**的旋钮不再写死：容器里按
+# cgroup 的 quota/limit 派生（nproc 会报宿主核数，直接用会让 2 vCPU 的机器开几十个线程）。
+# **必须在 _load_dotenv 之后**：派生只填"没被显式设过"的键，而 .env / 平台注入正是"显式"；
+# 反过来会让 .env 永远失效（本仓库点名过的静默原型）。
+# 放这么早是因为 MALLOC_ARENA_MAX 要在**每个**子进程启动前就位 —— 下面 qdrant / ollama /
+# infinity / streamlit 全都继承本 shell。
+# 缺它 = 镜像不完整：线程数会退回各工具自己的默认、arena 不设，在 2vCPU/8G 上就是"按宿主
+# 核数开线程 + 内存碎片化"，正是本模块要消除的那件事。故与 dotenv.sh 同规格 fail-closed。
+if [ -f /app/tools/hw_profile.sh ]; then
+    . /app/tools/hw_profile.sh
+    _load_hw_profile
+else
+    _log "❌ 缺少 /app/tools/hw_profile.sh（硬件适配参数的唯一实现）—— 线程数/内存旋钮会静默偏离，退出"
+    exit 1
+fi
+
 # ── 0. 运行期目录与下载源 ────────────────────────────────────────────────────
 # Ollama 权重落在 /app 下（不依赖 HOME，非 root 也可写）；平台若给持久卷可挂到这里。
 export OLLAMA_MODELS="${OLLAMA_MODELS:-/app/ollama_models}"
@@ -196,13 +213,16 @@ _log "qdrant 就绪（http://127.0.0.1:6333）"
 # 非单例/其它客户端访问时生效。容器内 ollama serve 由本脚本拉起，故在此显式导出默认值
 # —— 若部署方在 .env 设了 OLLAMA_KEEP_ALIVE，_load_dotenv 已导出，${VAR:-...} 会沿用。
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
-# ── 生成侧服务端参数：**唯一来源是 .env**（Dockerfile 不再注入这几个 ENV）──────────
+# ── 生成侧服务端参数：语义项来自 .env，硬件项来自 hw_profile（Dockerfile 两者都不再注入）──
 # 为什么不再注入 ENV：ENV 与 .env 是**两套注入机制**，效果相同、来源不同，改一处必漏
 # 另一处；且 _load_dotenv 是"进程环境优先"，只要 Dockerfile 预设了同名 ENV，.env 里的值就
-# **永远**不生效（静默原型：配置写了却没用）。现在两边同源：
-#     .env → _load_dotenv（第 125 行已执行）→ 本脚本 _ollama_start 起的 ollama serve
-#     → 它拉起的 llama-server 继承
-# 本机的对应机制：tools/run_ollama.sh（读同一份 .env 后 exec ollama serve）。
+# **永远**不生效（静默原型：配置写了却没用）。现在两边同源，且**按性质分成两类**：
+#   · 语义项（KV 量化 / flash attention / 槽位并发）—— 定义行为，与核数无关：
+#         .env → _load_dotenv → ollama serve
+#   · 硬件项（OLLAMA_NUM_THREADS 等线程数）—— 随机器而变：
+#         tools/hw_profile.sh 按 cgroup 探测派生 → ollama serve（见上方 [hw] 审计行）
+# 本机的对应机制：tools/run_ollama.sh / tools/run_local.sh，两者 source 的就是同一份
+# dotenv.sh 与 hw_profile.sh。
 #
 # ★ fail-closed（本次统一最容易引入的新静默点）★
 # KV_CACHE_TYPE 为空 = KV 退回 f16：65536 窗口下 KV 体积翻倍，8G 档 llama-server 必被
@@ -217,10 +237,11 @@ if [ -z "${OLLAMA_KV_CACHE_TYPE:-}" ]; then
 fi
 [ -n "${OLLAMA_FLASH_ATTENTION:-}" ] || _log "⚠️  OLLAMA_FLASH_ATTENTION 为空：KV 量化可能不生效（.env 未生效？）"
 [ -n "${OLLAMA_NUM_PARALLEL:-}" ]    || _log "⚠️  OLLAMA_NUM_PARALLEL 为空：退回多槽位，65536 窗口按并发数翻倍吃内存（.env 未生效？）"
-[ -n "${OLLAMA_NUM_THREADS:-}" ]     || _log "⚠️  OLLAMA_NUM_THREADS 为空：按 vCPU 全开线程（.env 未生效？）"
-# 生效值留痕：OOM 现场要能一眼看出是不是 q8_0/1/1 **以及它们来自哪里**。这一行是本次
-# "唯一来源"改造的可证日志 —— 值只可能来自 .env 或平台注入的同名环境变量。
-_log "生成侧服务端参数（来源 /app/.env，经 tools/dotenv.sh 解析）：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>} NUM_THREADS=${OLLAMA_NUM_THREADS:-<未设>}"
+[ -n "${OLLAMA_NUM_THREADS:-}" ]     || _log "⚠️  OLLAMA_NUM_THREADS 为空：hw_profile 没生效？（启动早期应有一行 [hw]）"
+# 生效值留痕：OOM 现场要能一眼看出是不是 q8_0/1/1 **以及它们来自哪里**。这一行是
+# "唯一来源"改造的可证日志 —— 前三项只可能来自 .env 或平台注入的同名环境变量，
+# NUM_THREADS 只可能来自 tools/hw_profile.sh 的派生（或显式覆盖）。
+_log "生成侧服务端参数：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}〔以上三项来源 /app/.env〕 NUM_THREADS=${OLLAMA_NUM_THREADS:-<未设>}〔来源 tools/hw_profile.sh 派生，见上方 [hw] 行〕"
 # 拉起函数：首启与运行期自愈（4.5）复用同一份命令。
 _ollama_start() {
     ollama serve >>/tmp/ollama.log 2>&1 &

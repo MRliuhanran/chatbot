@@ -58,6 +58,17 @@ fi
 . "${ROOT}/tools/dotenv.sh"
 _load_dotenv
 
+# ── 硬件适配参数：唯一实现 tools/hw_profile.sh（与 entrypoint.sh / tools/run_ollama.sh
+#    共用同一份）。**必须在 _load_dotenv 之后**：派生只填"没被显式设过"的键。
+#    放在这里（而不是 _start_ollama 里）是为了让 Qdrant / Ollama / infinity / 应用
+#    **都**继承同一份线程数与 MALLOC_ARENA_MAX。加载时会打印一行 [hw] 审计（取值 + 依据）。
+if [ ! -f "${ROOT}/tools/hw_profile.sh" ]; then
+    echo "[run_local] ❌ 缺少 ${ROOT}/tools/hw_profile.sh（硬件适配参数的唯一实现）—— 退出" >&2
+    exit 1
+fi
+. "${ROOT}/tools/hw_profile.sh"
+_load_hw_profile
+
 EMBED_MODEL_PATH="${RAG_EMBED_MODEL_PATH:-}"
 RERANK_MODEL_PATH="${RAG_RERANK_MODEL_PATH:-}"
 EMBED_MODEL_NAME="${RAG_EMBED_MODEL_NAME:-}"

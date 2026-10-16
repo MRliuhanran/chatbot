@@ -4,19 +4,7 @@
   "resource_configuration": "platform/2v-cpu-8g-mem",
   "environment_variables": [
     {
-      "name": "OLLAMA_KV_CACHE_TYPE",
-      "value": "q8_0"
-    },
-    {
-      "name": "RAG_PRELOAD",
-      "value": "0"
-    },
-    {
       "name": "OLLAMA_MAX_LOADED_MODELS",
-      "value": "1"
-    },
-    {
-      "name": "OLLAMA_NUM_PARALLEL",
       "value": "1"
     }
   ],
