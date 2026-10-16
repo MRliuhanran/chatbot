@@ -51,7 +51,7 @@ license: apache-2.0
 | `artifacts/` | 离线产物：`chunks.json` + `chunks.meta.json`（分块与切分指纹）、`docs/`（逐文档分块缓存）、`embeddings/`（稠密向量缓存）、`gen_tokenizer/`（生成模型 tokenizer） |
 | `lexicon/` | 领域词表：`aliases.txt`（别名归一）、`stopwords.txt`，整表替换即可换领域 |
 | `models/` | 本地模型权重（嵌入、重排） |
-| `qdrant_storage/`、`qdrant_config/` | Qdrant 数据与配置 |
+| `storage/`、`qdrant_config/` | Qdrant 数据与配置 |
 | `tools/` | 运维与验证脚本，见第 9 节 |
 | `Dockerfile`、`entrypoint.sh` | 魔搭创空间单容器（qdrant + ollama + streamlit 三进程） |
 | `docker-compose.yml`、`docker-compose.gpu.yml`、`embed.Dockerfile` | 容器化路径（本地 Docker / 自有服务器；gpu 覆盖仅把生成模型交给 GPU） |

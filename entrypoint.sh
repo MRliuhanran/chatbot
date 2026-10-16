@@ -199,7 +199,7 @@ fi
 # 与本地 docker-compose 完全同配置：加载同一份 qdrant_config/config.yaml
 # （memmap/indexing 阈值、log_level 等与本地一致），storage_path 用环境变量
 # 覆盖成镜像内布局（qdrant 优先级：环境变量 > 配置文件）。
-export QDRANT__STORAGE__STORAGE_PATH="${QDRANT__STORAGE__STORAGE_PATH:-/app/qdrant_storage}"
+export QDRANT__STORAGE__STORAGE_PATH="${QDRANT__STORAGE__STORAGE_PATH:-/app/storage}"
 # 拉起函数：首启与运行期自愈（4.5）复用同一份命令；日志追加写，重启不清历史。
 _qdrant_start() {
     /opt/qdrant/qdrant --config-path /app/qdrant_config/config.yaml >>/tmp/qdrant.log 2>&1 &

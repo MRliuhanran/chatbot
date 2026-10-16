@@ -1,6 +1,6 @@
 # 容器化路径 · 现成组件版（2026-10-12）：行为与本地原生平行，模型服务优先用现成组件。
 #   qdrant —— 向量库（版本锁 v1.19.1，必须与 Dockerfile 的 ARG QDRANT_VERSION 同版：
-#             共用 ./qdrant_storage，Qdrant 存储**不支持降级**，latest 写过数据后镜像
+#             共用 ./storage，Qdrant 存储**不支持降级**，latest 写过数据后镜像
 #             里固定版打不开）。
 #   ollama —— 生成模型服务（对齐 Dockerfile ARG OLLAMA_VERSION=0.34.4 的二进制版；
 #             挂载本地 ~/.ollama/models 复用现有权重、不重新拉取）。
@@ -48,7 +48,7 @@ services:
       - "127.0.0.1:6333:6333"   # REST API
       - "127.0.0.1:6334:6334"   # gRPC API
     volumes:
-      - ./qdrant_storage:/qdrant/storage
+      - ./storage:/qdrant/storage
       - ./qdrant_config/config.yaml:/qdrant/config/production.yaml
     environment:
       - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:-}

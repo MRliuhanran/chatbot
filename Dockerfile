@@ -5,7 +5,7 @@
 #      容器可写层不持久，运行期下载=每次重启重下数 GB、且"构建完"并不"能用"。置 0 退回运行期
 #      按需下载（镜像回到 ~2.5G，但首启要等下载）。清单唯一来源 tools/fetch_models.sh。
 #   2) Ollama 自带 CUDA/ROCm 运行库在无 GPU 服务器上是纯浪费，构建时删除（约省 2.1G）。
-#   3) 本地数据全部打进镜像：.env / artifacts / qdrant_storage / corpus / lexicon，
+#   3) 本地数据全部打进镜像：.env / artifacts / storage / corpus / lexicon，
 #      开箱即用、无需在服务器重建（2 核重建索引远超 73 分钟）。
 #   4) 权限用 COPY --chmod 与一个只改目录的小 RUN 设定，避免旧写法里 chmod -R 产生的
 #      整份文件复制层（旧构建该层 ~1.2G）。
@@ -56,7 +56,7 @@
 #   - 本地 macOS 的 torch 是 MPS 版，镜像走 CPU 专用索引装 +cpu 版；这是操作系统差异，
 #     由 chatbot.py 的 get_device()（MPS→CUDA→CPU）自动对齐，无需也不应统一。
 #
-# 构建上下文：必须含 .env / artifacts / qdrant_storage / corpus（被 .gitignore 忽略，
+# 构建上下文：必须含 .env / artifacts / storage / corpus（被 .gitignore 忽略，
 #   推送前需 git add -f）。models/ 不进入上下文（.dockerignore），由 modelbake 阶段下载。
 #
 # 本地构建: docker build --platform linux/arm64 -t rag-chatbot .   （M 系 Mac）
@@ -348,7 +348,7 @@ COPY --from=modelbake /bake/ollama_models/ /app/ollama_models/
 
 # 本地数据全量进镜像。**文件集合与旧写法 COPY --chmod=0777 . . 只差下面点名的 3 个**（旧写法
 # 26 个顶层条目、1302 个路径），.dockerignore 仍在生效（artifacts/embeddings、artifacts/docs、
-# qdrant_storage/**/wal/{closed,open}-*、*.log 等照旧被排除）。改动只有三点：
+# storage/**/wal/{closed,open}-*、*.log 等照旧被排除）。改动只有三点：
 #   ① 权限从"全部 0777"收敛成"按用途给"：运行期要写的两棵树 0777；只读的给 a+rX；
 #      根文件 0644；入口脚本 0755（旧写法连 .env/chatbot.py/corpus 都是 0777）。
 #      已验证无写入点：corpus/lexicon/tools/wheels/qdrant_config/.streamlit 运行期只读
@@ -383,7 +383,7 @@ COPY --chmod=0755 qdrant_config/  ./qdrant_config/
 COPY --chmod=0755 tools/          ./tools/
 COPY --chmod=0755 wheels/         ./wheels/
 COPY --chmod=0777 artifacts/      ./artifacts/
-COPY --chmod=0777 qdrant_storage/ ./qdrant_storage/
+COPY --chmod=0777 storage/ ./storage/
 
 # 只改目录属性（不复制文件，层极小）：预建运行期可写目录。**非递归** —— 递归 chmod 会让
 # overlay 把每个文件 copy-up 成新层（旧构建 ~1.2G 的"整份文件复制层"就是这么来的）。
@@ -393,7 +393,7 @@ RUN set -eux; \
     chmod 0777 /app /app/models /app/ollama_models /app/.infinity_cache; \
     test -x /app/entrypoint.sh; \
     echo "[layer] /app 顶层："; ls -la /app; \
-    du -sh /app/models /app/ollama_models /app/artifacts /app/qdrant_storage /app/corpus
+    du -sh /app/models /app/ollama_models /app/artifacts /app/storage /app/corpus
 
 # 这里**故意没有任何 ENV**：MALLOC_ARENA_MAX / OMP_NUM_THREADS / MKL_NUM_THREADS /
 # OPENBLAS_NUM_THREADS / OLLAMA_NUM_THREADS / OLLAMA_NUM_PARALLEL 这些硬件相关旋钮全部由

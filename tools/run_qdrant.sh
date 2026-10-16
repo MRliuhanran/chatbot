@@ -8,7 +8,7 @@
 #   tools/run_qdrant.sh download  # 只下载/解压二进制
 #
 # 版本单一来源 = Dockerfile 的 ARG QDRANT_VERSION：本地原生二进制与镜像必须同版本。
-# Qdrant 存储**不支持降级**，而 魔搭镜像会打包同一份 ./qdrant_storage —— 若本地原生
+# Qdrant 存储**不支持降级**，而 魔搭镜像会打包同一份 ./storage —— 若本地原生
 # 用了更新版本写过数据，镜像里的旧版本就打不开该目录。故这里直接读 Dockerfile，
 # 不另写一份版本号（"同一份知识写两处必然分叉"）。
 set -euo pipefail
@@ -38,7 +38,7 @@ esac
 
 BIN_DIR="$REPO_ROOT/.bin/qdrant"
 QDRANT_BIN="$BIN_DIR/qdrant"
-STORAGE="$REPO_ROOT/qdrant_storage"
+STORAGE="$REPO_ROOT/storage"
 CONFIG="$REPO_ROOT/qdrant_config/config.yaml"
 LOG="$REPO_ROOT/qdrant.log"
 PIDFILE="$REPO_ROOT/.qdrant.pid"
