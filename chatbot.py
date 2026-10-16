@@ -342,6 +342,14 @@ def _gen_gpu_fallback(reason):
     （调用方据此决定是否重发）；非 auto 或已经落过则返回 False。"""
     if GEN_NUM_GPU != "auto":
         return False
+    # ★ 只认**设备类**失败：旧判据是"任何非 200"，于是容器冷启动时模型还在后台拉取的那个
+    #   404、或一次 503，就能把 GPU 机器此后所有请求永久降级为自动分层（.env 自述 65536 档
+    #   要求 RAG_GEN_NUM_GPU=999，自动分层实测 47% 的层掉 CPU），日志还把它归因成
+    #   "生成侧 GPU 不可用"——归因错误 + 跨轮次持久污染（无复位路径）。
+    _DEVICE_HINTS = ("cuda", "out of memory", "oom", "device", "gpu", "metal", "mps", "vram", "insufficient memory")
+    if not any(_k in reason.lower() for _k in _DEVICE_HINTS):
+        log(f"⚠️  生成失败但不像设备问题（{reason}）：保持 num_gpu 不变，不做 GPU 回落")
+        return False
     with _GEN_GPU_LOCK:
         if _GEN_GPU_STATE["fallback"]:
             return False
@@ -2110,7 +2118,12 @@ def dual_channel_recall(client, collection, dense_query, sparse_query, limit, qu
     sparse_hits = []
 
     def _sparse():
-        return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
+        # 本地推理器（qdrant-client 的 ModelEmbedder）每客户端一份且内部无锁：带 Document 的
+        # 请求必须串行，否则并发时 pop(0) 竞争 -> IndexError，或两份 Document 互换（稀疏查询
+        # 拿另一路提问的文本去打分）。写入口早有这把锁，检索侧这条一直裸跑；失败又被
+        # tolerate_sparse_error 吞成"退化为纯稠密"、页面无提示（静默丢召回）。
+        with _QDRANT_INFERENCE_LOCK:
+            return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
 
     # 双通道并发：两个 Qdrant 往返并行发，墙钟 = max(dense, sparse) 而非和。
     with ThreadPoolExecutor(max_workers=2) as pool:
