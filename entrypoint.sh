@@ -280,20 +280,23 @@ fi
     done
 ) &
 
-# ── 4.6 冷启动自检：真实一轮「检索 + 生成」────────────────────────────────────
+# ── 4.6 冷启动自检：生成链路（默认）/ 完整检索+生成（可选）──────────────────────
 # 8G 档 llama-server 被 cgroup OOM 杀时（`signal: killed`），业务侧只表现为一次 500，
 # 运行日志里既无 KV 规模也无峰值内存；而容器外又驱动不了 Streamlit（脚本只在浏览器
-# websocket 会话建立后才跑，curl 只拿静态壳）。故把验收前移到启动期：跑业务同一条
-# 代码路径（get_engine().hybrid_search → plan_generation → stream_chat），把命中数、
-# 正文长度、MemAvailable 与 llama-server RSS 直接写进运行日志。
-# 判据与 _warm_engine 一致（think=false、8 token、正文非空）；num_ctx 取业务生效值
-# RAG_NUM_CTX，这才是 KV 能否分配的真实条件。**非致命**：失败只告警，服务照常起。
-# 置 RAG_BOOT_SELFTEST=0 可关（自检进程会短暂持有嵌入/重排权重，随后释放，与首查询同）。
+# websocket 会话建立后才跑，curl 只拿静态壳）。故把验收前移到启动期，把结果与内存
+# 现场直接写进运行日志（前缀 [自检]）。
+# **必须后台 + 延迟**：早期版本在 exec Streamlit 之前同步跑，自检占住 7860 端口 85~240
+# 秒，平台健康探针等不到监听 → 容器反复重启（2026-10-16 实测 2 分钟内 6 次冷启动）。
+# 默认只跑「生成探针」（不导入 torch，进程几十 MB，与真实查询重叠也不会撑爆 8G）；
+# 需要验收检索侧时再开 RAG_BOOT_SELFTEST_FULL=1。RAG_BOOT_SELFTEST=0 可整体关掉。
 if [ "${RAG_BOOT_SELFTEST:-1}" != 0 ]; then
     if [ -f /app/models/bge-m3/config.json ] || [ -f /app/models/bge-reranker-v2-m3/config.json ]; then
-        _log "启动自检开始（真实检索+生成，日志前缀 [自检]）"
-        RAG_SKIP_MODEL_DOWNLOAD=1 timeout 900 python /app/tools/boot_selftest.py || \
-            _log "⚠️ 启动自检超时/异常退出（非致命，服务照常提供）"
+        (
+            sleep "${RAG_BOOT_SELFTEST_DELAY:-45}"
+            _log "启动自检开始（前缀 [自检]；服务已就绪，自检不阻塞端口）"
+            timeout 900 python /app/tools/boot_selftest.py || \
+                _log "⚠️ 启动自检超时/异常退出（非致命，服务照常提供）"
+        ) &
     else
         _log "启动自检跳过：检索权重尚未就位（运行期下载中或未挂载）"
     fi
