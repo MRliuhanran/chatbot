@@ -721,29 +721,49 @@ if SOURCE_FIELD in _RESERVED_SOURCE_FIELDS:
     )
 TOP_K = env_int_min("RAG_TOP_K", 5, 1)
 RERANK_TOP_K = env_int_min("RAG_RERANK_TOP_K", 20, 1)
-# 重排候选池的**延迟预算**（毫秒）：用户对"重排这一步"愿意等多久 —— 这是用户意图，故是配置项。
-# 候选池 = clamp(预算 ÷ 单候选实测耗时, 1, RERANK_TOP_K)：慢机器少排但保住延迟，快机器排满。
+# 重排候选池**恒等于** RAG_RERANK_TOP_K（默认 20）—— 本地与容器一字不差。
+# ★ "延迟换精度"是**用户决策，不是系统自动决策**：自动按预算收缩会让同一次提问在本地与容器
+#   得到不同质量的答案（容器 20→9 = 直接砍召回），而且没有任何告警。故这里只做两件事：
+#     ① 观测：实测单候选耗时 × 池大小打进日志（超线时给出**显式调小**的建议，由人来决定）；
+#     ② 执行用户的显式决定：只有 RAG_RERANK_BUDGET_MS > 0（默认 0 = 不启用）才按预算收缩。
 # 实测（bge-reranker-v2-m3，候选=child 文本 ≈100 token，与线上 RERANK_ON=child 同口径）：
-#   MPS fp16 41.9 ms/候选（20 条 ≈ 0.84s）；CPU 2 线程 fp32 872 ms/候选（20 条 ≈ 17s！）
-# 默认 8000ms：本机 MPS 算出 190 → 封顶到配置的 20（**本机行为一字不变**）；
-# 2vCPU 容器算出 9 —— 既够 top_k=5 用，又把最坏 17s 压到 8s。
-RERANK_BUDGET_MS = env_int_min("RAG_RERANK_BUDGET_MS", 8000, 1)
+#   MPS fp16 41.9 ms/候选（20 条 ≈ 0.84s）；CPU 2 线程 fp32 872 ms/候选（20 条 ≈ 17.4s）。
+RERANK_BUDGET_MS = env_int_min("RAG_RERANK_BUDGET_MS", 0, 0)       # 0 = 只观测、不收缩（默认）
+RERANK_OBSERVE_MS = env_int_min("RAG_RERANK_OBSERVE_MS", 8000, 1)  # 只用于提示文案的观测线
 _RERANK_MS_PER_CAND = {"mps": 41.9, "cuda": 15.0, "cpu": 872.4}
+_RERANK_POOL_NOTED = False
 
 
 def rerank_pool_size(pool_max=None):
-    """重排候选池 = clamp(预算 ÷ 单候选实测耗时, 1, 上限)，返回 (池大小, 依据串)。
+    """返回 (候选池大小, 依据串)。**默认恒等于上限**，只有显式预算才收缩。
 
-    **只减不增**：配置的 RAG_RERANK_TOP_K 是质量上限，也是本机（快机器）的取值；
-    派生只在机器带不动时向下收 —— 于是"快机器"与"配置值"两条口径在本机完全一致。
+    观测行每进程只打一次（不刷屏），且只给建议、不改池大小 —— 池大小的唯一决定权在
+    RAG_RERANK_TOP_K（质量/用户意图）与显式 RAG_RERANK_BUDGET_MS（用户显式要求降延迟）。
     """
+    global _RERANK_POOL_NOTED
     top = RERANK_TOP_K if pool_max is None else int(pool_max)
     if RERANK_BACKEND != "torch":
-        return top, f"http 重排后端：服务端算力不可知，不按预算截断（HTTP 超时兜底），池={top}"
+        return top, f"http 重排后端：服务端算力不可知，恒保持 {top}（HTTP 超时兜底）"
     device = get_device()
     per = _RERANK_MS_PER_CAND.get(device, _RERANK_MS_PER_CAND["cpu"])
+    est_ms = per * top
+    if RERANK_BUDGET_MS <= 0:
+        if not _RERANK_POOL_NOTED:
+            _RERANK_POOL_NOTED = True
+            if est_ms > RERANK_OBSERVE_MS:
+                suggest = max(1, int(RERANK_OBSERVE_MS // per))
+                log(
+                    f"[rerank] 单候选 {per}ms × {top} = {est_ms / 1000:.1f}s，超出 {RERANK_OBSERVE_MS / 1000:.0f}s 观测线；"
+                    f"若需降延迟可显式设 RAG_RERANK_TOP_K={suggest}（会降低召回，需用户决定）"
+                )
+            else:
+                log(
+                    f"[rerank] 单候选 {per}ms × {top} = {est_ms / 1000:.1f}s（device={device}），"
+                    f"在 {RERANK_OBSERVE_MS / 1000:.0f}s 观测线内；候选池保持 {top}（本地与容器一致）"
+                )
+        return top, f"观测：{per}ms × {top} ≈ {est_ms / 1000:.1f}s（device={device}），未启用预算收缩"
     pool = max(1, min(top, int(RERANK_BUDGET_MS // per) or 1))
-    return pool, f"预算 {RERANK_BUDGET_MS}ms ÷ 实测单候选 {per}ms（device={device}）"
+    return pool, f"**显式**预算 {RERANK_BUDGET_MS}ms ÷ 实测单候选 {per}ms（device={device}）"
 RERANK_BATCH = env_int_min("RAG_RERANK_BATCH", 32, 1)  # padding 隔离下分数与批大小无关；候选<=20 单批一次过
 RERANK_MAX_LENGTH = env_int_min("RAG_RERANK_MAX_LENGTH", 384, 1)
 RERANK_ON = env_choice("RAG_RERANK_ON", "child", ("child", "parent"))
@@ -3514,10 +3534,11 @@ class RAGEngine:
         if steps is not None:
             steps[STEP_RECALL] = [ {"channel": ch, "rank": r, "point_id": pid} for ch, pids, _w in rankings for r, pid in enumerate(pids, 1) ]
         n_channels = max(1, len(rankings))
-        # 候选池先按"延迟预算 ÷ 实测单候选耗时"收口，再进 RRF 融合与重排：慢机器少排但保住延迟。
+        # 候选池默认**恒等于** RAG_RERANK_TOP_K（本地与容器质量一致）；只有用户显式设了
+        # RAG_RERANK_BUDGET_MS 才收缩 —— 收缩时每次都点名，杜绝"静默降精度"。
         _pool, _pool_note = rerank_pool_size()
-        if _pool < RERANK_TOP_K:
-            log(f"  重排候选池: {_pool}/{RERANK_TOP_K}（{_pool_note}）")
+        if _pool != RERANK_TOP_K:
+            log(f"  重排候选池: {_pool}/{RERANK_TOP_K}（{_pool_note}）—— 会降低召回，来自显式配置")
         fuse_limit = _pool * n_channels if DEDUP_BY_PARENT else _pool
         fused = weighted_rrf(rankings, k=RRF_K, limit=fuse_limit)
         chunks = self._fetch_chunks([point_id for point_id, _score, _res in fused], collection) if fused else {}
