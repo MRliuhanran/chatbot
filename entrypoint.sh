@@ -50,14 +50,15 @@ _wait_http_ready() {
     fi
 }
 
-# ── 0.1c 进程自愈：运行期崩溃自动拉起（指数退避 + 熔断）────────────────────
+# ── 0.1c 进程自愈：运行期崩溃自动拉起（指数退避）────────────────────────────
 # 旧实现（4.5）只告警不重启，顾虑是"Qdrant 崩溃循环 + 反复打开损坏 WAL 比直接停机更糟"。
-# 本函数把那个顾虑变成**有界**的：退避把重启频率指数压低，熔断在连续崩溃时停手。
-# 退避公式（第 n 次连续重启，n 从 1 起；再叠加 0~20% 抖动避免固定节拍）：
+# 退避公式本身就把顾虑消掉了：崩溃越频繁，间隔拉得越长，最后稳定在 120s 一次，与直接
+# 停机相比差的只是"每 120s 一次的重启尝试"，而换来崩溃自愈 —— 故不再设熔断/计次上限
+# （否则等于把稳定部分也判死，把自愈关了）。参数只留公式里的两个：
+# 退避公式（第 n 次连续崩溃，n 从 1 起，起跑不归零；再叠加 0~20% 抖动避免固定节拍）：
 #     delay(n) = min(CAP, BASE·2^(n-1)) · (1 + jitter)
-#   BASE=5s CAP=120s → 5 / 10 / 20 / 40 / 80 / 120s
-# 熔断：连续重启达 MAX 次即放弃拉起（转人工/编排层）；实例连续存活 ≥ RESET 秒则计数清零
-#      （视为已恢复，下一次崩溃从头算）。
+#   BASE=5s CAP=120s → 5 / 10 / 20 / 40 / 80 / 120s，此后恒 120s
+#   可调 RAG_SUPERVISE_BASE / RAG_SUPERVISE_CAP（公式参数，非开关）
 # 只负责"运行期崩溃"：首启失败仍由 _wait_http_ready 直接 exit 1（交给平台重拉容器）。
 # 子进程回收：重启出来的实例是本监督者的子进程，用 wait 收尸——否则 PID 1=Streamlit
 #      不 wait，死进程会积成僵尸（_pid_alive 已排除 Z，但僵尸仍占 pid 槽）。
@@ -71,7 +72,6 @@ _svc_health() {
 _supervise() {
     local _name="$1" _logf="$2" _startfn="$3" _pid="${4:-}"
     local _base="${RAG_SUPERVISE_BASE:-5}" _cap="${RAG_SUPERVISE_CAP:-120}"
-    local _max="${RAG_SUPERVISE_MAX:-6}" _reset="${RAG_SUPERVISE_RESET:-120}"
     local _n=0 _svc_pid _i _ok _t0 _up _d _jit _url
     _url="$(_svc_health "${_name}")"
     while :; do
@@ -96,17 +96,12 @@ _supervise() {
         while _pid_alive "${_pid}"; do sleep 3; done
         wait "${_pid}" 2>/dev/null || true # 回收自己拉起的子进程（非自身子进程时无副作用）
         _up=$(( $(date +%s) - _t0 ))
-        [ "${_up}" -ge "${_reset}" ] && _n=0
         _n=$(( _n + 1 ))
-        if [ "${_n}" -gt "${_max}" ]; then
-            _log "🔴 ${_name} 连续重启 ${_max} 次仍不稳定，已放弃自动拉起（转人工/编排层，详见 ${_logf}）"
-            return 1
-        fi
         _d="$(awk -v b="${_base}" -v n="${_n}" -v c="${_cap}" \
             'BEGIN{d=b*2^(n-1); if(d>c)d=c; printf "%d", d}')"
         _jit=$(( RANDOM % 20 ))
         _d=$(( _d + _d * _jit / 100 ))
-        _log "🔴 ${_name} 运行期崩溃（存活 ${_up}s）→ 第 ${_n} 次拉起，退避 ${_d}s（min(${_base}·2^(n-1), ${_cap})+抖动）"
+        _log "🔴 ${_name} 运行期崩溃（存活 ${_up}s）→ 第 ${_n} 次拉起，退避 ${_d}s（min(${_base}·2^(n-1), ${_cap})+抖动），详见 ${_logf}"
         sleep "${_d}"
         _pid=""
     done
@@ -254,7 +249,7 @@ fi
 # 依据见 Dockerfile：8G 单容器运行档定为 torch 进程内；且 infinity-emb[server] 要求
 # uvicorn<0.33.0，与 requirements.txt 的锁定直接冲突（带约束安装必然构建失败）。
 # 旧写法不看命令在不在就起子 shell：exec infinity_emb 立刻 127 退出，被 4.5 的自愈当成
-# "运行期崩溃"，退避 5/10/20/40/80/120s 重启共 6 次才熔断 —— 日志里全是"运行期崩溃"，
+# "运行期崩溃"无限重启（退避封顶 120s）—— 日志里全是"运行期崩溃"，
 # **没有一条**说"infinity 没装"（失效原型：静默 + 自愈把根因放大成噪声）。
 # 修法：先 command -v 判据 + 具名报错，并让 _infinity_pid 保持空 —— 4.5 不会为它注册自愈，
 # 也就不会再有"假装崩溃"的重启风暴。触发场景：平台/部署方把两个 BACKEND 注入成 http
@@ -321,34 +316,13 @@ fi
 # exec 让 Streamlit 当 PID 1，容器里没人 wait：qdrant/ollama 运行期崩了只会变僵尸，
 # 既不重启也不告警 —— 上面两处存活检查只在启动期跑一次。表现为"页面照常 200、检索或
 # 生成全失败"，而日志里一条线索都没有（失效原型：状态失步 + 静默）。
-# 现改为**受控自愈**：_supervise 指数退避 + 熔断（公式与顾虑见 0.1c 注释），默认开。
-#   RAG_SUPERVISE=0      退回旧的"只告警不重启"
-#   RAG_SUPERVISE_MAX/BASE/CAP/RESET  调熔断次数与退避参数
-if [ "${RAG_SUPERVISE:-1}" = 1 ]; then
-    _supervise qdrant   /tmp/qdrant.log   _qdrant_start   "${_qdrant_pid}"   &
-    _supervise ollama   /tmp/ollama.log   _ollama_start   "${_ollama_pid}"   &
-    [ -n "${_infinity_pid}" ] && \
-        _supervise infinity /tmp/infinity.log _infinity_start "${_infinity_pid}" &
-else
-    (
-        _said_q=0; _said_o=0; _said_m=0
-        while :; do
-            sleep 30
-            if [ "${_said_q}" = 0 ] && ! _pid_alive "${_qdrant_pid}"; then
-                _said_q=1
-                _log "🔴 qdrant 已死（pid=${_qdrant_pid}）→ 检索必然全部失败；容器不自动重启，详见 /tmp/qdrant.log"
-            fi
-            if [ "${_said_o}" = 0 ] && ! _pid_alive "${_ollama_pid}"; then
-                _said_o=1
-                _log "🔴 ollama 已死（pid=${_ollama_pid}）→ 生成必然失败；容器不自动重启，详见 /tmp/ollama.log"
-            fi
-            if [ -n "${_infinity_pid}" ] && [ "${_said_m}" = 0 ] && ! _pid_alive "${_infinity_pid}"; then
-                _said_m=1
-                _log "🔴 检索模型服务（infinity）已死（pid=${_infinity_pid}）→ 嵌入/重排全部失败、检索必挂；详见 /tmp/infinity.log"
-            fi
-        done
-    ) &
-fi
+# 现改为自愈：_supervise 指数退避（公式与顾虑见 0.1c 注释），无条件启用，不设开关 ——
+# 有开关就迟早有人把它关掉，然后静默与状态失步又回来了；不想要自动重启的是"编排层
+# 应该重拉容器"的场景，那由首启失败 exit 1 处理，不归这里管。
+_supervise qdrant   /tmp/qdrant.log   _qdrant_start   "${_qdrant_pid}"   &
+_supervise ollama   /tmp/ollama.log   _ollama_start   "${_ollama_pid}"   &
+[ -n "${_infinity_pid}" ] && \
+    _supervise infinity /tmp/infinity.log _infinity_start "${_infinity_pid}" &
 
 # ── 4.6 冷启动自检：生成链路（默认）/ 完整检索+生成（可选）──────────────────────
 # 8G 档 llama-server 被 cgroup OOM 杀时（`signal: killed`），业务侧只表现为一次 500，

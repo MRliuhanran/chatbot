@@ -1,9 +1,8 @@
 {
   "meta_version": 1,
-  "fingerprint": "88288b3912b9672f",
+  "fingerprint": "afbb81bd23ea2c0a",
   "chunking_config": {
     "child_max_tokens": 128,
-    "child_min_tokens": 32,
     "parent_max_tokens": 512,
     "parent_min_tokens": 192,
     "chunk_overlap": 32,
@@ -11,9 +10,9 @@
     "text_opencc": "t2s",
     "ftfy_fix": "{\"fix_character_width\": false, \"fix_encoding\": true, \"fix_latin_ligatures\": false, \"fix_line_breaks\": false, \"fix_surrogates\": false, \"remove_control_chars\": false, \"remove_terminal_escapes\": false, \"uncurl_quotes\": false, \"unescape_html\": false}",
     "embed_model": "./models/bge-m3",
-    "embed_model_content": "e9914797a3fe",
+    "embed_model_content": "23d8f4c1c39f",
     "splitter": "0.33.0",
-    "chunking_code": "6ba8d3d4f6fc2172"
+    "chunking_code": "117eab19a1f7e40f"
   },
   "sources": {
     "毛泽东文集 第1卷 001 在新民学会长沙会员大会上的发言.txt": "8cc28af58f799534",
@@ -1017,5 +1016,5 @@
   "total_chunks": 21255,
   "total_parents": 4852,
   "reused_documents": 0,
-  "build_time": "2026-10-15T21:37:14"
+  "build_time": "2026-10-16T22:27:26"
 }
