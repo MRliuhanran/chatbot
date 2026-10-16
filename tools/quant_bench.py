@@ -73,8 +73,12 @@ VARIANTS = {
 }
 # 重排侧现状是 fp16 权重（chatbot.py::load_reranker_model 传了 torch_dtype=float16），
 # 嵌入侧现状是 fp32 权重 + autocast（load_embedding_model 没传 dtype），故 fp16ac 只对 embed 有意义。
+# 注：embed 侧现状是"fp32 权重 + MPS autocast"（fp16ac）。本机实测该配置在 8GB +
+# 系统已占用（Ollama/streamlit/qdrant/swap 10GB）下抖动到 20 分钟跑不完 512 块，
+# 且数值上与 fp16 权重等价（都是 fp16 计算），故自动跑的 MPS 参考用 fp16；
+# fp16ac 仍保留在 VARIANTS 里，可手动单跑（--variant fp16ac）。
 TASK_VARIANTS = {
-    "embed": ["fp32", "int8", "int8e", "fp16", "fp16ac", "onnx_fp32", "onnx_int8"],
+    "embed": ["fp32", "int8", "int8e", "fp16", "onnx_fp32", "onnx_int8"],
     "rerank": ["fp32", "int8", "int8e", "fp16", "onnx_fp32", "onnx_int8"],
 }
 
@@ -96,17 +100,25 @@ def peak_rss_mb() -> float:
 
 
 def param_bytes(model) -> int:
-    """权重实际字节数（int8 量化后 packed 权重按 1 字节/元素计）。"""
+    """权重实际字节数。递归展开 state_dict（动态量化 Linear 的 int8 权重藏在
+    _packed_params._packed_params 这个 (weight, bias) **元组**里，只扫张量会漏掉全部
+    Linear —— 这正是"标准配方省了多少"的关键数字），int8 packed 权重按 1B/元素计。"""
     import torch
+
+    def _sum(v) -> int:
+        if torch.is_tensor(v):
+            return v.numel() * v.element_size()
+        if isinstance(v, (tuple, list)):
+            return sum(_sum(x) for x in v)
+        if isinstance(v, dict):
+            return sum(_sum(x) for x in v.values())
+        return 0
+
     try:
         sd = model.state_dict()
     except Exception:
         return -1
-    tot = 0
-    for v in sd.values():
-        if torch.is_tensor(v):
-            tot += v.numel() * v.element_size()
-    return tot
+    return sum(_sum(v) for v in sd.values())
 
 
 # ───────────────────────── 采样 ─────────────────────────
@@ -169,15 +181,35 @@ def _quantize(model, spec: str, log: dict):
         per_channel_dynamic_qconfig,
         quantize_dynamic,
     )
+    # Apple Silicon 上 torch 的量化引擎默认是 "none"（quantized::linear_prepack NoQEngine），
+    # 必须显式挑一个可用引擎；x86 容器上默认就是 fbgemm，这里按优先级选，不改数值语义。
+    avail = list(torch.backends.quantized.supported_engines)
+    for cand in ("fbgemm", "x86", "onednn", "qnnpack"):
+        if cand in avail:
+            torch.backends.quantized.engine = cand
+            break
+    log["quant_engine"] = torch.backends.quantized.engine
     t0 = time.time()
     if spec == "lin":
         qm = quantize_dynamic(model, {nn.Linear: per_channel_dynamic_qconfig}, inplace=False)
     elif spec == "lin_emb":
-        qm = quantize_dynamic(
-            model,
-            {nn.Linear: per_channel_dynamic_qconfig, nn.Embedding: float_qparams_weight_only_qconfig},
-            inplace=False,
-        )
+        qm = quantize_dynamic(model, {nn.Linear: per_channel_dynamic_qconfig}, inplace=False)
+        # 词表嵌入表单独量化：只量化**唯一的大表**（bge-m3/bge-reranker 的
+        # embeddings.word_embeddings = 250002x1024x4B = 1.02GB/模型）。
+        # 为什么不直接 {nn.Embedding: float_qparams_weight_only_qconfig} 一把梭：
+        # XLMRobertaEmbeddings 把 token_type_ids 用 buffer.expand() 展开成**非连续**索引，
+        # qnnpack 的 quantized::embedding_byte 直接抛
+        # "Expect weight, indices, and offsets to be contiguous"（已在真机复现，见备忘）。
+        # token_type/position 两表各 4MB，量化它们对内存没有意义，故保持 fp32。
+        from torch.ao.nn.quantized import Embedding as QEmbedding
+        for name, sub in list(qm.named_modules()):
+            for child_name, child in list(sub.named_children()):
+                if isinstance(child, nn.Embedding) and child.weight.numel() >= 1_000_000:
+                    child.qconfig = float_qparams_weight_only_qconfig
+                    setattr(sub, child_name, QEmbedding.from_float(child, float_qparams_weight_only_qconfig))
+                    log.setdefault("quantized_embedding_tables", []).append(f"{name}.{child_name}" if name else child_name)
+                    del child
+        gc.collect()
     else:
         raise ValueError(spec)
     log["t_quant_s"] = round(time.time() - t0, 2)
@@ -209,6 +241,7 @@ def load_torch_model(task: str, variant: str, log: dict):
     model.eval()
     log["t_load_s"] = round(time.time() - t0, 2)
     log["device_actual"] = device
+    log["model_bytes_fp32"] = param_bytes(model)   # 量化前权重字节（fp32 现状基线）
     if v.get("quant"):
         model = _quantize(model, v["quant"], log)
     log["dtype"] = dtype_s
@@ -279,9 +312,13 @@ def _export_wrapper(task: str):
                 self.m = AutoModel.from_pretrained(str(path))
             else:
                 self.m = AutoModelForSequenceClassification.from_pretrained(str(path))
+            # 用 config 关掉 KV cache，而不是给 forward 传 use_cache：
+            # XLMRobertaForSequenceClassification.forward() 不接受 use_cache 关键字
+            # （只有 XLMRobertaModel 接受），传了会在导出时直接 TypeError。
+            self.m.config.use_cache = False
 
         def forward(self, input_ids, attention_mask):
-            out = self.m(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            out = self.m(input_ids=input_ids, attention_mask=attention_mask)
             if task == "embed":
                 cls = out.last_hidden_state[:, 0].float()
                 return torch.nn.functional.normalize(cls, p=2, dim=1)
@@ -297,12 +334,15 @@ def onnx_prepare(tasks, opset=17):
     from onnxruntime.quantization import QuantType, quantize_dynamic
     from transformers import AutoTokenizer
 
-    ONNX_DIR.mkdir(parents=True, exist_ok=True)
     report = {}
     for task in tasks:
+        # 每个任务一个子目录：fp32 的外置权重按 initializer 名落盘（m.embeddings.* / roberta.*），
+        # 两个任务混在一个目录里会让"这个 model_bytes 属于谁"无法判断。
+        task_dir = ONNX_DIR / task
+        task_dir.mkdir(parents=True, exist_ok=True)
         tok = AutoTokenizer.from_pretrained(str(EMBED_MODEL if task == "embed" else RERANK_MODEL))
-        fp32_path = ONNX_DIR / f"{task}_fp32.onnx"
-        int8_path = ONNX_DIR / f"{task}_int8.onnx"
+        fp32_path = task_dir / f"{task}_fp32.onnx"
+        int8_path = task_dir / f"{task}_int8.onnx"
         rec = {"fp32_bytes": None, "int8_bytes": None, "t_export_s": None, "t_quant_s": None}
         if not fp32_path.exists():
             model = _export_wrapper(task)
@@ -330,13 +370,15 @@ def onnx_prepare(tasks, opset=17):
             rec["t_export_s"] = round(time.time() - t0, 2)
             del model
             gc.collect()
-        rec["fp32_bytes"] = sum(f.stat().st_size for f in ONNX_DIR.glob(f"{task}_fp32.onnx*"))
+        # fp32 侧的外置权重是按 initializer 名逐文件落盘的（m.embeddings.word_embeddings.weight 等），
+        # 不叫 <task>_fp32.onnx.data —— 只 glob 图文件会把 2.1GB 权重漏掉，故统计目录全量。
+        rec["fp32_bytes"] = sum(f.stat().st_size for f in task_dir.iterdir() if f.is_file())
         if not int8_path.exists():
             t0 = time.time()
             quantize_dynamic(str(fp32_path), str(int8_path), weight_type=QuantType.QInt8,
                              per_channel=True, use_external_data_format=True)
             rec["t_quant_s"] = round(time.time() - t0, 2)
-        rec["int8_bytes"] = sum(f.stat().st_size for f in ONNX_DIR.glob(f"{task}_int8.onnx*"))
+        rec["int8_bytes"] = sum(f.stat().st_size for f in task_dir.glob(f"{task}_int8.onnx*"))
         report[task] = rec
         print(f"[onnx] {task}: fp32={rec['fp32_bytes']} B int8={rec['int8_bytes']} B "
               f"export={rec['t_export_s']}s quant={rec['t_quant_s']}s", flush=True)
@@ -350,7 +392,7 @@ def _ort_session(task, which, threads):
     so.intra_op_num_threads = threads
     so.inter_op_num_threads = 1
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    path = ONNX_DIR / f"{task}_{which}.onnx"
+    path = ONNX_DIR / task / f"{task}_{which}.onnx"
     return ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
 
 
@@ -429,12 +471,14 @@ def worker(task: str, variant: str, phase: str, threads: int, limit: int | None,
         "task": task, "variant": variant, "phase": phase, "threads": threads,
         "batch": bsz, "n_units": units, "n_items": len(texts) if task == "embed" else len(groups),
         "python": sys.version.split()[0], "platform": sys.platform,
-        "torch": torch.__version__, "mps": bool(torch.backends.mps.is_available()),
+        "torch": torch.__version__, "numpy": np.__version__, "mps": bool(torch.backends.mps.is_available()),
         "rss_before_load_mb": round(rss_mb(), 1),
     }
     t0 = time.time()
     timing = {}
     if is_onnx:
+        import onnxruntime as _ort
+        log["onnxruntime"] = _ort.__version__
         sess = _ort_session(task, v["onnx"], threads)
         tok = None
         from transformers import AutoTokenizer
@@ -444,8 +488,17 @@ def worker(task: str, variant: str, phase: str, threads: int, limit: int | None,
         tok, model, device = load_torch_model(task, variant, log)
     gc.collect()
     log["rss_load_mb"] = round(rss_mb(), 1)
-    log["model_bytes"] = (sum(f.stat().st_size for f in ONNX_DIR.glob(
-        f"{task}_{v['onnx']}.onnx*")) if is_onnx else param_bytes(model))
+    if is_onnx:
+        # fp32 的外置权重按 initializer 名逐文件落盘（不叫 <task>_fp32.onnx.data），
+        # 故 fp32 目录全量；int8 是 <task>_int8.onnx + .data。
+        task_dir = ONNX_DIR / task
+        if v["onnx"] == "fp32":
+            log["model_bytes"] = sum(f.stat().st_size for f in task_dir.iterdir()
+                                     if f.is_file() and "_int8.onnx" not in f.name)
+        else:
+            log["model_bytes"] = sum(f.stat().st_size for f in task_dir.glob(f"{task}_int8.onnx*"))
+    else:
+        log["model_bytes"] = param_bytes(model)
 
     # 预热（不计入吞吐）
     if task == "embed":
@@ -485,7 +538,8 @@ def worker(task: str, variant: str, phase: str, threads: int, limit: int | None,
 
 # ───────────────────────── 驱动 ─────────────────────────
 
-def run_all(tasks, phases, threads_fidelity, threads_throughput, skip_onnx):
+def run_all(tasks, phases, threads_fidelity, threads_throughput, skip_onnx,
+            skip_existing=False, timeout_s=0):
     env = dict(os.environ)
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["PYTHONPATH"] = env.get("PYTHONPATH", "") + os.pathsep + str(OUT / "pylibs")
@@ -506,11 +560,20 @@ def run_all(tasks, phases, threads_fidelity, threads_throughput, skip_onnx):
                        "--threads", str(th)]
                 if lim:
                     cmd += ["--limit", str(lim)]
+                if skip_existing and (RAW / f"{task}__{variant}__{phase}.json").exists():
+                    print(f"--- 跳过（已有结果）: {task}/{variant}/{phase}", flush=True)
+                    results.append({"task": task, "variant": variant, "phase": phase, "rc": 0, "skipped": True})
+                    continue
                 print(f"\n>>> {' '.join(cmd)}", flush=True)
-                p = subprocess.run(cmd, env=env, cwd=str(ROOT))
-                results.append({"task": task, "variant": variant, "phase": phase, "rc": p.returncode})
-                if p.returncode != 0:
-                    print(f"!!! {task}/{variant}/{phase} 失败 rc={p.returncode}", flush=True)
+                try:
+                    p = subprocess.run(cmd, env=env, cwd=str(ROOT), timeout=(timeout_s or None))
+                    rc = p.returncode
+                except subprocess.TimeoutExpired:
+                    rc = -9
+                    print(f"!!! {task}/{variant}/{phase} 超时 {timeout_s}s，已放弃", flush=True)
+                results.append({"task": task, "variant": variant, "phase": phase, "rc": rc})
+                if rc != 0:
+                    print(f"!!! {task}/{variant}/{phase} 失败 rc={rc}", flush=True)
     (OUT / "run_report.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     return results
 
@@ -524,7 +587,7 @@ def main(argv=None):
     w = sub.add_parser("worker", help="单变体单进程测量（内部用）")
     w.add_argument("--task", required=True, choices=["embed", "rerank"])
     w.add_argument("--variant", required=True, choices=list(VARIANTS))
-    w.add_argument("--phase", default="fidelity", choices=["fidelity", "throughput"])
+    w.add_argument("--phase", default="fidelity", choices=["fidelity", "throughput", "probe"])
     w.add_argument("--threads", type=int, default=8)
     w.add_argument("--limit", type=int, default=None)
     w.add_argument("--cands", type=int, default=None)
@@ -536,6 +599,8 @@ def main(argv=None):
     r.add_argument("--threads-fidelity", type=int, default=8)
     r.add_argument("--threads-throughput", type=int, default=2)
     r.add_argument("--skip-onnx", action="store_true")
+    r.add_argument("--skip-existing", action="store_true", help="已有 raw/<task>__<variant>__<phase>.json 就跳过")
+    r.add_argument("--timeout-s", type=int, default=0, help="单个变体的墙钟上限（秒），0=不限")
 
     o = sub.add_parser("onnx-prepare", help="导出+量化 ONNX")
     o.add_argument("--tasks", default="embed,rerank")
@@ -548,7 +613,8 @@ def main(argv=None):
     elif a.cmd == "worker":
         worker(a.task, a.variant, a.phase, a.threads, a.limit, a.cands, a.batch)
     elif a.cmd == "run":
-        run_all(a.tasks.split(","), a.phases.split(","), a.threads_fidelity, a.threads_throughput, a.skip_onnx)
+        run_all(a.tasks.split(","), a.phases.split(","), a.threads_fidelity, a.threads_throughput,
+                a.skip_onnx, a.skip_existing, a.timeout_s)
     elif a.cmd == "onnx-prepare":
         onnx_prepare(a.tasks.split(","))
 

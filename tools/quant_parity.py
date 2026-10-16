@@ -99,6 +99,33 @@ def cosine_stats(a: np.ndarray, b: np.ndarray) -> dict:
     }
 
 
+def neighbor_stats(a: np.ndarray, b: np.ndarray, k: int = 10) -> dict:
+    """近邻一致性：把 512 条真实块互相做最近邻，比较 fp32 与量化版的 top-k 邻居。
+
+    余弦差 1.4% 是"分量级"的数字，检索里真正要紧的是**邻居集合是否变化**：
+    recall@k = 两边 top-k 的交集/k，jaccard@k = 交/并。这一列是量化对检索的直接影响。
+    """
+    a = a / np.maximum(np.linalg.norm(a, axis=1, keepdims=True), 1e-12)
+    b = b / np.maximum(np.linalg.norm(b, axis=1, keepdims=True), 1e-12)
+    sim_a, sim_b = a @ a.T, b @ b.T
+    np.fill_diagonal(sim_a, -np.inf)
+    np.fill_diagonal(sim_b, -np.inf)
+    idx_a = np.argsort(-sim_a, axis=1)[:, :k]
+    idx_b = np.argsort(-sim_b, axis=1)[:, :k]
+    rec, jac, same_top1 = [], [], []
+    for i in range(a.shape[0]):
+        sa, sb = set(idx_a[i].tolist()), set(idx_b[i].tolist())
+        rec.append(len(sa & sb) / k)
+        jac.append(len(sa & sb) / len(sa | sb))
+        same_top1.append(1.0 if idx_a[i][0] == idx_b[i][0] else 0.0)
+    return {
+        "k": k,
+        "recall_at_k": float(np.mean(rec)),
+        "jaccard_at_k": float(np.mean(jac)),
+        "top1_neighbor_agree": float(np.mean(same_top1)),
+    }
+
+
 def _rankdata(x: np.ndarray) -> np.ndarray:
     """平均秩（处理并列），不依赖 scipy。"""
     order = np.argsort(x, kind="mergesort")
@@ -157,9 +184,15 @@ def collect() -> dict:
             rec = {"log": log}
             if base is not None and variant != "fp32":
                 rec["vs_fp32"] = cosine_stats(base, m) if task == "embed" else rerank_stats(base, m)
+                if task == "embed":
+                    rec["neighbor_vs_fp32"] = neighbor_stats(base, m)
             d[task][variant] = rec
-    # MPS 侧的量化对照：int8(CPU) vs fp16(MPS 现状)
-    for task, mps_variant in (("embed", "fp16ac"), ("rerank", "fp16")):
+    # MPS 侧的量化对照：int8(CPU) 要替换的是 MPS 上的基线。嵌入侧现状是 fp32 权重 + autocast
+    # （fp16ac，本机因内存抖动未能跑完 512 块），退而用数值等价的 fp16 权重作参考。
+    for task in ("embed", "rerank"):
+        mps_variant = "fp16"
+        if task == "embed" and (RAW / "embed__fp16ac__fidelity.json").exists():
+            mps_variant = "fp16ac"
         ref = _mat(task, mps_variant, "fidelity")
         if ref is None:
             continue
@@ -169,6 +202,8 @@ def collect() -> dict:
                 continue
             key = "vs_" + mps_variant
             d[task][variant][key] = (cosine_stats(ref, m) if task == "embed" else rerank_stats(ref, m))
+            if task == "embed" and key == "vs_fp16":
+                d[task][variant]["neighbor_vs_fp16"] = neighbor_stats(ref, m)
     return d
 
 
@@ -211,10 +246,20 @@ def speed_rows(data: dict, task: str) -> dict:
 # ─────────────── 判定 ───────────────
 
 def _resident(task, variant):
+    """单模型常驻的**权重字节**（MB）。
+
+    为什么不用 RSS：本机 macOS 在 8GB + 10GB swap 的压力下会把匿名页压缩/换出，
+    实测 fp32 模型 RSS 增量只有 321MB（模型本身 2166MB）——RSS 在这里系统性偏低、
+    不可用于容量决策。权重字节是确定性数字，容器里这些页必须真的驻留（否则就是换页抖动）。
+    """
     lg = _raw(task, variant, "fidelity") or {}
     if not lg:
         return None
-    return lg.get("rss_load_mb", 0) - lg.get("rss_before_load_mb", 0)
+    mb = lg.get("model_bytes", -1)
+    if mb and mb > 0:
+        return mb / 2 ** 20
+    r = lg.get("rss_load_mb", 0) - lg.get("rss_before_load_mb", 0)
+    return r
 
 
 def judge(data: dict) -> dict:
@@ -222,7 +267,12 @@ def judge(data: dict) -> dict:
     verdicts = {}
     for variant in QUANT_VARIANTS:
         v = {"variant": variant, "embed": {}, "rerank": {}, "gain": {}, "fail": []}
-        for key, label in (("vs_fp32", "vs fp32"), ("vs_fp16ac", "vs fp16ac(MPS现状)")):
+        embed_pairs = [("vs_fp32", "vs fp32")]
+        if data["embed"].get(variant, {}).get("vs_fp16"):
+            embed_pairs.append(("vs_fp16", "vs fp16(MPS)"))
+        if data["embed"].get(variant, {}).get("vs_fp16ac"):
+            embed_pairs.append(("vs_fp16ac", "vs fp16ac(MPS现状)"))
+        for key, label in embed_pairs:
             st = data["embed"].get(variant, {}).get(key)
             if not st:
                 continue
@@ -289,6 +339,12 @@ def memo(data: dict, verdicts: dict) -> str:
     A("- 批大小：嵌入 64 / max_len 512；重排 32 / max_len 384（= chatbot.py 现役默认）")
     A("- 阈值：%s" % json.dumps(THRESHOLDS, ensure_ascii=False))
     A("")
+    A("**测量条件与可信度**：本机同时跑着 Ollama/streamlit/qdrant，swap 已用 10.2GB/11.2GB，"
+      "故 ①**RSS 列系统性失真**（fp32 模型权重 2166MB，RSS 增量只有 321MB —— macOS 把匿名页压缩/换出），"
+      "容量决策一律用**权重字节**；②吞吐是同机同条件对比，绝对值偏悲观、比例可用；"
+      "③吞吐只在 ARM(M2)+qnnpack 上测过，x86 容器走 FBGEMM **未实测、不可外推**；"
+      "④保真数字与架构无关（int8 舍入一致，只有 GEMM 内核不同），可外推。")
+    A("")
     A("## 表 1 内存（每变体独立进程实测）")
     A("")
     A("| 任务 | 变体 | 权重字节 | 装载后常驻增量 | 峰值 RSS | 装载 s | 量化 s |")
@@ -315,17 +371,20 @@ def memo(data: dict, verdicts: dict) -> str:
     A("")
     A("## 表 3 嵌入保真（512 条真实块逐条余弦）")
     A("")
-    A("| 变体 | 基线 | 余弦均值 | P1 | 最小 | max|Δ| | 判定 |")
-    A("|---|---|---|---|---|---|---|")
+    A("| 变体 | 基线 | 余弦均值 | P1 | 最小 | max|Δ| | top-10 邻居 recall | 判定 |")
+    A("|---|---|---|---|---|---|---|---|")
+    embed_labels = (("vs_fp32", "fp32(CPU)"), ("vs_fp16", "fp16 权重(MPS)"), ("vs_fp16ac", "fp16 autocast(MPS)"))
     for variant, rec in data["embed"].items():
-        for key, label in (("vs_fp32", "fp32(CPU)"), ("vs_fp16ac", "fp16 autocast(MPS)")):
+        for key, label in embed_labels:
             st = rec.get(key)
             if not st:
                 continue
             ok = st["mean"] >= THRESHOLDS["embed_cos_mean_min"] and st["p1"] >= THRESHOLDS["embed_cos_p1_min"]
-            A("| %s | %s | %.6f | %.6f | %.6f | %.5f | %s |" % (
+            nk = rec.get("neighbor_vs_fp32" if key == "vs_fp32" else "neighbor_vs_fp16")
+            A("| %s | %s | %.6f | %.6f | %.6f | %.5f | %s | %s |" % (
                 PRETTY.get(variant, variant), label, st["mean"], st["p1"], st["min"],
-                st["max_abs_delta"], "过" if ok else "不过"))
+                st["max_abs_delta"],
+                ("%.3f" % nk["recall_at_k"]) if nk else "—", "过" if ok else "不过"))
     A("")
     A("## 表 4 重排保真（120 组 × 12 候选）")
     A("")
@@ -346,11 +405,14 @@ def memo(data: dict, verdicts: dict) -> str:
     A("容器 HW_MEM_MB = %d；应用基线 %d；qdrant %d；LLM(权重+KV q8_0) %d → 检索侧预算 = %d MB" % (
         HW_MEM_MB, APP_BASELINE_MB, QDRANT_MB, LLM_MB, RETRIEVAL_BUDGET_MB))
     A("")
-    A("| 组合 | 嵌入常驻 | 重排常驻 | 检索侧合计 | 总占用 | 是否 <= HW_MEM_MB |")
+    A("（检索侧合计 = 双模型**权重字节**；不含运行时与激活开销，容器里这些页必须真驻留）")
+    A("")
+    A("| 组合 | 嵌入权重 | 重排权重 | 检索侧合计 | + 基线/Qdrant/LLM = 总占用 | 是否 <= HW_MEM_MB |")
     A("|---|---|---|---|---|---|")
     combos = [
         ("fp32 双模型（CPU 容器现状）", "embed", "fp32", "rerank", "fp32"),
-        ("fp16 双模型（Mac 现状 fp16ac+fp16）", "embed", "fp16ac", "rerank", "fp16"),
+        ("Mac 当前精确配置（嵌入 fp32 权重+autocast / 重排 fp16）", "embed", "fp32", "rerank", "fp16"),
+        ("fp16 双模型（Mac 可选项：两边都 fp16 权重）", "embed", "fp16", "rerank", "fp16"),
         ("int8 双模型（仅 Linear）", "embed", "int8", "rerank", "int8"),
         ("int8 双模型（Linear+Embedding）", "embed", "int8e", "rerank", "int8e"),
         ("ONNX-int8 双模型", "embed", "onnx_int8", "rerank", "onnx_int8"),
