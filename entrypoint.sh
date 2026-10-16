@@ -280,6 +280,25 @@ fi
     done
 ) &
 
+# ── 4.6 冷启动自检：真实一轮「检索 + 生成」────────────────────────────────────
+# 8G 档 llama-server 被 cgroup OOM 杀时（`signal: killed`），业务侧只表现为一次 500，
+# 运行日志里既无 KV 规模也无峰值内存；而容器外又驱动不了 Streamlit（脚本只在浏览器
+# websocket 会话建立后才跑，curl 只拿静态壳）。故把验收前移到启动期：跑业务同一条
+# 代码路径（get_engine().hybrid_search → plan_generation → stream_chat），把命中数、
+# 正文长度、MemAvailable 与 llama-server RSS 直接写进运行日志。
+# 判据与 _warm_engine 一致（think=false、8 token、正文非空）；num_ctx 取业务生效值
+# RAG_NUM_CTX，这才是 KV 能否分配的真实条件。**非致命**：失败只告警，服务照常起。
+# 置 RAG_BOOT_SELFTEST=0 可关（自检进程会短暂持有嵌入/重排权重，随后释放，与首查询同）。
+if [ "${RAG_BOOT_SELFTEST:-1}" != 0 ]; then
+    if [ -f /app/models/bge-m3/config.json ] || [ -f /app/models/bge-reranker-v2-m3/config.json ]; then
+        _log "启动自检开始（真实检索+生成，日志前缀 [自检]）"
+        RAG_SKIP_MODEL_DOWNLOAD=1 timeout 900 python /app/tools/boot_selftest.py || \
+            _log "⚠️ 启动自检超时/异常退出（非致命，服务照常提供）"
+    else
+        _log "启动自检跳过：检索权重尚未就位（运行期下载中或未挂载）"
+    fi
+fi
+
 # ── 5. Streamlit：前台运行（容器主进程），端口按创空间要求固定 7860 ────────────
 # 0.0.0.0 是**容器语境的正确值**（容器内直连 127.0.0.1 拿不到宿主端口映射）；不要照搬
 # 到裸机 —— 裸机上 Streamlit 默认绑 localhost，对外暴露需自己显式选 --server.address。
