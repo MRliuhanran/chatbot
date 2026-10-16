@@ -344,18 +344,27 @@ COPY --from=modelbake /bake/embed/         /app/models/
 COPY --from=modelbake /bake/rerank/        /app/models/
 COPY --from=modelbake /bake/ollama_models/ /app/ollama_models/
 
-# 本地数据全量进镜像。**文件集合与旧写法 COPY --chmod=0777 . . 逐条相同**（26 个顶层条目、
-# 1302 个路径），.dockerignore 仍在生效（artifacts/embeddings、artifacts/docs、
-# qdrant_storage/**/wal/{closed,open}-*、*.log 等照旧被排除）。改动只有两点：
+# 本地数据全量进镜像。**文件集合与旧写法 COPY --chmod=0777 . . 只差下面点名的 3 个**（旧写法
+# 26 个顶层条目、1302 个路径），.dockerignore 仍在生效（artifacts/embeddings、artifacts/docs、
+# qdrant_storage/**/wal/{closed,open}-*、*.log 等照旧被排除）。改动只有三点：
 #   ① 权限从"全部 0777"收敛成"按用途给"：运行期要写的两棵树 0777；只读的给 a+rX；
 #      根文件 0644；入口脚本 0755（旧写法连 .env/chatbot.py/corpus 都是 0777）。
 #      已验证无写入点：corpus/lexicon/tools/wheels/qdrant_config/.streamlit 运行期只读
 #      （chatbot.py 的 RAG_DATA_DIR 只 glob+open 读，RAG_LEXICON_DIR 只读，artifacts 才是写目标）。
 #   ② 逐路径 COPY：改一个文件只重建它那一层，不再整块重来 476MB。
-# ⚠️ 往构建上下文加新顶层条目时必须同步加到这里，否则该文件不进镜像（旧写法是自动带上）。
-#    但只能列**进得了上下文**的文件：.qdrant-initialized / .qdrant.pid / .streamlit.pid 是
-#    运行期生成且被 .gitignore 排除，永远不在构建上下文里 —— COPY 列上它们会
-#    `failed to calculate checksum ... "not found"` 直接 kill 构建（本项目曾如此）。
+#   ③ **有意不复制 3 个宿主遗留文件**：.qdrant-initialized / .qdrant.pid / .streamlit.pid。
+#      它们是宿主运行期的残留（.qdrant.pid 只有 tools/run_qdrant.sh 读、.streamlit.pid 只有
+#      tools/run_local.sh 读），容器内没有任何读取方；旧写法靠 COPY . . 顺手带进去，属噪声。
+# ⚠️ **决定构建上下文的是 .dockerignore，不是 .gitignore** —— 这两份名单不同，别混：
+#    上面那 3 个文件在 .gitignore 里（`*.pid` / `.qdrant-initialized`）**但 .dockerignore 里
+#    没有任何规则**，所以它们**确实进得了上下文**（2026-10-16 用真实 docker build 探针
+#    （FROM python:3.10-slim-bookworm + COPY . /ctx/）拉出的上下文清单里就有这三项，各 0~5 字节）。
+#    换句话说：把不存在的文件列进 COPY 才会 `failed to calculate checksum ... "not found"`。
+#    现在不列它们，是为了**不再依赖 .dockerignore 永远保持宽松** —— 将来若有人照 .gitignore
+#    给 .dockerignore 补一条 `*.pid`，列在 COPY 里的它们就会立刻 kill 构建。
+# ⚠️ 往构建上下文加新顶层条目时必须同步加到这里，否则该文件不进镜像（旧写法是自动带上）；
+#    但只列 .dockerignore **没有排除**的文件。判断口径：`git check-ignore` 看的是 .gitignore，
+#    对这里没有意义 —— 要看 .dockerignore 里有没有匹配的 pattern。
 #    .infinity_cache/ 是空目录（COPY 空目录的语义在各 Docker 版本上不一致），故改由下方 RUN mkdir。
 COPY --chmod=0644 \
      .dockerignore .env \
