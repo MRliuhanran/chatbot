@@ -50,6 +50,65 @@ _wait_http_ready() {
     fi
 }
 
+# ── 0.1c 进程自愈：运行期崩溃自动拉起（指数退避 + 熔断）────────────────────
+# 旧实现（4.5）只告警不重启，顾虑是"Qdrant 崩溃循环 + 反复打开损坏 WAL 比直接停机更糟"。
+# 本函数把那个顾虑变成**有界**的：退避把重启频率指数压低，熔断在连续崩溃时停手。
+# 退避公式（第 n 次连续重启，n 从 1 起；再叠加 0~20% 抖动避免固定节拍）：
+#     delay(n) = min(CAP, BASE·2^(n-1)) · (1 + jitter)
+#   BASE=5s CAP=120s → 5 / 10 / 20 / 40 / 80 / 120s
+# 熔断：连续重启达 MAX 次即放弃拉起（转人工/编排层）；实例连续存活 ≥ RESET 秒则计数清零
+#      （视为已恢复，下一次崩溃从头算）。
+# 只负责"运行期崩溃"：首启失败仍由 _wait_http_ready 直接 exit 1（交给平台重拉容器）。
+# 子进程回收：重启出来的实例是本监督者的子进程，用 wait 收尸——否则 PID 1=Streamlit
+#      不 wait，死进程会积成僵尸（_pid_alive 已排除 Z，但僵尸仍占 pid 槽）。
+_svc_health() {
+    case "$1" in
+        qdrant)   printf 'http://127.0.0.1:6333/healthz' ;;
+        ollama)   printf 'http://127.0.0.1:11434/api/version' ;;
+        infinity) printf 'http://127.0.0.1:%s/health' "${_inf_port:-8001}" ;;
+    esac
+}
+_supervise() {
+    local _name="$1" _logf="$2" _startfn="$3" _pid="${4:-}"
+    local _base="${RAG_SUPERVISE_BASE:-5}" _cap="${RAG_SUPERVISE_CAP:-120}"
+    local _max="${RAG_SUPERVISE_MAX:-6}" _reset="${RAG_SUPERVISE_RESET:-120}"
+    local _n=0 _svc_pid _i _ok _t0 _up _d _jit _url
+    _url="$(_svc_health "${_name}")"
+    while :; do
+        if [ -n "${_pid}" ] && _pid_alive "${_pid}"; then
+            : # 首启实例由主脚本拉起，这里只接管监控（不重复起第二个）
+        else
+            _svc_pid=""
+            "${_startfn}"
+            _pid="${_svc_pid}"
+            _ok=0
+            for _i in $(seq 1 60); do
+                if curl -fsS "${_url}" >/dev/null 2>&1; then _ok=1; break; fi
+                _pid_alive "${_pid}" || break
+                sleep 1
+            done
+            [ "${_ok}" = 1 ] || _log "⚠️ ${_name} 拉起后 60 秒未就绪（pid=${_pid}），继续观察"
+        fi
+        _t0="$(date +%s)"
+        while _pid_alive "${_pid}"; do sleep 3; done
+        wait "${_pid}" 2>/dev/null || true # 回收自己拉起的子进程（非自身子进程时无副作用）
+        _up=$(( $(date +%s) - _t0 ))
+        [ "${_up}" -ge "${_reset}" ] && _n=0
+        _n=$(( _n + 1 ))
+        if [ "${_n}" -gt "${_max}" ]; then
+            _log "🔴 ${_name} 连续重启 ${_max} 次仍不稳定，已放弃自动拉起（转人工/编排层，详见 ${_logf}）"
+            return 1
+        fi
+        _d="$(awk -v b="${_base}" -v n="${_n}" -v c="${_cap}" \
+            'BEGIN{d=b*2^(n-1); if(d>c)d=c; printf "%d", d}')"
+        _jit=$(( RANDOM % 20 ))
+        _d=$(( _d + _d * _jit / 100 ))
+        _log "🔴 ${_name} 运行期崩溃（存活 ${_up}s）→ 第 ${_n} 次拉起，退避 ${_d}s（min(${_base}·2^(n-1), ${_cap})+抖动）"
+        sleep "${_d}"
+        _pid=""
+    done
+}
+
 # ── 0.2 从 .env 补齐本脚本要用的变量（与 python-dotenv 同语义）───────────────
 # 旧写法只特判 MODEL 一行，于是 RAG_HTTP_PORT / RAG_SKIP_MODEL_PULL / HF_ENDPOINT 等
 # 写进 .env 对本脚本**静默无效**（端口仍是 7860）—— 而本项目配置的唯一入口就是 .env。
@@ -145,8 +204,14 @@ fi
 # （memmap/indexing 阈值、log_level 等与本地一致），storage_path 用环境变量
 # 覆盖成镜像内布局（qdrant 优先级：环境变量 > 配置文件）。
 export QDRANT__STORAGE__STORAGE_PATH="${QDRANT__STORAGE__STORAGE_PATH:-/app/qdrant_storage}"
-/opt/qdrant/qdrant --config-path /app/qdrant_config/config.yaml >/tmp/qdrant.log 2>&1 &
-_qdrant_pid=$!
+# 拉起函数：首启与运行期自愈（4.5）复用同一份命令；日志追加写，重启不清历史。
+_qdrant_start() {
+    /opt/qdrant/qdrant --config-path /app/qdrant_config/config.yaml >>/tmp/qdrant.log 2>&1 &
+    _svc_pid=$!
+}
+: > /tmp/qdrant.log
+_qdrant_start
+_qdrant_pid="${_svc_pid}"
 _log "qdrant 启动中（storage=${QDRANT__STORAGE__STORAGE_PATH}）"
 _wait_http_ready qdrant http://127.0.0.1:6333/healthz "${_qdrant_pid}" /tmp/qdrant.log
 _log "qdrant 就绪（http://127.0.0.1:6333）"
@@ -162,10 +227,28 @@ export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
 # （见 Dockerfile），此处只做运行日志留痕——OOM 现场需要能一眼看出生效值是不是
 # q8_0/1/1；若部署方用平台变量覆盖，日志也会显示实际值（不覆盖则打印镜像默认）。
 _log "生成侧内存参数：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-<未设=f16>} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}"
-ollama serve >/tmp/ollama.log 2>&1 &
-_ollama_pid=$!
+# 拉起函数：首启与运行期自愈（4.5）复用同一份命令。
+_ollama_start() {
+    ollama serve >>/tmp/ollama.log 2>&1 &
+    _svc_pid=$!
+}
+: > /tmp/ollama.log
+_ollama_start
+_ollama_pid="${_svc_pid}"
 _wait_http_ready ollama http://127.0.0.1:11434/api/version "${_ollama_pid}" /tmp/ollama.log
 _log "ollama 就绪（http://127.0.0.1:11434, models=${OLLAMA_MODELS}）"
+# 生成侧是否真的用上了量化 KV / flash attention：llama.cpp 只在**模型加载后**把
+# KV 缓冲大小写进 ollama 日志，而 FC 只收 stdout —— 故此处把关键行转印到 stdout。
+# 判据：出现 `KV buffer size = xxx MiB` 即知道 KV 用了什么精度（q8_0 应明显小于 f16）。
+_kv_report() {
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+        _line=$(grep -hoE "(KV buffer size = [0-9.]+ MiB|flash[- _]?attn[^ ]*|FLASH_ATTN[^ ]*)" /tmp/ollama.log 2>/dev/null | tail -3 | tr "\n" " ")
+        if [ -n "$_line" ]; then _log "🔎 生成侧 KV/FA 实证: $_line"; return 0; fi
+        sleep 3
+    done
+    _log "🔎 生成侧 KV/FA 实证: 尚未产生（首个请求后才会出现，属正常）"
+}
+_kv_report &
 
 # ── 3. 嵌入/重排权重：清单与实现见 tools/fetch_models.sh（构建期烘焙 / 运行期补下共用）──
 #     构建期已烘焙进镜像时，这里只会打"已就绪"、不产生任何下载。RAG_SKIP_MODEL_DOWNLOAD=1
