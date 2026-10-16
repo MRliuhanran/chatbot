@@ -35,6 +35,19 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     OLLAMA_MODELS=/app/ollama_models
 
+# Ollama 生成侧三个**服务端**变量：本地 macOS 是靠 `launchctl setenv` 注入的
+# （OLLAMA_KV_CACHE_TYPE=q8_0 / OLLAMA_FLASH_ATTENTION=1 / OLLAMA_NUM_PARALLEL=1），
+# 容器里没有等价机制——ms_deploy.json 的 environment_variables 是否被平台注入没有先例，
+# 不能依赖。缺了它们的后果（2026-10-16 实测）：ollama 退回 f16 KV 且 num_parallel 默认
+# 多槽位，65536 窗口直接把 8G 档打爆，llama-server 被 cgroup OOM 杀
+# （运行日志 `llama-server process has terminated: signal: killed`，maxMemoryUsage 7933MB）。
+# 烘焙进镜像 ENV 后 `ollama serve` 与所有子进程都会继承，且不动 .env/ms_deploy.json。
+# qwen3.5 是 SSM 混合层（full_attention_interval=4，32 层仅 8 层带 KV），故 65536 窗
+# q8_0 实测 KV 仅 ~1.06G（本地 server.log: `llama_kv_cache: KV buffer size = 1088.00 MiB`）。
+ENV OLLAMA_KV_CACHE_TYPE=q8_0 \
+    OLLAMA_FLASH_ATTENTION=1 \
+    OLLAMA_NUM_PARALLEL=1
+
 ARG TARGETARCH
 ARG QDRANT_VERSION=v1.19.1
 ARG OLLAMA_VERSION=0.34.4

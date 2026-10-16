@@ -158,6 +158,10 @@ _log "qdrant 就绪（http://127.0.0.1:6333）"
 # 非单例/其它客户端访问时生效。容器内 ollama serve 由本脚本拉起，故在此显式导出默认值
 # —— 若部署方在 .env 设了 OLLAMA_KEEP_ALIVE，_load_dotenv 已导出，${VAR:-...} 会沿用。
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
+# 生成侧内存三件套：KV 量化 / flash attention / 槽位并发。**镜像 ENV 已设默认**
+# （见 Dockerfile），此处只做运行日志留痕——OOM 现场需要能一眼看出生效值是不是
+# q8_0/1/1；若部署方用平台变量覆盖，日志也会显示实际值（不覆盖则打印镜像默认）。
+_log "生成侧内存参数：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-<未设=f16>} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}"
 ollama serve >/tmp/ollama.log 2>&1 &
 _ollama_pid=$!
 _wait_http_ready ollama http://127.0.0.1:11434/api/version "${_ollama_pid}" /tmp/ollama.log
