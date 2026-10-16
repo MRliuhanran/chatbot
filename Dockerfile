@@ -46,7 +46,8 @@ ENV PYTHONUNBUFFERED=1 \
 # q8_0 实测 KV 仅 ~1.06G（本地 server.log: `llama_kv_cache: KV buffer size = 1088.00 MiB`）。
 ENV OLLAMA_KV_CACHE_TYPE=q8_0 \
     OLLAMA_FLASH_ATTENTION=1 \
-    OLLAMA_NUM_PARALLEL=1
+    OLLAMA_NUM_PARALLEL=1 \    # 内存：glibc 每线程一个 arena（碎片化），2 vCPU 上限制到 2 个可省几百 MB\    MALLOC_ARENA_MAX=2 \    # 线程数按 vCPU 收敛：2 核上开 8 个 OpenMP 线程既慢又占内存\    OMP_NUM_THREADS=2 \    MKL_NUM_THREADS=2 \    OPENBLAS_NUM_THREADS=2
+
 
 ARG TARGETARCH
 ARG QDRANT_VERSION=v1.19.1
