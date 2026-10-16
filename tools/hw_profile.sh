@@ -17,6 +17,18 @@
 # 其它 agent 若要按核数并行（如离线 process/index），**读 HW_CORES / HW_MEM_MB 即可**，
 # 不要另写一套探测：容器里 nproc 报的是宿主核数，自己探测必然与这里分叉。
 #
+# ── 怎么拿到契约（读之前先看这段）────────────────────────────────────────────
+# 契约是**导出的环境变量**，只在这一句跑过之后才存在：
+#     . tools/hw_profile.sh && _load_hw_profile      # 建议前面再加 _load_dotenv 以尊重显式值
+# 已接入这条语句的入口只有三个：entrypoint.sh（容器）、tools/run_local.sh、tools/run_ollama.sh。
+# 它们的**子进程**（ollama serve、streamlit、torch）全都继承，无需再做别的。
+# ⚠️ 裸跑 `python chatbot.py <process|index|sparse|…>` **不会**自动带上契约 —— 那条路不经过
+#    上面三个脚本。要么先经 tools/run_local.sh 起服务，要么在使用前补上那一行 source+调用。
+# ⚠️ 读不到 HW_CORES 时**不要**在调用方再探测一遍兜底 —— 那会让"这台机器有几个核"变成
+#    两处实现，而两处必然分叉（容器里一处读 cgroup、一处读宿主 nproc 就是最典型的形态；
+#    本仓库为"同一知识多处实现"已踩过两次坑）。**读不到 = 没加载，补上 source 那一行即可。**
+#    本函数末尾有一道契约自检：万一 export 被改坏，[hw] 日志会直接喊出来。
+#
 # 为什么派生而不是写死：同一份 .env 要同时服务多核 Mac 与 2vCPU 容器。写死必然有一边是错的
 # —— 写 2 则本地白丢大半算力（本地因为容器化而变慢，违反"只是把本地容器化"的根本约束）；
 # 写 8 则 2 vCPU 容器上开 8 个线程，既慢又按线程吃内存。**探测到多少核就用多少核**，
@@ -272,6 +284,22 @@ _load_hw_profile() {
     export HW_THREADS="${_threads}"
     _HW_GLIBC="${_glibc}"
     _HW_LOADED=1
+
+    # ── 4b. 契约自检：HW_* 必须**真的在导出环境里** ──────────────────────────
+    # 写成 HW_CORES=... 而漏掉 export 时，本 shell 里读得到、**子进程读不到** —— 下游于是
+    # 自己再探测一遍（同一事实两处实现），而且不报任何错。这类回归只会在下游静默分叉，
+    # 故在这里显式核对：export -p 只列**已导出**的变量，未导出的同名 shell 变量不在其中。
+    # 覆盖范围：只挡"忘了 export"。调用方若把 _load_hw_profile 放进子 shell / 管道，导出会随
+    # 子 shell 一起消失，这里看不见 —— 所以加载语句必须在脚本顶层，不要包在 $( ) 里。
+    _hw_exports="$(export -p 2>/dev/null)"
+    _hw_unexported=""
+    for _k in HW_CORES HW_MEM_MB HW_THREADS; do
+        case "${_hw_exports}" in
+            *" ${_k}="*) : ;;
+            *) _hw_unexported="${_hw_unexported} ${_k}" ;;
+        esac
+    done
+    [ -z "${_hw_unexported}" ] || printf '[hw] ⚠️  契约变量未导出:%s —— 子进程会读到空值并自行探测（两处实现），请检查 _load_hw_profile 里的 export\n' "${_hw_unexported}"
 
     # ── 5. 审计行（必须能一眼看出"为什么是 2 而不是 8"）─────────────────────
     # 打印的是**生效值**（可能来自显式覆盖）；被覆盖时加 (显式) 标记。
