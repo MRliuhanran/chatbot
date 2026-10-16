@@ -1033,15 +1033,26 @@ def _require_model_dir(path, what, hint):
 
 
 def load_embedding_model(device=None, model_path=None):
+    """嵌入模型加载：**权重精度按设备派生**（与 load_reranker_model 完全同款）。
+
+    GPU（mps/cuda）= fp16 权重：内存 2166MiB → 1083MiB，吞吐实测 28.2 块/s vs 纯 autocast
+    4.63 块/s（32 块探针，量化对拍 agent 实测；余弦 0.999998、top-10 近邻 recall 0.998）。
+    CPU = fp32（fp16 在 CPU 上不加速反而更慢），故容器走 CPU 时精度与语义同改造前。
+
+    注意：本函数在 _embed_code_fingerprint 的源码清单里 —— 改它会让稠密缓存文件名里的
+    code_key 变化，旧向量**自动作废、不会静默复用**（这是有意的：换精度必须全量重算）。
+    """
+    import torch
     from transformers import AutoModel, AutoTokenizer
     device = device or get_device()
+    dtype = torch.float16 if _float16_ok(device) else torch.float32
     model_path = _require_model_dir(
         model_path or EMBED_MODEL_PATH, "嵌入",
         "创空间看运行日志的 [entrypoint] 权重下载行（下载完成后再试）；"
         "本地确认 RAG_EMBED_MODEL_PATH 指向可用的模型目录",
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModel.from_pretrained(model_path).to(device)
+    model = AutoModel.from_pretrained(model_path, torch_dtype=dtype).to(device)
     model.eval()
     return tokenizer, model, device
 
