@@ -353,9 +353,12 @@ COPY --from=modelbake /bake/ollama_models/ /app/ollama_models/
 #      （chatbot.py 的 RAG_DATA_DIR 只 glob+open 读，RAG_LEXICON_DIR 只读，artifacts 才是写目标）。
 #   ② 逐路径 COPY：改一个文件只重建它那一层，不再整块重来 476MB。
 # ⚠️ 往构建上下文加新顶层条目时必须同步加到这里，否则该文件不进镜像（旧写法是自动带上）。
+#    但只能列**进得了上下文**的文件：.qdrant-initialized / .qdrant.pid / .streamlit.pid 是
+#    运行期生成且被 .gitignore 排除，永远不在构建上下文里 —— COPY 列上它们会
+#    `failed to calculate checksum ... "not found"` 直接 kill 构建（本项目曾如此）。
 #    .infinity_cache/ 是空目录（COPY 空目录的语义在各 Docker 版本上不一致），故改由下方 RUN mkdir。
 COPY --chmod=0644 \
-     .dockerignore .env .qdrant-initialized .qdrant.pid .streamlit.pid \
+     .dockerignore .env \
      Dockerfile README.md chatbot.py \
      docker-compose.gpu.yml docker-compose.yml embed.Dockerfile \
      ms_deploy.json pyproject.toml requirements-dev.txt requirements.txt \
