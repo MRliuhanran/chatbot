@@ -44,9 +44,17 @@ ENV PYTHONUNBUFFERED=1 \
 # 烘焙进镜像 ENV 后 `ollama serve` 与所有子进程都会继承，且不动 .env/ms_deploy.json。
 # qwen3.5 是 SSM 混合层（full_attention_interval=4，32 层仅 8 层带 KV），故 65536 窗
 # q8_0 实测 KV 仅 ~1.06G（本地 server.log: `llama_kv_cache: KV buffer size = 1088.00 MiB`）。
+# 生成侧内存参数（烘焙进镜像，ollama serve 与子进程都继承；不动 .env / ms_deploy.json）
+#   KV 量化要配合 FLASH_ATTENTION 才生效；单槽 NUM_PARALLEL=1 避免多份 KV
+#   glibc 每线程一个 arena（碎片化），2 vCPU 上限制到 2 个可省几百 MB
+#   线程数按 vCPU 收敛：2 核上开 8 个 OpenMP 线程既慢又占内存
 ENV OLLAMA_KV_CACHE_TYPE=q8_0 \
     OLLAMA_FLASH_ATTENTION=1 \
-    OLLAMA_NUM_PARALLEL=1 \    # 内存：glibc 每线程一个 arena（碎片化），2 vCPU 上限制到 2 个可省几百 MB\    MALLOC_ARENA_MAX=2 \    # 线程数按 vCPU 收敛：2 核上开 8 个 OpenMP 线程既慢又占内存\    OMP_NUM_THREADS=2 \    MKL_NUM_THREADS=2 \    OPENBLAS_NUM_THREADS=2
+    OLLAMA_NUM_PARALLEL=1 \
+    MALLOC_ARENA_MAX=2 \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2
 
 
 ARG TARGETARCH
