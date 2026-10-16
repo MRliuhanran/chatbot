@@ -196,10 +196,31 @@ _log "qdrant 就绪（http://127.0.0.1:6333）"
 # 非单例/其它客户端访问时生效。容器内 ollama serve 由本脚本拉起，故在此显式导出默认值
 # —— 若部署方在 .env 设了 OLLAMA_KEEP_ALIVE，_load_dotenv 已导出，${VAR:-...} 会沿用。
 export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
-# 生成侧内存三件套：KV 量化 / flash attention / 槽位并发。**镜像 ENV 已设默认**
-# （见 Dockerfile），此处只做运行日志留痕——OOM 现场需要能一眼看出生效值是不是
-# q8_0/1/1；若部署方用平台变量覆盖，日志也会显示实际值（不覆盖则打印镜像默认）。
-_log "生成侧内存参数：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-<未设=f16>} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}"
+# ── 生成侧服务端参数：**唯一来源是 .env**（Dockerfile 不再注入这几个 ENV）──────────
+# 为什么不再注入 ENV：ENV 与 .env 是**两套注入机制**，效果相同、来源不同，改一处必漏
+# 另一处；且 _load_dotenv 是"进程环境优先"，只要 Dockerfile 预设了同名 ENV，.env 里的值就
+# **永远**不生效（静默原型：配置写了却没用）。现在两边同源：
+#     .env → _load_dotenv（第 125 行已执行）→ 本脚本 _ollama_start 起的 ollama serve
+#     → 它拉起的 llama-server 继承
+# 本机的对应机制：tools/run_ollama.sh（读同一份 .env 后 exec ollama serve）。
+#
+# ★ fail-closed（本次统一最容易引入的新静默点）★
+# KV_CACHE_TYPE 为空 = KV 退回 f16：65536 窗口下 KV 体积翻倍，8G 档 llama-server 必被
+# cgroup OOM 杀（2026-10-16 实测 signal: killed / maxMemoryUsage 7933MB）。旧写法只用
+# ${VAR:-<未设=f16>} 打一行日志就继续跑 —— 那是"看得见的降级"里最难被看见的一种（日志
+# 在几万行里，事后归因只能看到一次 500）。故改为：为空直接退出，把根因摆在启动第一屏。
+if [ -z "${OLLAMA_KV_CACHE_TYPE:-}" ]; then
+    _log "❌ OLLAMA_KV_CACHE_TYPE 为空：KV 会退回 f16，65536 窗口下体积翻倍，8G 档必被 OOM 杀。"
+    _log "   唯一来源是 /app/.env（Dockerfile 已不再注入该 ENV）：请确认 .env 存在且含"
+    _log "   OLLAMA_KV_CACHE_TYPE=q8_0；本地对应机制见 tools/run_ollama.sh。拒绝在错误的内存档位下启动。"
+    exit 1
+fi
+[ -n "${OLLAMA_FLASH_ATTENTION:-}" ] || _log "⚠️  OLLAMA_FLASH_ATTENTION 为空：KV 量化可能不生效（.env 未生效？）"
+[ -n "${OLLAMA_NUM_PARALLEL:-}" ]    || _log "⚠️  OLLAMA_NUM_PARALLEL 为空：退回多槽位，65536 窗口按并发数翻倍吃内存（.env 未生效？）"
+[ -n "${OLLAMA_NUM_THREADS:-}" ]     || _log "⚠️  OLLAMA_NUM_THREADS 为空：按 vCPU 全开线程（.env 未生效？）"
+# 生效值留痕：OOM 现场要能一眼看出是不是 q8_0/1/1 **以及它们来自哪里**。这一行是本次
+# "唯一来源"改造的可证日志 —— 值只可能来自 .env 或平台注入的同名环境变量。
+_log "生成侧服务端参数（来源 /app/.env，经 tools/dotenv.sh 解析）：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>} NUM_THREADS=${OLLAMA_NUM_THREADS:-<未设>}"
 # 拉起函数：首启与运行期自愈（4.5）复用同一份命令。
 _ollama_start() {
     ollama serve >>/tmp/ollama.log 2>&1 &

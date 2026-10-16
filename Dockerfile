@@ -1,14 +1,48 @@
 # 单镜像全栈：Qdrant + Ollama(CPU) + RAG 应用（魔搭创空间 Docker 类型用，端口 7860）
 #
 # ★ 最小化策略（2026-09-27）★
-#   1) 模型默认在**构建期烘焙**进镜像（BAKE_MODELS/BAKE_OLLAMA，见下方烘焙层）：容器
-#      可写层不持久，运行期下载=每次重启重下数 GB、且"构建完"并不"能用"。置 0 退回运行期
+#   1) 模型默认在**构建期烘焙**进镜像（BAKE_MODELS/BAKE_OLLAMA，见下方 modelbake 阶段）：
+#      容器可写层不持久，运行期下载=每次重启重下数 GB、且"构建完"并不"能用"。置 0 退回运行期
 #      按需下载（镜像回到 ~2.5G，但首启要等下载）。清单唯一来源 tools/fetch_models.sh。
 #   2) Ollama 自带 CUDA/ROCm 运行库在无 GPU 服务器上是纯浪费，构建时删除（约省 2.1G）。
 #   3) 本地数据全部打进镜像：.env / artifacts / qdrant_storage / corpus / lexicon，
 #      开箱即用、无需在服务器重建（2 核重建索引远超 73 分钟）。
 #   4) 权限用 COPY --chmod 与一个只改目录的小 RUN 设定，避免旧写法里 chmod -R 产生的
 #      整份文件复制层（旧构建该层 ~1.2G）。
+#
+# ★ 构建压榨（2026-10-16）★ —— 只改「怎么构建」，不改「构建出什么」
+#   A) 易变 ENV 后移：原 OLLAMA_KV_CACHE_TYPE/FLASH_ATTENTION/NUM_PARALLEL 曾在任何模型层
+#      **之前**，改一个数值就让其后全部层失效、重下 7.7G（实测每次部署约 10 分钟）。现在：
+#      · 前三项 + OLLAMA_NUM_THREADS **从本文件移除**，唯一来源改成 .env（见下方"服务端参数"），
+#        本地 tools/run_ollama.sh 与容器 entrypoint.sh 走**同一个** _load_dotenv 解析器；
+#      · 只剩 4 个容器专有的线程/分配器旋钮，已移到文件**末尾**（所有模型层之后）。
+#      安全性依据：ENV 对**整个镜像**生效（含运行期），位置只决定"哪些构建期 RUN 看得见它"。
+#      这 4 个变量只在 entrypoint.sh 启动的 ollama serve / streamlit 进程里被读，而它们全部
+#      在 ENV 之后启动 —— 运行期语义逐字不变；构建期差异仅"pip/烘焙阶段不再看到线程限制"，
+#      不影响任何产物字节。
+#   B) 三段并行烘焙：bge-m3 / bge-reranker-v2-m3 / ollama 生成模型在**同一个 RUN** 里后台
+#      同时跑、最后一次 wait 收口 → 关键路径从 sum(2.1G, 2.1G, 2.6G) 变 max(...)。
+#      ⚠️ 为什么不直接合成一个 RUN：一个 RUN = 一层，三段合一 = ~6.8G 单层，而 2026-10-16
+#      两次实测推镜像正是在 5.95G 单层上卡死 >75 分钟（无一层完成、无错误）。故改用
+#      **builder 阶段**并行下载，再由最终阶段 COPY --from 拆成 embed/rerank/ollama 三层推
+#      （各 ~2.1G，与今天的层大小一致）。代价：构建期多占 ~6.8G 磁盘，故先做 df 预检。
+#      失败语义不变：任一失败 → 非零退出 → 整层失败；ollama pull 的 3 次重试与失败日志
+#      转印保持原样（都在 tools/fetch_models.sh 里，本文件一行不动它）。
+#   C) COPY 显式化：COPY --chmod=0777 . . 改成逐路径 COPY + 逐路径 --chmod。
+#      **文件集合与今天逐条相同**（下方 COPY 段有完整清单与核对方式），但：
+#      · 改一个文件不再让 476MB 上下文整块重建（今天改 chatbot.py 会整块重来）；
+#      · 不再给全部数据文件 0777，只给运行期真的需要写的两棵树 0777。
+#      代价：新增构建上下文里的顶层条目时，必须同步往下面 COPY 清单里加一行。
+#   D) 同层清理 + 度量：apt lists / pip+uv 缓存 / .part 暂存 / /tmp/*.log 都在**创建它们的
+#      同一个 RUN** 里删；每个阶段打印耗时与 du -sh，构建日志可直接判读关键路径。
+#
+# ★ 服务端参数：两边同源（2026-10-16 统一）★
+#   Ollama 服务端四项（KV 量化 / flash attention / 槽位并发 / 线程）过去是**两套注入机制**
+#   —— 本地 launchctl setenv、容器 Dockerfile ENV；效果相同、来源不同。现统一为：
+#       .env  →  _load_dotenv（tools/dotenv.sh，唯一实现）  →  各自那份 ollama serve
+#   本地走 tools/run_ollama.sh（纯原生，不用 Docker）；容器走 entrypoint.sh（它 source 同一个
+#   tools/dotenv.sh，且在启动 ollama serve 之前）。entrypoint 对 KV_CACHE_TYPE 为空做了
+#   fail-closed：宁可起不来，也不静默退回 f16 KV 把 8G 档 OOM 掉。
 #
 # 环境一致性：
 #   - requirements.txt 全 == 锁定本地现役版本；基础镜像 python:3.10（本地 3.10.0，
@@ -17,7 +51,7 @@
 #     由 chatbot.py 的 get_device()（MPS→CUDA→CPU）自动对齐，无需也不应统一。
 #
 # 构建上下文：必须含 .env / artifacts / qdrant_storage / corpus（被 .gitignore 忽略，
-#   推送前需 git add -f）。models/ 不再需要进入上下文。
+#   推送前需 git add -f）。models/ 不进入上下文（.dockerignore），由 modelbake 阶段下载。
 #
 # 本地构建: docker build --platform linux/arm64 -t rag-chatbot .   （M 系 Mac）
 #           docker build --platform linux/amd64 -t rag-chatbot .   （x86 / 服务器）
@@ -27,36 +61,16 @@
 #             -v "$PWD/models:/app/models:ro" rag-chatbot
 #           （挂载本地模型仅为离线自测；不挂载则启动时自动下载）
 
-FROM python:3.10-slim-bookworm
+# ── 基座与依赖：appbase 同时是 modelbake 与最终镜像的父层（同一份 apt/pip/ollama 只构建一次）
+FROM python:3.10-slim-bookworm AS appbase
 
 # stdout 不缓冲：非 logging 的 print（jieba 初始化行等）在容器里默认块缓冲，
 # 崩溃/OOM 时最后一批输出整段丢失，而运行日志是唯一的现场。
+# OLLAMA_MODELS 是**路径**不是旋钮（值稳定、且 modelbake 阶段要用），故留在最前；
+# 它变化也会让后续层失效，但它只随目录布局变，不随调参变。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     OLLAMA_MODELS=/app/ollama_models
-
-# Ollama 生成侧三个**服务端**变量：本地 macOS 是靠 `launchctl setenv` 注入的
-# （OLLAMA_KV_CACHE_TYPE=q8_0 / OLLAMA_FLASH_ATTENTION=1 / OLLAMA_NUM_PARALLEL=1），
-# 容器里没有等价机制——ms_deploy.json 的 environment_variables 是否被平台注入没有先例，
-# 不能依赖。缺了它们的后果（2026-10-16 实测）：ollama 退回 f16 KV 且 num_parallel 默认
-# 多槽位，65536 窗口直接把 8G 档打爆，llama-server 被 cgroup OOM 杀
-# （运行日志 `llama-server process has terminated: signal: killed`，maxMemoryUsage 7933MB）。
-# 烘焙进镜像 ENV 后 `ollama serve` 与所有子进程都会继承，且不动 .env/ms_deploy.json。
-# qwen3.5 是 SSM 混合层（full_attention_interval=4，32 层仅 8 层带 KV），故 65536 窗
-# q8_0 实测 KV 仅 ~1.06G（本地 server.log: `llama_kv_cache: KV buffer size = 1088.00 MiB`）。
-# 生成侧内存参数（烘焙进镜像，ollama serve 与子进程都继承；不动 .env / ms_deploy.json）
-#   KV 量化要配合 FLASH_ATTENTION 才生效；单槽 NUM_PARALLEL=1 避免多份 KV
-#   glibc 每线程一个 arena（碎片化），2 vCPU 上限制到 2 个可省几百 MB
-#   线程数按 vCPU 收敛：2 核上开 8 个 OpenMP 线程既慢又占内存
-ENV OLLAMA_KV_CACHE_TYPE=q8_0 \
-    OLLAMA_FLASH_ATTENTION=1 \
-    OLLAMA_NUM_PARALLEL=1 \
-    OLLAMA_NUM_THREADS=2 \
-    MALLOC_ARENA_MAX=2 \
-    OMP_NUM_THREADS=2 \
-    MKL_NUM_THREADS=2 \
-    OPENBLAS_NUM_THREADS=2
-
 
 ARG TARGETARCH
 ARG QDRANT_VERSION=v1.19.1
@@ -72,10 +86,13 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ARG PIP_FALLBACK_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
 
 # 系统依赖单独成层（这个层很慢但很稳定，与下面的下载分层，改下载逻辑不必重装 apt）
+# apt lists 在**同一个 RUN** 里删：换层删只减可见性、不减体积。
 RUN set -eux; \
+    _t0=$(date +%s); \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl zstd procps musl; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    echo "[timing] apt 系统依赖 $(( $(date +%s) - _t0 ))s（apt lists 已同层删除）"
 
 # Qdrant + Ollama(CPU)：
 # - Qdrant 两架构统一用官方 musl 静态版：gnu 版链接 glibc≥2.38，bookworm 基座只有 2.36
@@ -88,6 +105,7 @@ RUN set -eux; \
 #   卡在第 7 层 16 分钟、日志停在 0 字节，即此因）。大资产优先 gh-proxy（实测 9MB/s），
 #   直连 GitHub 实测卡死、仅作兜底；qdrant 小资产直连更快，顺序不变。
 RUN set -eux; \
+    _t0=$(date +%s); \
     case "${TARGETARCH}" in \
       amd64) _qarch="x86_64-unknown-linux-musl" ;; \
       arm64) _qarch="aarch64-unknown-linux-musl" ;; \
@@ -120,7 +138,8 @@ RUN set -eux; \
     rm -f /tmp/ollama.tar.zst; \
     rm -rf /usr/local/lib/ollama/cuda_* /usr/local/lib/ollama/rocm*; \
     du -sh /usr/local/lib/ollama; \
-    ollama --version
+    ollama --version; \
+    echo "[timing] Qdrant+Ollama 安装 $(( $(date +%s) - _t0 ))s"
 
 WORKDIR /app
 
@@ -135,7 +154,9 @@ WORKDIR /app
 # uv 本身也走主源+兜底源，避免镜像滞后导致构建工具装不上。
 COPY requirements.txt .
 COPY wheels/ /tmp/wheels/
-RUN pip install --no-cache-dir \
+RUN set -eux; \
+    _t0=$(date +%s); \
+    pip install --no-cache-dir \
         --index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
         "uv==${UV_VERSION}" \
@@ -153,7 +174,8 @@ RUN pip install --no-cache-dir \
         -r requirements.txt \
     && uv pip check --system \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
-    && rm -rf /root/.cache
+    && rm -rf /root/.cache \
+    && echo "[timing] Python 依赖 $(( $(date +%s) - _t0 ))s（pip/uv 缓存与 __pycache__ 已同层删除）"
 
 # 检索模型服务（infinity）**不装进本镜像**：魔搭是 8G 单容器，运行档定为
 # RAG_EMBED_BACKEND/RAG_RERANK_BACKEND = torch（进程内），entrypoint 仅在 =http 时才拉起
@@ -161,57 +183,212 @@ RUN pip install --no-cache-dir \
 # 与 requirements.txt 锁定的 uvicorn==0.48.0 直接冲突，带 --constraint 的安装**必然构建失败**
 # （2026-10-15 构建实测）。compose 路径仍用独立的 embed.Dockerfile（不带本仓约束、可解析）。
 
-# ── 构建期烘焙模型（"构建完就能用"）────────────────────────────────────────────
 # ⚠️ 必须先把 RUN 的 shell 换成 bash：Docker 默认 /bin/sh，Debian 上是 dash，而
 # tools/fetch_models.sh 用了 bash 专有语法（declare -F / 数组 local -a / ${!arr[@]}），
 # dash 在**解析阶段**就报 `Syntax error: "(" unexpected`，整层从未执行
 # （2026-10-10 构建实测的失败点）。只影响其后的 RUN；entrypoint.sh 自带 bash shebang。
+# 放在 appbase 里 → modelbake 与最终阶段一起继承。
 SHELL ["/bin/bash", "-c"]
 
+# ── 构建期烘焙模型（"构建完就能用"）────────────────────────────────────────────
 # 容器的可写层不跨重启持久：模型若在运行期下载，每次冷启都要重下数 GB，且"构建完成"
 # 并不等于"可服务"。烘焙进镜像层后，entrypoint 的清单判据直接判"已就绪"，启动即用，
 # 运行日志里不再有下载过程。清单与实现唯一来源 tools/fetch_models.sh（与运行期共用，
 # 避免两处清单漂移）；BAKE_MODELS / BAKE_OLLAMA 任一置 0 即可关掉对应烘焙、退回运行期下载。
-# 烘焙后 chmod a+rX 让平台以非 root 跑时也能读；下载/拉取失败会让本层构建失败，
-# 避免产出"模型缺失却照样成功"的半成品镜像。
-# **按侧拆成三个 RUN（2026-10-16 实测强制）**：原单 RUN 产出 5.95G 单层，两次构建
-# 推镜像都卡死在该层（香港构建机 → 张家口 registry，>75 分钟无任何一层完成、无错误）；
-# 拆成 嵌入 2.1G / 重排 2.1G / 生成 2.6G 三层后单层推速回到分钟级，也恢复了可观测性。
+#
+# 本阶段**只下载**，不产出镜像层：它把三份模型放 /bake/{embed,rerank,ollama_models}，
+# 由最终阶段 COPY --from 拆成三层（见文件头 B 条）。
+FROM appbase AS modelbake
+
+# SHELL / WORKDIR 在 FROM <stage> 时按 Docker 语义继承自 appbase，但本机无法实跑构建验证，
+# 故**显式重申**而不是依赖隐含继承：SHELL 决定本阶段能不能用 bash 数组/declare（fetch_models.sh
+# 必需），WORKDIR 决定 COPY .env ./ 落到 /app 与 _load_dotenv 读的 ./.env 是不是同一份。
+SHELL ["/bin/bash", "-c"]
+WORKDIR /app
+
 COPY .env ./
-COPY tools/fetch_models.sh ./tools/
+# dotenv.sh 与 fetch_models.sh 一起进构建期：Ollama 服务端参数在构建期也走**同一个**
+# _load_dotenv，与运行期逐字同源（避免"构建期一套、运行期一套"的第二条注入路径）。
+COPY tools/fetch_models.sh tools/dotenv.sh ./tools/
+
 ARG BAKE_MODELS=1
 ARG BAKE_OLLAMA=1
-RUN set -eux; \
-    mkdir -p /app/models; \
-    . ./tools/fetch_models.sh; \
-    if [ "${BAKE_MODELS}" = "1" ]; then _download_side embed; fi; \
-    rm -f /tmp/model-download.status; \
-    chmod -R a+rX /app/models; \
-    du -sh /app/models
-RUN set -eux; \
-    mkdir -p /app/models; \
-    . ./tools/fetch_models.sh; \
-    if [ "${BAKE_MODELS}" = "1" ]; then _download_side rerank; fi; \
-    rm -f /tmp/model-download.status; \
-    chmod -R a+rX /app/models; \
-    du -sh /app/models
-RUN set -eux; \
-    mkdir -p /app/ollama_models; \
-    . ./tools/fetch_models.sh; \
-    if [ "${BAKE_OLLAMA}" = "1" ]; then _pull_ollama_model "$(_env_get MODEL)"; fi; \
-    rm -f /tmp/ollama-pull.log /tmp/ollama-bake.log; \
-    chmod -R a+rX /app/ollama_models; \
-    du -sh /app/ollama_models
+# 磁盘预检下限（GB）：并行烘焙同时容纳"下载区 + 最终镜像层"两份，低于下限直接判失败
+# （半途 ENOSPC 只会产出更难归因的残层）。构建机磁盘紧时：清缓存，或置 BAKE_*=0。
+ARG BAKE_MIN_FREE_GB=8
+# 体积下限（MB）：清单齐备但明显偏小 = 半截下载。取值远低于实测（bge-m3 ≈2.1G、
+# rerank ≈2.1G、ollama Q4_K_M ≈2.5G），只挡"静默小文件"，不挡模型换代。
+ARG BAKE_MIN_EMBED_MB=1500
+ARG BAKE_MIN_RERANK_MB=1500
+ARG BAKE_MIN_OLLAMA_MB=1800
 
-# 本地数据全量进镜像：--chmod=0777 让平台以非 root 跑时也能写 qdrant_storage/artifacts/rag.log，
-# 且不额外产生整份文件的 chmod 层。models/ 已排除，由 entrypoint 运行时下载。
-COPY --chmod=0777 . .
+RUN set -eux; \
+    _T_ALL=$(date +%s); \
+    mkdir -p /bake/embed /bake/rerank /bake/ollama_models; \
+    echo "[bake] ==================== 磁盘预检（要下 ~7.7G）===================="; \
+    df -h / /bake; \
+    _free=$(df -Pk /bake | awk 'NR==2{printf "%d", $4/1048576}'); \
+    echo "[bake] /bake 可用 ${_free}G（下限 BAKE_MIN_FREE_GB=${BAKE_MIN_FREE_GB}G）"; \
+    if [ "${_free}" -lt "${BAKE_MIN_FREE_GB}" ]; then \
+        echo "[bake] ❌ 可用空间 ${_free}G < ${BAKE_MIN_FREE_GB}G：并行烘焙需同时容纳下载区与最终镜像层" >&2; \
+        echo "[bake]    出路：① 清理构建机磁盘 ② BAKE_MODELS=0 / BAKE_OLLAMA=0 退回运行期下载。" >&2; \
+        exit 1; \
+    fi; \
+    . ./tools/dotenv.sh; \
+    _load_dotenv; \
+    . ./tools/fetch_models.sh; \
+    echo "[bake] 检索模型（来自 .env）：embed=$(basename "$(_env_get RAG_EMBED_MODEL_PATH)") rerank=$(basename "$(_env_get RAG_RERANK_MODEL_PATH)") 生成模型=$(_env_get MODEL)"; \
+    echo "[bake] 生成侧服务端参数（唯一来源 .env，与运行期同一解析器）：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-<未设>} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>} NUM_THREADS=${OLLAMA_NUM_THREADS:-<未设>}"; \
+    echo "[bake] ==================== 三段并行下载（最后一次 wait 收口）===================="; \
+    _pids=(); _tags=(); \
+    if [ "${BAKE_MODELS}" = "1" ]; then \
+        ( _t0=$(date +%s); _rc=0; \
+          MODELS_DIR=/bake/embed _download_side embed || _rc=$?; \
+          echo "[timing] embed(bge-m3) 用时 $(( $(date +%s) - _t0 ))s rc=${_rc}"; \
+          exit "${_rc}" ) & \
+        _pids+=("$!"); _tags+=("embed"); \
+        ( _t0=$(date +%s); _rc=0; \
+          MODELS_DIR=/bake/rerank _download_side rerank || _rc=$?; \
+          echo "[timing] rerank(bge-reranker-v2-m3) 用时 $(( $(date +%s) - _t0 ))s rc=${_rc}"; \
+          exit "${_rc}" ) & \
+        _pids+=("$!"); _tags+=("rerank"); \
+    fi; \
+    if [ "${BAKE_OLLAMA}" = "1" ]; then \
+        ( _t0=$(date +%s); _rc=0; \
+          OLLAMA_MODELS=/bake/ollama_models _pull_ollama_model "$(_env_get MODEL)" || _rc=$?; \
+          echo "[timing] ollama($(_env_get MODEL)) 用时 $(( $(date +%s) - _t0 ))s rc=${_rc}"; \
+          exit "${_rc}" ) & \
+        _pids+=("$!"); _tags+=("ollama"); \
+    fi; \
+    _rc=0; \
+    for _i in "${!_pids[@]}"; do \
+        if wait "${_pids[$_i]}"; then \
+            echo "[bake] ✅ ${_tags[$_i]} 完成"; \
+        else \
+            echo "[bake] ❌ ${_tags[$_i]} 失败（rc≠0；失败原因见上方该段日志，ollama pull 已内建 3 次重试）" >&2; \
+            _rc=1; \
+        fi; \
+    done; \
+    if [ "${_rc}" != 0 ]; then \
+        echo "[bake] ❌ 有失败项 → 不产出「模型缺失却照样成功」的半成品镜像" >&2; \
+        exit 1; \
+    fi; \
+    echo "[bake] ==================== 清单 / 尺寸校验（清单来源 _model_spec）===================="; \
+    _verify_side() { \
+        local _side="$1" _root="$2" _min_mb="$3" _name _spec _files _f _bad=0 _mb; \
+        case "${_side}" in \
+            embed)  _name="$(basename "$(_env_get RAG_EMBED_MODEL_PATH)")" ;; \
+            rerank) _name="$(basename "$(_env_get RAG_RERANK_MODEL_PATH)")" ;; \
+            *) echo "[verify] ❌ 未知侧 ${_side}" >&2; return 1 ;; \
+        esac; \
+        _spec="$(_model_spec "${_name}")" || { echo "[verify] ❌ ${_name} 未登记于 _model_spec" >&2; return 1; }; \
+        _files="${_spec#*|}"; _files="${_files#*|}"; \
+        echo "[verify] ${_name} 清单（tools/fetch_models.sh:_model_spec）："; \
+        for _f in ${_files}; do \
+            if [ -s "${_root}/${_name}/${_f}" ]; then \
+                printf '[verify]   %12s  %s\n' "$(wc -c < "${_root}/${_name}/${_f}")" "${_f}"; \
+            else \
+                echo "[verify] ❌ 缺失或空文件: ${_name}/${_f}" >&2; _bad=1; \
+            fi; \
+        done; \
+        _mb=$(du -sm "${_root}/${_name}" | awk '{print $1}'); \
+        echo "[verify] ${_name} 合计 ${_mb}MB（下限 ${_min_mb}MB）"; \
+        if [ "${_mb}" -lt "${_min_mb}" ]; then \
+            echo "[verify] ❌ ${_name} 体积 ${_mb}MB < ${_min_mb}MB：疑似半截下载" >&2; _bad=1; \
+        fi; \
+        [ "${_bad}" = 0 ] || return 1; \
+        du -sh "${_root}/${_name}"; \
+    }; \
+    if [ "${BAKE_MODELS}" = "1" ]; then \
+        _verify_side embed  /bake/embed  "${BAKE_MIN_EMBED_MB}"; \
+        _verify_side rerank /bake/rerank "${BAKE_MIN_RERANK_MB}"; \
+    else \
+        echo "[verify] BAKE_MODELS=0：跳过检索模型校验（退回运行期下载，镜像里 /app/models 为空目录）"; \
+    fi; \
+    if [ "${BAKE_OLLAMA}" = "1" ]; then \
+        _mb=$(du -sm /bake/ollama_models/blobs 2>/dev/null | awk '{print $1}'); \
+        _mb="${_mb:-0}"; \
+        echo "[verify] ollama blobs ${_mb}MB（下限 ${BAKE_MIN_OLLAMA_MB}MB）；manifests："; \
+        find /bake/ollama_models/manifests -type f 2>/dev/null || true; \
+        if [ "${_mb}" -lt "${BAKE_MIN_OLLAMA_MB}" ]; then \
+            echo "[verify] ❌ ollama 模型体积 ${_mb}MB < ${BAKE_MIN_OLLAMA_MB}MB：疑似半截下载" >&2; \
+            exit 1; \
+        fi; \
+    else \
+        echo "[verify] BAKE_OLLAMA=0：跳过生成模型校验（退回运行期拉取）"; \
+    fi; \
+    echo "[bake] ==================== 同层清理（创建者即删除者）===================="; \
+    rm -f /tmp/ollama-pull.log /tmp/ollama-bake.log /tmp/model-download.status /tmp/mkdir.log; \
+    rm -rf /bake/embed/*.part /bake/rerank/*.part /bake/embed/*.old /bake/rerank/*.old; \
+    chmod -R a+rX /bake/embed /bake/rerank /bake/ollama_models; \
+    echo "[bake] ==================== 产物汇总 ===================="; \
+    du -sh /bake/embed /bake/rerank /bake/ollama_models; \
+    echo "[timing] 烘焙总用时 $(( $(date +%s) - _T_ALL ))s（三段并行的墙钟，非各自之和）"
 
-# 只改目录属性（不复制文件，层极小）：预建运行期可写目录，并确保入口可执行。
-RUN chmod 0777 /app \
-    && mkdir -p /app/models /app/ollama_models \
-    && chmod 0777 /app/models /app/ollama_models \
-    && chmod +x /app/entrypoint.sh
+# ── 最终镜像 ─────────────────────────────────────────────────────────────────
+# 与 appbase 同一父层：apt/pip/ollama 的层**直接复用**，此处只落模型与数据。
+FROM appbase AS app
+
+# 同上：显式重申 WORKDIR（下面 COPY 的相对目标 ./ 与运行期 CWD 都依赖它）。
+WORKDIR /app
+
+# 模型三层（每层 ~2.1G）：层大小与今天的「按侧拆三个 RUN」逐层一致，推镜像行为不变；
+# 但下载已在 modelbake 里并行完成，墙钟 = max(三段) 而不是 sum。
+# 目录名从 .env 推导、写在 modelbake 里，这里按**目录本身**搬（/bake/embed/ 的内容 →
+# /app/models/），故 .env 换模型不需要改本文件。
+COPY --from=modelbake /bake/embed/         /app/models/
+COPY --from=modelbake /bake/rerank/        /app/models/
+COPY --from=modelbake /bake/ollama_models/ /app/ollama_models/
+
+# 本地数据全量进镜像。**文件集合与旧写法 COPY --chmod=0777 . . 逐条相同**（26 个顶层条目、
+# 1302 个路径），.dockerignore 仍在生效（artifacts/embeddings、artifacts/docs、
+# qdrant_storage/**/wal/{closed,open}-*、*.log 等照旧被排除）。改动只有两点：
+#   ① 权限从"全部 0777"收敛成"按用途给"：运行期要写的两棵树 0777；只读的给 a+rX；
+#      根文件 0644；入口脚本 0755（旧写法连 .env/chatbot.py/corpus 都是 0777）。
+#      已验证无写入点：corpus/lexicon/tools/wheels/qdrant_config/.streamlit 运行期只读
+#      （chatbot.py 的 RAG_DATA_DIR 只 glob+open 读，RAG_LEXICON_DIR 只读，artifacts 才是写目标）。
+#   ② 逐路径 COPY：改一个文件只重建它那一层，不再整块重来 476MB。
+# ⚠️ 往构建上下文加新顶层条目时必须同步加到这里，否则该文件不进镜像（旧写法是自动带上）。
+#    .infinity_cache/ 是空目录（COPY 空目录的语义在各 Docker 版本上不一致），故改由下方 RUN mkdir。
+COPY --chmod=0644 \
+     .dockerignore .env .qdrant-initialized .qdrant.pid .streamlit.pid \
+     Dockerfile README.md chatbot.py \
+     docker-compose.gpu.yml docker-compose.yml embed.Dockerfile \
+     ms_deploy.json pyproject.toml requirements-dev.txt requirements.txt \
+     ./
+COPY --chmod=0755 entrypoint.sh ./
+COPY --chmod=0755 .devcontainer/  ./.devcontainer/
+COPY --chmod=0755 .streamlit/     ./.streamlit/
+COPY --chmod=0755 corpus/         ./corpus/
+COPY --chmod=0755 lexicon/        ./lexicon/
+COPY --chmod=0755 qdrant_config/  ./qdrant_config/
+COPY --chmod=0755 tools/          ./tools/
+COPY --chmod=0755 wheels/         ./wheels/
+COPY --chmod=0777 artifacts/      ./artifacts/
+COPY --chmod=0777 qdrant_storage/ ./qdrant_storage/
+
+# 只改目录属性（不复制文件，层极小）：预建运行期可写目录。**非递归** —— 递归 chmod 会让
+# overlay 把每个文件 copy-up 成新层（旧构建 ~1.2G 的"整份文件复制层"就是这么来的）。
+# models/ollama_models 由 entrypoint 在运行期按需补下，故这两个目录必须可写。
+RUN set -eux; \
+    mkdir -p /app/models /app/ollama_models /app/.infinity_cache; \
+    chmod 0777 /app /app/models /app/ollama_models /app/.infinity_cache; \
+    test -x /app/entrypoint.sh; \
+    echo "[layer] /app 顶层："; ls -la /app; \
+    du -sh /app/models /app/ollama_models /app/artifacts /app/qdrant_storage /app/corpus
+
+# ── 容器专有旋钮（**不在 .env 里**，见文件头"服务端参数"）──────────────────────
+# 放在文件末尾：改它们只失效本元数据层，不碰任何模型/数据层。
+# 为什么只属于容器（逐项理由见交付表）：
+#   MALLOC_ARENA_MAX=2   —— glibc 专有；macOS 的 malloc 没有 arena 概念，本地无对应物。
+#   OMP/MKL/OPENBLAS_NUM_THREADS=2 —— 按 2 vCPU 收敛 OpenMP 线程；本地 Mac 多核，且这些
+#                          变量会直接改变本地 torch 的并行度，写进 .env 会改本地行为。
+# 它们只被 entrypoint.sh 启动的 ollama serve / streamlit 读，全部发生在 ENV 之后，
+# 故后移不影响运行期语义（ENV 对整镜像生效，位置只影响构建期可见性）。
+ENV MALLOC_ARENA_MAX=2 \
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=2
 
 EXPOSE 7860
 
