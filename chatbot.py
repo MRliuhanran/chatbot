@@ -1218,7 +1218,12 @@ def build_chunks():
             if dropped:
                 log(f"    ⚠️  丢弃 {dropped} 个纯空白块（不含任何文字）")
             if not kept:
-                raise ValueError(f"文档 {source_name} 分块后无有效内容（所有块均为空白），请检查源文件或调整分块参数")
+                # 空文档（0 字节/纯空白）是**合法边界**，不是本轮失败：按 0 块正常结算并留痕。
+                # 旧写法在此 raise -> failures 短路 -> 整轮拒绝写 chunks.json：一篇空文件就能让
+                # 其余文档的增改全都不入库，且 process 永远退出 1（卡死式静默）。
+                log(f"    ⚠️  文档 {source_name} 分块后无有效内容（0 块）：按空文档结算，不影响其余文档")
+                _save_doc_chunks(source_name, sha, fingerprint, [])
+                continue
             # pairs 是整篇的 (child, parent) 文本对，kept 是它的子集 —— 两者并存就是
             # 这篇文档的文本在峰值里翻倍。kept 起不再需要 pairs。
             del pairs
@@ -1792,6 +1797,13 @@ def build_index():
     meta = verify_chunks_freshness()
     with open(CHUNKS_JSON, encoding="utf-8") as f:
         all_chunks = json.load(f)
+        # ★ 记录键集必须与当前契约一致：改 RAG_SOURCE_FIELD 后只跑 index（没跑 process）时，
+        # 切分指纹与源 sha 都不变、stages 四段全绿，而旧键读不到 -> payload 来源全空、
+        # 来源过滤恒零命中（静默）。这里 fail-closed 并指名要重跑 process。
+        if all_chunks and set(all_chunks[0]) != _RECORD_FIELDS:
+            _miss = sorted(_RECORD_FIELDS - set(all_chunks[0]))
+            _extra = sorted(set(all_chunks[0]) - _RECORD_FIELDS)
+            raise RuntimeError(f"{CHUNKS_JSON} 记录键集与当前契约不一致（多 {_extra}、少 {_miss}）——通常是改了 RAG_SOURCE_FIELD 等字段配置，请重跑 process 后再 index")
     if not all_chunks:
         raise ValueError("chunks.json 为空")
     log(f"加载分块数据: {len(all_chunks)} 条（{meta.get('total_parents', '?')} 个父块）")
