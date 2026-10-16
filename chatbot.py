@@ -3724,9 +3724,92 @@ def cmd_process(args=None):
     return build_chunks()
 
 
+# ── index 单例锁：同一 artifacts 目录只允许一个重建在跑 ──
+# 为什么必须 fail-fast（而不是等待/跳过）：两个 index 会写**同一个**稠密缓存 tmp
+# （_save_embed_cache 用 "<path>.tmp.npz" + os.replace）—— 一方还在写、另一方就把它 rename，
+# 得到的半截缓存**看起来完全正常**（维度对、条数对），却少了一批向量；而写缓存失败只被 catch
+# 成一条 warning。这正是本项目反复点名的"状态"失效原型：不崩，只留下一个像正常的坏文件。
+# 语义：拿不到锁 = 明确报错退出（exit 1）。"另一个重建正在跑"与"本次跳过重建"是两件事，
+# 后者会让调用方以为索引已经更新。
+INDEX_LOCK_FILE = os.path.join(_ARTIFACTS_DIR, ".index.lock")
+
+
+def _pid_alive(pid):
+    """pid 是否还活着。判不了（权限/异常）一律按"活着"处理 —— 保守地不抢别人的锁。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def acquire_index_lock():
+    """取 index 单例锁；拿到返回锁路径，被别人持有则抛 RuntimeError（调用方报错退出）。
+
+    陈旧锁（持有 pid 已不存在：容器被杀、断电、崩溃残留）自动接管并告警 —— 否则一次异常退出
+    就会让 index 永久跑不起来（比并发更糟的失效：功能被一把死锁永久关闭）。
+    """
+    os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
+    for _attempt in range(2):
+        try:
+            fd = os.open(INDEX_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                with open(INDEX_LOCK_FILE, encoding="utf-8") as f:
+                    holder = f.read().strip()
+            except OSError:
+                holder = ""
+            parts = holder.split()
+            pid = int(parts[0]) if parts and parts[0].isdigit() else None
+            if pid is not None and _pid_alive(pid):
+                raise RuntimeError(
+                    f"另一个 index 正在运行（pid={pid}，锁 {INDEX_LOCK_FILE}，起始 {parts[1] if len(parts) > 1 else '未知'}）——"
+                    f"并发重建会写坏同一份稠密缓存，本进程直接退出（不等待、不跳过）。"
+                    f"确认对方已结束后重跑；确实没有别的 index 在跑时删锁: rm -f {INDEX_LOCK_FILE}"
+                ) from None
+            log(f"⚠️  发现陈旧 index 锁（内容 {holder or '空'}）：持有进程已不存在，自动接管 {INDEX_LOCK_FILE}")
+            try:
+                os.remove(INDEX_LOCK_FILE)
+            except OSError as exc:
+                raise RuntimeError(f"陈旧锁 {INDEX_LOCK_FILE} 删除失败（{type(exc).__name__}: {exc}），请手动清理后重跑") from None
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()} {datetime.datetime.now().isoformat(timespec='seconds')}\n")
+        return INDEX_LOCK_FILE
+    raise RuntimeError(f"取 index 锁失败（{INDEX_LOCK_FILE} 连续两次被抢占），请检查后重跑")
+
+
+def release_index_lock():
+    """释放锁。**只删自己持有的那份**（防误删接管者的锁）；失败只告警，不影响重建结果。"""
+    try:
+        with open(INDEX_LOCK_FILE, encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if parts and parts[0].isdigit() and int(parts[0]) != os.getpid():
+            log(f"⚠️  index 锁 {INDEX_LOCK_FILE} 现在属于 pid={parts[0]}，不由本进程删除")
+            return
+        os.remove(INDEX_LOCK_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"⚠️  释放 index 锁失败（不影响本次重建结果）: {type(exc).__name__}: {exc}")
+
+
 def cmd_index(args=None):
     log("阶段二: 向量化入库")
-    build_index()
+    try:
+        acquire_index_lock()
+    except RuntimeError as exc:
+        log(f"❌ {exc}")
+        return 1
+    try:
+        # finally 覆盖正常返回、异常与 Ctrl-C（KeyboardInterrupt 也走 finally）：
+        # 绝不因为一次中断把锁留在盘上。
+        build_index()
+    finally:
+        release_index_lock()
+    return 0
 
 
 def _port_in_use(port):
