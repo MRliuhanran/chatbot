@@ -91,3 +91,9 @@ ftfy==6.3.1
 OpenCC==1.1.9
 pyahocorasick==2.3.1
 tenacity==9.1.4
+
+# 生成侧精确分词：用 Ollama 背后的 llama.cpp 直接分词（零规则）。需要预编译 wheel，
+# Dockerfile 已加上 https://abetlen.github.io/llama-cpp-python/whl/cpu 额外索引。
+# 若本地无外网/离线构建，需先把 wheel 放到 wheels/ 目录。
+llama-cpp-python==0.3.19
+diskcache==5.6.3

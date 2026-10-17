@@ -177,6 +177,7 @@ RUN set -eux; \
         --find-links /tmp/wheels \
         --index-url "${PIP_INDEX_URL}" \
         --extra-index-url "${PIP_FALLBACK_INDEX}" \
+        --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/cpu" \
         -r requirements.txt \
     && uv pip check --system \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \

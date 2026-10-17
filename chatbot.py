@@ -2881,15 +2881,57 @@ if NUM_CTX <= GEN_INPUT_RESERVE:
 GEN_HISTORY_MAX_TOKENS = env_int_min("RAG_GEN_HISTORY_MAX_TOKENS", 0, 0)
 # 原值"……（已按上下文预算截断）"；按全裸 prompt 配置置空：截断无痕，空内容条照旧被整条丢弃。
 _TRUNCATION_MARK = ""
-# 生成侧精确计数：给到**生成模型自己的** tokenizer 目录时用它，否则退回保守估算。
-# Ollama 不暴露分词接口（/api/tokenize 恒 404），本机也无 gguf/llama 工具、无外网，所以
-# 想精确必须把 tokenizer 文件（HF 目录，如 Qwen 的 tokenizer.json）放到本路径。中文语料
-# 下估算按"1 字=1 token"偏高、不会越界但会少用窗口；换真 tokenizer 即吃回余量，并让硬
-# 上界从"估算保证"升级为"真 token 保证"。加载失败只降级告警，绝不中断生成。
+# 生成侧精确计数。Ollama 不暴露分词接口（/api/tokenize 恒 404），但**它运行期用的就是
+# llama.cpp**——同一份 GGUF 用 llama-cpp-python 以 vocab_only 加载后分词，与生成端逐字节
+# 一致，且**不需要任何切分规则表**（无需照抄 llama.cpp 的 pre 正则、无需逐模型维护）。
+# 取用优先级：
+#   1) RAG_GEN_GGUF_PATH 指定的 GGUF；2) 按 MODEL 的 Ollama manifest 自动定位的 GGUF；
+#   3) RAG_GEN_TOKENIZER_PATH（tokenizer.json / HF 目录）——离线无 llama-cpp-python 时的回退；
+#   4) 保守估算："1 字=1 token"偏高、不越界但少用窗口。
+# 任一步失败只降级告警，绝不中断生成。
 GEN_TOKENIZER_PATH = os.getenv("RAG_GEN_TOKENIZER_PATH", "")
+# 显式指定生成模型的 GGUF；留空则按 MODEL 自动定位。
+GEN_GGUF_PATH = os.getenv("RAG_GEN_GGUF_PATH", "")
+# Ollama 模型目录（manifests/ + blobs/）。容器里由镜像 OLLAMA_MODELS 指到烘焙好的
+# /app/ollama_models，本地原生默认 ~/.ollama/models。
+OLLAMA_MODELS_DIR = os.getenv("OLLAMA_MODELS") or os.path.expanduser("~/.ollama/models")
 # 懒加载必须上锁：无锁时并发首请求会一个走"加载中=估算"、一个等完拿到真 tokenizer，
 # 同一次生成装配里前后两段计数各按一套口径（预算裁剪与硬上界分叉）。缓存放 _RuntimeState：
 # 预热线程/API 请求/Streamlit rerun 之间共用一个进程内的同一份。
+def _find_ollama_gguf(model, models_dir=OLLAMA_MODELS_DIR):
+    """按 Ollama manifest 定位 model 层的 GGUF blob。
+
+    manifest 布局对自 Ollama registry：<models_dir>/manifests/registry.ollama.ai/library/
+    <name>/<tag>；取 mediaType 以 image.model 结尾的层 digest，拼成 blobs/sha256-<digest>。
+    定位失败抛异常，由调用方降级（不吞错，日志里能看到具体原因）。
+    """
+    name, tag = model.split(":", 1) if ":" in model else (model, "latest")
+    manifest = os.path.join(models_dir, "manifests", "registry.ollama.ai", "library", name, tag)
+    with open(manifest, encoding="utf-8") as fh:
+        layers = json.load(fh)["layers"]
+    digest = next(layer["digest"].split(":", 1)[1] for layer in layers
+                  if layer["mediaType"].endswith("image.model"))
+    return os.path.join(models_dir, "blobs", "sha256-" + digest)
+
+
+class _LlamaCppTokenizer:
+    """把 Ollama 背后的 llama.cpp 直接当 tokenizer：零切分规则、与生成端逐字节一致。
+
+    vocab_only=True 只读词表、不加载权重张量；encode 走 llama_tokenize（与 Ollama 运行期
+    同一份实现，故计数精确）。对外只暴露 encode()（与 tokenizers / transformers 对齐），
+    _count_tokens 沿用同一入口。首次构造有一次性词表加载开销，故由 caller 懒加载。
+    """
+
+    def __init__(self, gguf_path):
+        from llama_cpp import Llama
+        self._llm = Llama(model_path=gguf_path, vocab_only=True, verbose=False)
+
+    def encode(self, text, add_special_tokens=False):
+        # add_bos=False 与 tokenizers 路径的 add_special_tokens=False 对齐：本函数按"条"计数，
+        # BOS 属于整条 prompt、由服务端模板加一次，不在这里重复计。
+        return self._llm.tokenize(text.encode("utf-8"), add_bos=False)
+
+
 def _load_gen_tokenizer(path):
     """加载生成模型 tokenizer。两条官方来源都吃：
 
@@ -2922,6 +2964,36 @@ def _count_tokens(tok, text):
     return len(ids.ids)
 
 
+def _load_gen_tokenizer_default():
+    """按优先级取生成侧 tokenizer：llama.cpp（GGUF）→ tokenizer.json/HF 目录 → None（估算）。
+
+    每一级都"加载即验证"（编一次冒烟串）：编不了就当该级失败、降级到下一级，绝不让坏
+    tokenizer 挂上去导致每次调用静默出错。
+    """
+    gguf = GEN_GGUF_PATH
+    if not gguf:
+        try:
+            gguf = _find_ollama_gguf(MODEL)
+        except Exception:
+            gguf = None
+    if gguf and os.path.isfile(gguf):
+        try:
+            tok = _LlamaCppTokenizer(gguf)
+            _count_tokens(tok, "冒烟")
+            log(f"✅ 生成 tokenizer：llama.cpp（GGUF={gguf}）")
+            return tok
+        except Exception as exc:
+            log(f"⚠️  llama.cpp 分词不可用（{gguf}），改用 tokenizer.json: {type(exc).__name__}: {exc}")
+    if GEN_TOKENIZER_PATH:
+        try:
+            tok = _load_gen_tokenizer(GEN_TOKENIZER_PATH)
+            _count_tokens(tok, "冒烟")
+            return tok
+        except Exception as exc:
+            log(f"⚠️  生成 tokenizer 加载失败（{GEN_TOKENIZER_PATH}），退回估算计数: {type(exc).__name__}: {exc}")
+    return None
+
+
 def _get_gen_tokenizer():
     state = _state_ref()
     # 快路径无锁读引用：CPython 下属性读是原子的，tokenizer 一旦挂好就是常量，后续
@@ -2934,15 +3006,7 @@ def _get_gen_tokenizer():
         if state.gen_tokenizer_tried:
             return state.gen_tokenizer
         state.gen_tokenizer_tried = True
-        if not GEN_TOKENIZER_PATH:
-            return None
-        try:
-            tok = _load_gen_tokenizer(GEN_TOKENIZER_PATH)
-            _count_tokens(tok, "冒烟")   # 加载即验证：编不了就当加载失败，避免每次调用静默降级
-            state.gen_tokenizer = tok
-        except Exception as exc:
-            log(f"⚠️  生成 tokenizer 加载失败（{GEN_TOKENIZER_PATH}），退回估算计数: {type(exc).__name__}: {exc}")
-            state.gen_tokenizer = None
+        state.gen_tokenizer = _load_gen_tokenizer_default()
         return state.gen_tokenizer
 
 
