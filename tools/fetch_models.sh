@@ -225,6 +225,123 @@ _ollama_manifest_meta() {
     esac
 }
 
+# ── 官方 registry 多连接直下（绕开 ollama pull 的单流）─────────────────────────
+# 背景：ollama pull 每个 blob 都是**单条 TCP 流**，对官方源（registry.ollama.ai →
+#   307 跳 Cloudflare R2）在境外链路常远跑不满带宽。本组按 OCI 分发协议直接取
+#   manifest + blobs，对每个 blob 开 N 条 Range 连接**分片并行**拉，拼回、校验 sha256
+#   后，按 Ollama 的磁盘布局落盘：
+#       <OLLAMA_MODELS>/manifests/<host>/library/<name>/<tag>
+#       <OLLAMA_MODELS>/blobs/sha256-<hex>
+#   ollama 无需再 pull 即可识别（已用真实模型验证：手动落盘后 ollama list/show 正常）。
+# 连接数：RAG_OLLAMA_DL_CONNS（默认 16）；小文件按体积自动降连接数（每连接 ≥1MiB）。
+# 失败语义：任一步失败 → 返回非零 → 调用方退回 ollama pull（保底出模型，只是可能慢）。
+# ⚠️ manifest/blobs 均为标准 OCI 产物，content-addressed；sha256 校验后再原子 rename 落盘，
+#    半截文件绝不就位（沿用 _download_model 的"先暂存再换入"风格）。
+_sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# 解析 307 后的最终直链（R2 预签名 URL）。签名只绑 host、24h 内有效，Range 可用。
+_curl_final_url() {
+    curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+        -r 0-0 -o /dev/null -w '%{url_effective}' "$1"
+}
+
+# 分片并行下载：$1=直链 $2=目标文件 $3=总字节 $4=连接数
+_curl_multiseg() {
+    local _url="$1" _out="$2" _size="$3" _conns="$4"
+    local _eff _seg _i _s _e _p _dir _rc=0
+    [ "${_size}" -gt 0 ] || return 1
+    _eff=$(( (_size + 1048575) / 1048576 ))          # 每连接至少 ~1MiB
+    [ "${_conns}" -lt "${_eff}" ] || _conns="${_eff}"
+    [ "${_conns}" -lt 1 ] && _conns=1
+    _seg=$(( _size / _conns )); [ "${_seg}" -lt 1 ] && _seg=1
+    _dir="$(mktemp -d "${_out}.parts.XXXXXX")" || return 1
+    local -a _pids=()
+    for ((_i=0; _i<_conns; _i++)); do
+        _s=$(( _i * _seg ))
+        [ "${_s}" -ge "${_size}" ] && break
+        if [ "${_i}" -eq "$(( _conns - 1 ))" ]; then _e=$(( _size - 1 )); else _e=$(( _s + _seg - 1 )); fi
+        curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 3600 \
+            -r "${_s}-${_e}" "$_url" -o "${_dir}/$(printf '%05d' "${_i}")" &
+        _pids+=("$!")
+    done
+    for _p in "${_pids[@]}"; do wait "${_p}" || _rc=1; done
+    if [ "${_rc}" = 0 ]; then
+        cat "${_dir}"/* > "${_out}" || _rc=1
+    fi
+    rm -rf "${_dir}"
+    return "${_rc}"
+}
+
+# _download_ollama_official <model>：官方源多连接直下并落到 Ollama 布局。
+# 只吃无 host 的短名（如 qwen3.5:4b-q4_K_M）；带 '/' 的一律返回 1（交回原路径）。
+_download_ollama_official() {
+    local _model="$1"
+    case "${_model}" in
+        ""|*/*) return 1 ;;
+    esac
+    : "${OLLAMA_MODELS:=/app/ollama_models}"
+    local _registry="${RAG_OLLAMA_REGISTRY:-https://registry.ollama.ai}"
+    local _host="${_registry#*://}"; _host="${_host%%/*}"
+    local _name="${_model%%:*}" _tag="latest"
+    case "${_model}" in *:*) _tag="${_model##*:}" ;; esac
+    local _conns="${RAG_OLLAMA_DL_CONNS:-16}"
+    local _murl="${_registry}/v2/library/${_name}/manifests/${_tag}"
+    local _mdir="${OLLAMA_MODELS}/manifests/${_host}/library/${_name}"
+    local _mdest="${_mdir}/${_tag}" _mtmp="${_mdir}/.${_tag}.tmp.$$"
+    local _list _hex _size _blob _btmp _final _got
+
+    _log "官方多连接：取 manifest ${_murl}（连接数 ${_conns}）"
+    mkdir -p "${OLLAMA_MODELS}/blobs" "${_mdir}" || return 1
+    if ! curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "${_murl}" -o "${_mtmp}"; then
+        _log "⚠️  官方 manifest 获取失败: ${_murl}"; rm -f "${_mtmp}"; return 1
+    fi
+    if ! _list="$(python3 - "${_mtmp}" 2>/dev/null <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+blobs = [(m["config"]["digest"], m["config"]["size"])]
+blobs += [(l["digest"], l["size"]) for l in m.get("layers", [])]
+for d, s in blobs:
+    print("%s %s" % (d.split(":", 1)[1], s))
+PY
+    )"; then
+        _log "⚠️  官方 manifest 解析失败"; rm -f "${_mtmp}"; return 1
+    fi
+
+    while read -r _hex _size; do
+        [ -n "${_hex}" ] || continue
+        _blob="${OLLAMA_MODELS}/blobs/sha256-${_hex}"
+        if [ -s "${_blob}" ] && [ "$(wc -c < "${_blob}" | tr -d ' ')" = "${_size}" ]; then
+            continue
+        fi
+        if ! _final="$(_curl_final_url "${_registry}/v2/library/${_name}/blobs/sha256:${_hex}")" || [ -z "${_final}" ]; then
+            _log "⚠️  解析 blob 直链失败: ${_hex:0:12}…"; rm -f "${_mtmp}"; return 1
+        fi
+        _btmp="${_blob}.part.$$"
+        _log "  ↓ blob ${_hex:0:12}… ${_size}B"
+        if ! _curl_multiseg "${_final}" "${_btmp}" "${_size}" "${_conns}"; then
+            _log "⚠️  分片下载失败: ${_hex:0:12}…"; rm -f "${_btmp}" "${_mtmp}"; return 1
+        fi
+        _got="$(_sha256_of "${_btmp}")"
+        if [ "${_got}" != "${_hex}" ]; then
+            _log "⚠️  sha256 校验失败 ${_hex:0:12}…（实得 ${_got:0:12}…）"
+            rm -f "${_btmp}" "${_mtmp}"; return 1
+        fi
+        if ! mv -f "${_btmp}" "${_blob}"; then rm -f "${_btmp}" "${_mtmp}"; return 1; fi
+    done <<< "${_list}"
+
+    if ! mv -f "${_mtmp}" "${_mdest}"; then rm -f "${_mtmp}"; return 1; fi
+    _log "✅ 官方多连接落盘完成: ${_model}"
+    return 0
+}
+
 # _pull_ollama_model <model> ─────────────────────────────────────────────────
 # 确保生成模型在 OLLAMA_MODELS 下就位。构建期无人预启服务，函数会自己拉起 ollama serve
 # 并在结束后关掉；运行期 entrypoint 已启动服务，这里只做 list 判据、不重复起第二个。
@@ -261,12 +378,25 @@ _pull_ollama_model() {
             sleep 1
         done
     fi
-    # 源选择：优先 ModelScope 官方 Ollama 集成（modelscope.cn/<owner>/<repo>:<quant>，
-    # 走 ModelScope CDN；实测 ~8MB/s，而 registry.ollama.ai 只有 ~1.4MB/s，3.4GB 差约 40 分钟）。
-    # 变量可空，空则退回官方 registry（老行为）。
+    # 源选择：
+    #   · RAG_GEN_MODEL_MODELSCOPE 非空 → ModelScope 官方 Ollama 集成（境内 CDN 快，
+    #     但 manifest 由平台自动生成、缺 renderer/parser，需下面用 Modelfile 补）；
+    #   · 为空 → 官方 registry。此时**先试多连接直下**（绕开 ollama pull 单流），
+    #     成功即免 pull，失败退回下面的 ollama pull（老行为，保底能出模型）。
     local _src="${RAG_GEN_MODEL_MODELSCOPE:-$(_env_get RAG_GEN_MODEL_MODELSCOPE)}"
     local _pulled="${_model}"
     [ -n "${_src}" ] && _pulled="${_src}"
+
+    if [ -z "${_src}" ]; then
+        if _download_ollama_official "${_model}" \
+           && ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -Fxq "${_model}"; then
+            [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
+            _log "生成模型已就绪（官方源多连接）: ${_model}"
+            return 0
+        fi
+        _log "⚠️  官方源多连接不可用/未生效，退回 ollama pull（单流）: ${_model}"
+    fi
+
     _log "拉取生成模型: ${_pulled}（models=${OLLAMA_MODELS}）→ /tmp/ollama-pull.log"
     # 构建期拉取必须扛得住瞬时抖动：一次失败就让整层 RUN 失败、整个镜像构建失败
     # （实测 2026-10-16 连续两次把公开站点打成 BuildFailed，站点下线近一小时）。
