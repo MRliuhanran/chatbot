@@ -3890,9 +3890,12 @@ def cmd_serve(args=None):
 
 # ── 交互入口：Streamlit 主界面 ──
 def _render_stored_message(msg):
-    """历史消息最简渲染：只有正文或错误（思维链只在当轮流式展示，历史不留折叠区）。"""
+    """历史消息渲染：正文/错误，以及已存的思维链（折叠区；只有 RAG_THINK 开启时才会入历史）。"""
     import streamlit as st
     with st.chat_message(msg["role"]):
+        if msg.get("thinking"):
+            with st.expander("思维链", expanded=False):
+                st.markdown(msg["thinking"])
         if msg.get("content"):
             st.markdown(msg["content"])
         elif msg.get("error"):
