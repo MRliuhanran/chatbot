@@ -234,7 +234,8 @@ _ollama_manifest_meta() {
 #       <OLLAMA_MODELS>/blobs/sha256-<hex>
 #   ollama 无需再 pull 即可识别（已用真实模型验证：手动落盘后 ollama list/show 正常）。
 # 连接数：RAG_OLLAMA_DL_CONNS（默认 16）；小文件按体积自动降连接数（每连接 ≥1MiB）。
-# 失败语义：任一步失败 → 返回非零 → 调用方退回 ollama pull（保底出模型，只是可能慢）。
+# 失败语义：任一步失败 → 返回非零 → 调用方**直接判失败**（构建报错结束）；官方源**不退回
+#   ollama pull**（有意去掉兜底：失败要响亮，别偷偷退成单流把问题藏起来）。
 # ⚠️ manifest/blobs 均为标准 OCI 产物，content-addressed；sha256 校验后再原子 rename 落盘，
 #    半截文件绝不就位（沿用 _download_model 的"先暂存再换入"风格）。
 _sha256_of() {
@@ -381,20 +382,23 @@ _pull_ollama_model() {
     # 源选择：
     #   · RAG_GEN_MODEL_MODELSCOPE 非空 → ModelScope 官方 Ollama 集成（境内 CDN 快，
     #     但 manifest 由平台自动生成、缺 renderer/parser，需下面用 Modelfile 补）；
-    #   · 为空 → 官方 registry。此时**先试多连接直下**（绕开 ollama pull 单流），
-    #     成功即免 pull，失败退回下面的 ollama pull（老行为，保底能出模型）。
+    #   · 为空 → 官方 registry，走多连接直下（绕开 ollama pull 单流）。
+    #     ⚠️ 官方源**不做 ollama pull 兜底**：多连接失败即判失败（构建直接报错结束），
+    #     让真实网络/协议问题暴露出来，而不是悄悄退化成单流慢拉把故障藏起来。
     local _src="${RAG_GEN_MODEL_MODELSCOPE:-$(_env_get RAG_GEN_MODEL_MODELSCOPE)}"
     local _pulled="${_model}"
     [ -n "${_src}" ] && _pulled="${_src}"
 
     if [ -z "${_src}" ]; then
-        if _download_ollama_official "${_model}" \
-           && ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -Fxq "${_model}"; then
+        if ! _download_ollama_official "${_model}" \
+           || ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -Fxq "${_model}"; then
+            _log "❌ 官方源多连接下载失败/未就位: ${_model}（已禁用 ollama pull 兜底）"
             [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
-            _log "生成模型已就绪（官方源多连接）: ${_model}"
-            return 0
+            return 1
         fi
-        _log "⚠️  官方源多连接不可用/未生效，退回 ollama pull（单流）: ${_model}"
+        [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
+        _log "生成模型已就绪（官方源多连接）: ${_model}"
+        return 0
     fi
 
     _log "拉取生成模型: ${_pulled}（models=${OLLAMA_MODELS}）→ /tmp/ollama-pull.log"

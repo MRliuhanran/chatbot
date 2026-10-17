@@ -213,7 +213,12 @@ FROM appbase AS modelbake
 SHELL ["/bin/bash", "-c"]
 WORKDIR /app
 
-COPY .env ./
+# ⚠️ 这里**有意不 COPY 整个 .env**，而是用只含"模型选择键"的 tools/bake.env 顶替成 .env：
+# modelbake 只关心"下哪些模型"（MODEL / RAG_*_MODEL_PATH / RAG_GEN_MODEL_MODELSCOPE /
+# RAG_OLLAMA_DL_CONNS）。COPY 整个 .env 会让任何业务配置（RAG_THINK / RAG_NUM_CTX…）
+# 一变就使烘焙层缓存失效、重下 ~7.7G；改用 bake.env 后，业务配置改动命中缓存、整段跳过。
+# 一致性由下方 app 阶段的断言兜底（.env ↔ tools/bake.env 逐键比对，不一致即构建失败）。
+COPY tools/bake.env ./.env
 # dotenv.sh 与 fetch_models.sh 一起进构建期：Ollama 服务端参数在构建期也走**同一个**
 # _load_dotenv，与运行期逐字同源（避免"构建期一套、运行期一套"的第二条注入路径）。
 COPY tools/fetch_models.sh tools/dotenv.sh ./tools/
@@ -244,8 +249,8 @@ RUN set -eux; \
     . ./tools/dotenv.sh; \
     _load_dotenv; \
     . ./tools/fetch_models.sh; \
-    echo "[bake] 检索模型（来自 .env）：embed=$(basename "$(_env_get RAG_EMBED_MODEL_PATH)") rerank=$(basename "$(_env_get RAG_RERANK_MODEL_PATH)") 生成模型=$(_env_get MODEL)"; \
-    echo "[bake] 生成侧语义参数（来源 .env，与运行期同一解析器）：KV_CACHE_TYPE=${OLLAMA_KV_CACHE_TYPE:-<未设>} FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-<未设>} NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-<未设>}（线程数/arena 是**运行期**按目标机 cgroup 派生的，构建期无法预知，故此处不打）"; \
+    echo "[bake] 检索模型（来自 tools/bake.env）：embed=$(basename "$(_env_get RAG_EMBED_MODEL_PATH)") rerank=$(basename "$(_env_get RAG_RERANK_MODEL_PATH)") 生成模型=$(_env_get MODEL)"; \
+    echo "[bake] 生成侧语义参数：本层用的是 tools/bake.env（只含模型选择键），故 KV_CACHE_TYPE/FLASH_ATTENTION/NUM_PARALLEL 之类的 OLLAMA_* 在此为未设 —— 它们只影响**运行期**服务，且由最终阶段的 .env 提供（构建期烘焙只看模型，不看服务参数）。"; \
     echo "[bake] ==================== 三段并行下载（最后一次 wait 收口）===================="; \
     _pids=(); _tags=(); \
     if [ "${BAKE_MODELS}" = "1" ]; then \
@@ -385,6 +390,24 @@ COPY --chmod=0755 tools/          ./tools/
 COPY --chmod=0755 wheels/         ./wheels/
 COPY --chmod=0777 artifacts/      ./artifacts/
 COPY --chmod=0777 storage/ ./storage/
+
+# 模型清单一致性断言（.env ↔ tools/bake.env）─────────────────────────────────────
+# modelbake 只 COPY tools/bake.env（为的是业务配置改动不打穿烘焙层缓存），而运行期读 .env。
+# 二者对"模型选择键"必须逐键一致，否则会出现"构建期烘焙 A、运行期按 .env 加载 B"。
+# 这里在最终镜像里把它们比一遍：不一致即构建失败（响亮，不静默）。用的 _env_get 与
+# 构建/运行期**同一解析器**（tools/fetch_models.sh），不另造一份 .env 解析。
+RUN set -eux; \
+    . ./tools/fetch_models.sh; \
+    for _k in MODEL RAG_GEN_MODEL_MODELSCOPE RAG_OLLAMA_DL_CONNS RAG_EMBED_MODEL_PATH RAG_RERANK_MODEL_PATH; do \
+        _a="$(_env_get "${_k}" .env)"; \
+        _b="$(_env_get "${_k}" tools/bake.env)"; \
+        if [ "${_a}" != "${_b}" ]; then \
+            echo "[check] ❌ 模型清单漂移：${_k} 在 .env='${_a}' 与 tools/bake.env='${_b}' 不一致" >&2; \
+            echo "[check]    .env 决定运行期加载、tools/bake.env 决定构建期烘焙 —— 两处必须同步改" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    echo "[check] ✅ 模型清单一致（.env ↔ tools/bake.env）"
 
 # 只改目录属性（不复制文件，层极小）：预建运行期可写目录。**非递归** —— 递归 chmod 会让
 # overlay 把每个文件 copy-up 成新层（旧构建 ~1.2G 的"整份文件复制层"就是这么来的）。
