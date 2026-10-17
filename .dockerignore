@@ -43,11 +43,6 @@ storage/**/wal/open-*
 storage/collections/*/*/wal/closed-*
 storage/collections/*/*/wal/open-*
 
-# 历史遗留死重：studio 工作区残留的未跟踪旧集合（fp16 重建后遗留，与别名集合内容重复），
-# 会被构建上下文带上（实测镜像 /app/storage=393M ≈ 两份 180M）；显式排除。
-# 别名指向的集合（storage/aliases/data.json 里的 rag_current）才是唯一该进镜像的。
-storage/collections/rag_documents_v1__c31ac8c7/
-
 # 不该进公开镜像（2026-10-16 白盒评审 #2）：
 .bin/
 .cache/
