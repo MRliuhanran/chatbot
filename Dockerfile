@@ -67,6 +67,33 @@
 #             -v "$PWD/models:/app/models:ro" rag-chatbot
 #           （挂载本地模型仅为离线自测；不挂载则启动时自动下载）
 
+# ── 生成侧精确分词 wheel：源码编译 llama-cpp-python 的 GLIBC 版（独立阶段，不进最终镜像）──
+# 为什么必须自编：llama-cpp-python **0.3.x 全系列都没有 glibc wheel** —— PyPI 只有 sdist，
+# abetlen 的 cpu 索引与 GitHub Release 只发 musl 版（linux_x86_64，DT_NEEDED=libc.musl-x86_64.so.1）。
+# 在 python:3.10-slim-bookworm（glibc）上加载该 musl wheel 直接失败：
+#   ⚠️ llama.cpp 分词不可用 … libc.musl-x86_64.so.1: cannot open shared object file
+#   → 生成侧精确分词**静默**退化成 tokenizer.json（2026-10-17 云端运行日志实测，违反"本地=云端"）。
+# 修法：用 build-essential+cmake 从 sdist 编译出 glibc wheel（实测 NEEDED=libc.so.6 /
+# libstdc++.so.6 / libgcc_s.so.1，RUNPATH=$ORIGIN → 自带 libggml*/libllama.so，不依赖系统额外库）。
+# 只产出 wheel，编译器不进最终镜像；版本**从 requirements.txt 现取**，避免与 pin 漂移（取不到即报错）。
+# 本阶段较慢，但输入仅 requirements.txt —— 层缓存命中即可整段跳过（不会拖慢日常重建）。
+FROM python:3.10-slim-bookworm AS lcpwheel
+# 与 appbase 同名 ARG 的默认值保持一致（本阶段在其之前，无法继承 appbase 的 ARG）。
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_FALLBACK_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential cmake \
+ && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN set -eux; \
+    _v="$(sed -nE 's/^llama-cpp-python==([^[:space:]]+).*$/\1/p' requirements.txt | head -n1)"; \
+    [ -n "${_v}" ] || { echo "[lcpwheel] ❌ requirements.txt 未找到 llama-cpp-python==<版本>"; exit 1; }; \
+    echo "[lcpwheel] 从源码编译 llama-cpp-python==${_v}（glibc）"; \
+    pip wheel --no-cache-dir --no-deps --wheel-dir /lcpwheel \
+        --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_FALLBACK_INDEX}" \
+        "llama-cpp-python==${_v}"; \
+    ls -l /lcpwheel
+
 # ── 基座与依赖：appbase 同时是 modelbake 与最终镜像的父层（同一份 apt/pip/ollama 只构建一次）
 FROM python:3.10-slim-bookworm AS appbase
 
@@ -160,6 +187,9 @@ WORKDIR /app
 # uv 本身也走主源+兜底源，避免镜像滞后导致构建工具装不上。
 COPY requirements.txt .
 COPY wheels/ /tmp/wheels/
+# 生成侧精确分词的 glibc wheel 由文件顶部的 lcpwheel 阶段源码编译产出，放进同一个 find-links 目录；
+# wheels/ 里**不再放** llama-cpp-python 的预编译 wheel（0.3.x 的官方预编译只有 musl 版，在 bookworm 上不可用）。
+COPY --from=lcpwheel /lcpwheel/ /tmp/wheels/
 RUN set -eux; \
     _t0=$(date +%s); \
     pip install --no-cache-dir \

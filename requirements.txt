@@ -92,8 +92,11 @@ OpenCC==1.1.9
 pyahocorasick==2.3.1
 tenacity==9.1.4
 
-# 生成侧精确分词：用 Ollama 背后的 llama.cpp 直接分词（零规则）。需要预编译 wheel，
-# Dockerfile 已加上 https://abetlen.github.io/llama-cpp-python/whl/cpu 额外索引。
-# 若本地无外网/离线构建，需先把 wheel 放到 wheels/ 目录。
+# 生成侧精确分词：用 Ollama 背后的 llama.cpp 直接分词（零规则）。
+# ⚠️ llama-cpp-python 0.3.x **没有 glibc wheel**：PyPI 只有 sdist；abetlen 的 cpu 索引与
+# GitHub Release 只发 musl 版（linux_x86_64，DT_NEEDED=libc.musl-x86_64.so.1）。在 bookworm
+# （glibc）上加载即失败 → llama.cpp 分词静默退化成 tokenizer.json。
+# 故 Dockerfile 用独立阶段 lcpwheel 从 sdist **源码编译出 glibc wheel**，放进 --find-links。
+# 本地/离线构建也可自行 `pip wheel llama-cpp-python==0.3.19` 后把产物丢进 wheels/。
 llama-cpp-python==0.3.19
 diskcache==5.6.3
