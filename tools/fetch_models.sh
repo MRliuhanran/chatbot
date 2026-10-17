@@ -209,11 +209,27 @@ _download_models() {
     return "${_dl_fail}"
 }
 
+# _ollama_manifest_meta <model> ──────────────────────────────────────────────
+# ModelScope 的 Ollama 集成**依据 GGUF 自动生成** manifest，但只落 template/params/license，
+# **不落 renderer/parser**（实测对比两边 config blob：官方 qwen3.5:4b-q4_K_M 带
+# "renderer":"qwen3.5"/"parser":"qwen3.5"，ModelScope 版两者皆无）。
+# 后果很隐蔽：ollama show 仍报 "thinking" 能力，但 /api/chat 传 think=true 时**不会把思考
+# 拆进 message.thinking 字段**——应用侧思维链永远是空的，正文却正常（实测同一份 GGUF，
+# 补不补 renderer/parser，thinking 有无判然不同；正文一致）。故从 ModelScope 快源拉下来的
+# 模型必须用 Modelfile 补上这两行，才能和官方 registry 那份行为一致。
+# 输出为该家族需要的 Modelfile 指令（不含 FROM）；未收录的家族返回 1，调用方退回 ollama cp。
+_ollama_manifest_meta() {
+    case "${1%%:*}" in
+        qwen3.5) printf 'RENDERER qwen3.5\nPARSER qwen3.5\n' ;;
+        *) return 1 ;;
+    esac
+}
+
 # _pull_ollama_model <model> ─────────────────────────────────────────────────
 # 确保生成模型在 OLLAMA_MODELS 下就位。构建期无人预启服务，函数会自己拉起 ollama serve
 # 并在结束后关掉；运行期 entrypoint 已启动服务，这里只做 list 判据、不重复起第二个。
 _pull_ollama_model() {
-    local _model="$1" _pid="" _we_started=0 _i
+    local _model="$1" _pid="" _we_started=0 _i _meta=""
     # 空模型名的两种语境（评审 #5）—— 返回值就是构建期唯一的闸门（Dockerfile 的 RUN 带
     # set -e，调用形式是 _pull_ollama_model "$(_env_get MODEL)"，BAKE_OLLAMA=1）：
     #   · 构建期：旧写法无条件 return 0 → .env 漏了 MODEL 时"构建成功却一个生成模型都没
@@ -273,13 +289,26 @@ _pull_ollama_model() {
         sleep $(( _try * 15 ))
     done
     if [ "${_pulled}" != "${_model}" ]; then
-        # ModelScope 源名带 host/repo，应用只认短名；ollama cp 只新建 manifest、共享同一份 blob，
-        # 不复制数据；随后删源名，避免 ollama list 出现两个名字。
+        # ModelScope 源名带 host/repo，应用只认短名；下面无论 create 还是 cp，都只新建 manifest、
+        # 共享同一份 blob（不复制数据）；随后删源名，避免 ollama list 出现两个名字。
         ollama rm "${_model}" >/dev/null 2>&1 || true
-        if ! ollama cp "${_pulled}" "${_model}" >>/tmp/ollama-pull.log 2>&1; then
-            _log "❌ 生成模型重命名失败: ${_pulled} → ${_model}，详见 /tmp/ollama-pull.log"
-            [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
-            return 1
+        # ModelScope 自动生成的 manifest 缺 renderer/parser（原因见 _ollama_manifest_meta），
+        # 缺了它 think=true 不会产出 message.thinking。已收录的家族用 Modelfile 补上再建成短名；
+        # 未收录的家族退回 ollama cp（保底能出正文，但思维链不可用）。
+        if _meta="$(_ollama_manifest_meta "${_model}")" && [ -n "${_meta}" ]; then
+            printf 'FROM %s\n%s' "${_pulled}" "${_meta}" > /tmp/ollama-gen.Modelfile
+            if ! ollama create "${_model}" -f /tmp/ollama-gen.Modelfile >>/tmp/ollama-pull.log 2>&1; then
+                _log "❌ 生成模型建模失败（补 renderer/parser）: ${_pulled} → ${_model}，详见 /tmp/ollama-pull.log"
+                [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
+                return 1
+            fi
+        else
+            _log "⚠️  ${_model} 未收录 renderer/parser 家族，退回 ollama cp（思维链可能不可用）"
+            if ! ollama cp "${_pulled}" "${_model}" >>/tmp/ollama-pull.log 2>&1; then
+                _log "❌ 生成模型重命名失败: ${_pulled} → ${_model}，详见 /tmp/ollama-pull.log"
+                [ "${_we_started}" = 1 ] && { kill "${_pid}" 2>/dev/null || true; wait "${_pid}" 2>/dev/null || true; }
+                return 1
+            fi
         fi
         ollama rm "${_pulled}" >/dev/null 2>&1 || true
     fi
