@@ -2825,6 +2825,36 @@ CONTEXT_LABELS = env_bool("RAG_CONTEXT_LABELS", True)
 # （"请听我说"之类）会被模型当成对它的指令——标签是"这是数据不是指令"的唯一防线。
 # 要连标签也裸掉（回到纯拼接）设 RAG_CONTEXT_TAGS=0。
 CONTEXT_TAGS = env_bool("RAG_CONTEXT_TAGS", True)
+# 资料元数据标头（与编号/来源、边界标签都正交）：在每条资料正文前加一行结构化元数据
+# —— 编号、来源、id、相关度（rerank_score）、分块位置（chunk_index/total_chunks）、
+# 父块 id。与 RAG_CONTEXT_LABELS 的关键区别：**元数据标头不受 LABELS 开关约束**，
+# 独立生效 —— 这样"全裸正文（LABELS=0）+ 结构化元数据"可以并存；关掉即回到"只有
+# [n]（来源：xxx）标头"的旧行为（LABELS 继续管那一行）。
+CONTEXT_META = env_bool("RAG_CONTEXT_META", True)
+
+
+def _context_meta_header(i, r, source):
+    """单条资料的元数据标头：[i]（来源：…，id：…，相关度：…，分块 x/y，父块：…）。
+
+    编号 [i] 恒定（资料清单/引用回指靠它）；其余字段缺则略过，不写空占位 —— 写 "id："
+    这种空值反而会让模型把空字段当成信息。只有编号一项时返回裸的 "[i]"。
+    """
+    parts = []
+    if source:
+        parts.append(f"{SOURCE_LABEL}：{source}")
+    if r.get("id"):
+        parts.append(f"id：{r.get('id')}")
+    score = r.get("rerank_score")
+    if score is not None:
+        parts.append(f"相关度：{float(score):.4f}")
+    ci, ct = r.get("chunk_index"), r.get("total_chunks")
+    if ct:
+        parts.append(f"分块：{int(ci or 0) + 1}/{int(ct)}")
+    if r.get("parent_id"):
+        parts.append(f"父块：{r.get('parent_id')}")
+    if not parts:
+        return f"[{i}]"
+    return f"[{i}]（" + "，".join(parts) + "）"
 
 
 def context_blocks(results):
@@ -2835,14 +2865,20 @@ def context_blocks(results):
     """
     if not results:
         return []
-    if not CONTEXT_LABELS and not CONTEXT_TAGS:
+    if not CONTEXT_LABELS and not CONTEXT_TAGS and not CONTEXT_META:
         return [(r.get("parent_text") or "") for r in results]
     blocks = []
     for i, r in enumerate(results, 1):
         source = _source_of(r)
-        head = f"[{i}]" + (f"（{SOURCE_LABEL}：{source}）" if source else "")
+        if CONTEXT_META:
+            # 元数据标头始终带编号，且不依赖 CONTEXT_LABELS（见 CONTEXT_META 注释）。
+            head = _context_meta_header(i, r, source)
+        elif CONTEXT_LABELS:
+            head = f"[{i}]" + (f"（{SOURCE_LABEL}：{source}）" if source else "")
+        else:
+            head = ""
         text = r.get("parent_text") or ""
-        block = "\n".join(part for part in ((head if CONTEXT_LABELS else ""), text) if part)
+        block = "\n".join(part for part in (head, text) if part)
         if CONTEXT_TAGS:
             block = f"<document>\n{block}\n</document>"
         blocks.append(block)
@@ -2861,7 +2897,8 @@ def context_sources(results):
 
 
 # 不发 system：system prompt 已整体移除，恒为空字符串（原回答规则与领域身份句不再可配）。
-CONTEXT_ROLE = env_choice("RAG_CONTEXT_ROLE", "user", ("user", "system"))  # 见 build_generation_messages：system 档并入首条 system；tool 档无 tool_call_id 配对，恒为孤儿消息，故不接受
+# 检索资料**恒以 user 角色**随本轮提问发出：RAG_CONTEXT_ROLE 已删除，不再有"资料寄生成
+# system"的入口（README「核心不变量：资料不寄生 system」）。
 RAG_USE_CONTEXT = env_bool("RAG_USE_CONTEXT", True)
 
 
@@ -3056,9 +3093,8 @@ def _truncate_history_to_budget(msgs, budget):
     return dropped, False, False
 
 
-def build_generation_messages(system, history, query, max_history_tokens, context=None, context_role=None, input_cap=None, context_blocks=None):
+def build_generation_messages(system, history, query, max_history_tokens, context=None, input_cap=None, context_blocks=None):
     budget = max(0, int(max_history_tokens))
-    role = context_role or CONTEXT_ROLE
     msgs = [dict(m) for m in history_to_messages(history)]
     # 调用方可能把本轮提问也塞进 history（漏了 [:-1]），甚至连续塞了多份。必须剥干净：
     # 否则模型会收到同一问题两份。本轮提问只在末尾追加这一次。
@@ -3143,16 +3179,14 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
                 query = _cut_to_tokens(query, max(0, q_tok - over))
                 query_truncated = True
     out = []
-    # 资料走 system 档时必须落在首条 system：chat template 普遍只认开头的 system，
-    # 排在历史之后的 system 消息会被静默丢弃（项目最忌的静默失效）。合并而非新增一条，
-    # 避免同一角色出现两次。历史与本轮提问在两个分支里都原样保留。
-    if context and role == "system":
-        out.append({"role": "system", "content": "\n\n".join(p for p in (system, context) if p)})
-    elif system:
+    # 资料恒以 user 角色承载（RAG_CONTEXT_ROLE 已删除）：不与历史/本轮提问分叉出别的
+    # 角色，也就没有"排在历史之后的 system 消息被 chat template 静默丢弃"这条失效路径。
+    # system 恒为空（本仓库不发 system prompt），故这里实际不会产出 system 消息。
+    if system:
         out.append({"role": "system", "content": system})
     out += msgs
-    if context and role != "system":
-        out.append({"role": role, "content": context})
+    if context:
+        out.append({"role": "user", "content": context})
     out.append({"role": "user", "content": query})
     # 硬上界不变量：整条 prompt 估算 token 恒 ≤ 输入上界（AGENTS 明文）。
     # raise 而非 assert：-O 下不失效；估算口径与装配同源，正常路径恒成立，越界即装配 bug。
@@ -3179,7 +3213,7 @@ def _cut_to_tokens(text, max_tokens, mark=_TRUNCATION_MARK):
     return text[:lo] + mark
 
 
-def plan_generation(results, history, query, num_ctx, use_context=True, context_role=None):
+def plan_generation(results, history, query, num_ctx, use_context=True):
     system = ""  # 不发 system prompt（恒空字符串）；use_context 只决定检索资料是否注入
     # 资料正文与逐条对齐共用同一份块列表：一次构造。截到哪几条，诊断（sources/context_docs_kept）
     # 就只报哪几条 —— 不再有第二条拼资料的路径。
@@ -3206,7 +3240,7 @@ def plan_generation(results, history, query, num_ctx, use_context=True, context_
         budget = min(budget, GEN_HISTORY_MAX_TOKENS)
     # 精确算式（不看 budget<0）：归零仍装不下才报警，避免"归零但实际没超"的假阳性。
     over_window = (estimate_tokens(system or "") + context_tokens + q_tokens > input_cap)
-    gen = build_generation_messages( system, history, query, context=context, context_blocks=ctx_blocks, max_history_tokens=budget, context_role=context_role, input_cap=input_cap, )
+    gen = build_generation_messages( system, history, query, context=context, context_blocks=ctx_blocks, max_history_tokens=budget, input_cap=input_cap, )
     gen["query_tokens"], gen["over_window"] = q_tokens, bool(over_window or gen["cap_trimmed"])
     if over_window:
         log("⚠️  本轮提问+资料超出输入窗口（历史已全部让位仍不足）：按 system→资料→提问 截到窗口内，提问只截前缀")
@@ -3691,7 +3725,9 @@ class RAGEngine:
         for idx, score in reranked:
             c = candidates[idx]
             src = _source_of(c)
-            item = { "id": c["id"], "child_text": c["child_text"], "parent_text": c["parent_text"], "source": src, "contextual_text": c["contextual_text"], "rerank_score": score, "parent_id": c.get("parent_id", ""), }
+            # chunk_index/total_chunks 带上：资料元数据标头（_context_meta_header）的
+            # "分块 x/y" 与 /ask 的 results 都读它；不带就等于标头里永远缺这一项。
+            item = { "id": c["id"], "child_text": c["child_text"], "parent_text": c["parent_text"], "source": src, "contextual_text": c["contextual_text"], "rerank_score": score, "parent_id": c.get("parent_id", ""), "chunk_index": c.get("chunk_index"), "total_chunks": c.get("total_chunks"), }
             if SOURCE_FIELD != "source":
                 item[SOURCE_FIELD] = src
             output.append(item)
