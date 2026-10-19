@@ -211,16 +211,35 @@ _download_models() {
 
 # _ollama_manifest_meta <model> ──────────────────────────────────────────────
 # ModelScope 的 Ollama 集成**依据 GGUF 自动生成** manifest，但只落 template/params/license，
-# **不落 renderer/parser**（实测对比两边 config blob：官方 qwen3.5:4b-q4_K_M 带
-# "renderer":"qwen3.5"/"parser":"qwen3.5"，ModelScope 版两者皆无）。
-# 后果很隐蔽：ollama show 仍报 "thinking" 能力，但 /api/chat 传 think=true 时**不会把思考
-# 拆进 message.thinking 字段**——应用侧思维链永远是空的，正文却正常（实测同一份 GGUF，
-# 补不补 renderer/parser，thinking 有无判然不同；正文一致）。故从 ModelScope 快源拉下来的
-# 模型必须用 Modelfile 补上这两行，才能和官方 registry 那份行为一致。
+# 且：
+#   · **不落 renderer/parser**（实测对比两边 config blob：官方 qwen3.5:4b-q4_K_M 带
+#     "renderer":"qwen3.5"/"parser":"qwen3.5"，ModelScope 版两者皆无）；
+#   · 模板是按 GGUF 猜出来的老式单轮件（.Prompt/.Response），既**丢了多轮历史**，也**没有
+#     家族特意的思维链前缀**（如 MiniCPM5 的 ` thinking`）。
+# 后果很隐蔽：ollama show 仍可能报 "thinking" 能力，但 /api/chat 传 think=true 时**不会把思考
+# 拆进 message.thinking 字段**——应用侧思维链永远是空的，正文却正常。故从 ModelScope 快源
+# 拉下来的模型必须用 Modelfile 校正，才能和官方那份行为一致。
 # 输出为该家族需要的 Modelfile 指令（不含 FROM）；未收录的家族返回 1，调用方退回 ollama cp。
+#   · qwen3.5：官方 renderer/parser 负责渲染与拆思维链 → 补 RENDERER/PARSER 两行即可。
+#   · minicpm5-2b：Ollama 0.33 **没有** minicpm5 的 renderer/parser，思维链**全靠模板**
+#     （assistant 前缀以 ` thinking` 结尾，对齐 OpenBMB 官方 ollama 部署文档）→ 补整段 TEMPLATE
+#     （含多轮 range）+ stop。必须与本地 `ollama create` 用的 Modelfile 逐字一致。
 _ollama_manifest_meta() {
     case "${1%%:*}" in
         qwen3.5) printf 'RENDERER qwen3.5\nPARSER qwen3.5\n' ;;
+        minicpm5-2b) cat <<'MCP5'
+TEMPLATE """{{- if .Messages -}}
+{{- range .Messages -}}
+<|im_start|>{{ .Role }}
+{{ .Content }}<|im_end|>
+{{ end -}}
+<|im_start|>assistant
+ thinking
+{{ end -}}"""
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "</s>"
+MCP5
+            ;;
         *) return 1 ;;
     esac
 }
