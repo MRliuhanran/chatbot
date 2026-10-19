@@ -259,10 +259,11 @@ ARG BAKE_OLLAMA=1
 # （半途 ENOSPC 只会产出更难归因的残层）。构建机磁盘紧时：清缓存，或置 BAKE_*=0。
 ARG BAKE_MIN_FREE_GB=8
 # 体积下限（MB）：清单齐备但明显偏小 = 半截下载。取值远低于实测（bge-m3 ≈2.1G、
-# rerank ≈2.1G、ollama Q4_K_M ≈2.5G），只挡"静默小文件"，不挡模型换代。
+# rerank ≈2.1G、ollama Q4_K_M：qwen3.5-4b ≈2.5G / minicpm5-2b ≈1.5G），只挡"静默小文件"。
+# 换成更小的生成模型时必须同步下调本下限，否则校验会把完整下载误判成"半截下载"。
 ARG BAKE_MIN_EMBED_MB=1500
 ARG BAKE_MIN_RERANK_MB=1500
-ARG BAKE_MIN_OLLAMA_MB=1800
+ARG BAKE_MIN_OLLAMA_MB=1200
 
 RUN set -eux; \
     _T_ALL=$(date +%s); \
