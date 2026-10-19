@@ -422,6 +422,11 @@ fi
 #     Streamlit 的默认 select_account 安全，无需覆盖。
 # 无 OAUTH_* 注入（本地裸跑 / Static）时删掉该文件：Dockerfile 会 COPY 整个 .streamlit/，
 # 不清掉的话镜像里烘焙的占位 secrets.toml 会被当成真配置，登录门拿占位 client_id 去请求。
+# 诊断（只列**变量名**，绝不打印值）：部署后看这一行即可区分两种故障 ——
+#   [空]          → 平台没开 OAuth（或没重新部署），登录门必然关闭；
+#   有名字但没就绪 → 开了 OAuth 但变量名/取值与本脚本的判定对不上，据此改判定即可。
+_ms_envnames="$(env | cut -d= -f1 | grep -E '^(OAUTH_|OPENID|STUDIO_)' | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
+_log "环境变量体检（仅列名）: [${_ms_envnames:-空}]"
 _ms_oauth=0
 if [ -n "${OAUTH_CLIENT_ID:-}" ] && [ -n "${OAUTH_CLIENT_SECRET:-}" ] && [ -n "${STUDIO_HOST:-}" ]; then
     # TOML 基本字符串：值里出现 " \ 或换行会破坏文件，直接拒绝（正常 client id/secret 不会含）。
