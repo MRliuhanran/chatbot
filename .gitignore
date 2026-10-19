@@ -39,6 +39,7 @@ bak/
 
 # ---- 密钥 ----
 .env
+.streamlit/secrets.toml
 
 # ---- IDE ----
 .idea/

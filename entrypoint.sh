@@ -404,6 +404,58 @@ fi
 # 让应用侧知道权重仍在后台下载：模型加载时轮询等待，而不是把首查询竞态当错误抛出。
 # RAG_SKIP_MODEL_DOWNLOAD=1（本地挂载模型自测）时下载根本没跑，别让应用去空等。
 [ "${RAG_SKIP_MODEL_DOWNLOAD:-0}" = 1 ] || export RAG_WEIGHTS_BACKGROUND=1
+
+# ── 5.0 创空间 OAuth：把平台注入的环境变量装配成 st.login 需要的 secrets.toml ──────
+# 官方（docs/studios/oauth）在运行时**只注入环境变量**（OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET
+# / OAUTH_SCOPES / OPENID_PROVIDER_URL / STUDIO_HOST），而 Streamlit 的 st.login() 只认
+# .streamlit/secrets.toml 的 [auth] 段 —— chatbot.py 的登录门也据此判断是否启用。两者之间
+# 的桥只能在启动期搭：缺了这一步，线上没有 [auth]，登录门被静默跳过（页面照常，谁也不登录）。
+# 约束均取自 Streamlit 1.62 源码，逐条对应：
+#   · redirect_uri 必须以 /oauth2callback 结尾（auth_util.get_validated_redirect_uri），
+#     回调路由也写死为该路径（starlette_auth_routes._ROUTE_OAUTH_CALLBACK）—— 改路径必失败。
+#     又必须用**创空间 host 域名**（https://${STUDIO_HOST}），因为创空间页面嵌在 modelscope.cn
+#     的 iframe 里，官方示例同样用 host 地址 + 新窗口，不能用 studios/... 路径。
+#   · 默认 scope 是 "openid email profile"，但魔搭只授权 openid/profile（无 email 项）→
+#     显式覆盖成平台注入的 OAUTH_SCOPES（即设置页勾选的 openid profile）。
+#   · cookie_secret 必须跨重启稳定，否则每次重部署把所有人踢下线 → 由 client_secret 派生。
+#   · prompt 不动：实测魔搭 authorize 对 prompt 值原样透传、不校验（连 bogus 值都收），
+#     Streamlit 的默认 select_account 安全，无需覆盖。
+# 无 OAUTH_* 注入（本地裸跑 / Static）时删掉该文件：Dockerfile 会 COPY 整个 .streamlit/，
+# 不清掉的话镜像里烘焙的占位 secrets.toml 会被当成真配置，登录门拿占位 client_id 去请求。
+_ms_oauth=0
+if [ -n "${OAUTH_CLIENT_ID:-}" ] && [ -n "${OAUTH_CLIENT_SECRET:-}" ] && [ -n "${STUDIO_HOST:-}" ]; then
+    # TOML 基本字符串：值里出现 " \ 或换行会破坏文件，直接拒绝（正常 client id/secret 不会含）。
+    case "${OAUTH_CLIENT_ID}${OAUTH_CLIENT_SECRET}" in
+        *'"'*|*'\'*|*$'\n'*)
+            _log "❌ OAUTH_CLIENT_ID/SECRET 含 TOML 非法字符（双引号/反斜杠/换行），拒绝生成 secrets.toml，退出"
+            exit 1 ;;
+    esac
+    _ms_oauth=1
+fi
+if [ "${_ms_oauth}" = 1 ]; then
+    mkdir -p /app/.streamlit
+    _ms_cookie_secret="$(printf '%s' "${OAUTH_CLIENT_SECRET}" | sha256sum | awk '{print $1}')"
+    _ms_scope="${OAUTH_SCOPES:-openid profile}"
+    _ms_meta="${OPENID_PROVIDER_URL:-https://www.modelscope.cn}"; _ms_meta="${_ms_meta%/}/.well-known/openid-configuration"
+    umask 077
+    cat > /app/.streamlit/secrets.toml <<EOF
+[auth]
+redirect_uri = "https://${STUDIO_HOST}/oauth2callback"
+cookie_secret = "${_ms_cookie_secret}"
+client_id = "${OAUTH_CLIENT_ID}"
+client_secret = "${OAUTH_CLIENT_SECRET}"
+server_metadata_url = "${_ms_meta}"
+
+[auth.client_kwargs]
+scope = "${_ms_scope}"
+EOF
+    chmod 600 /app/.streamlit/secrets.toml
+    _log "OAuth 登录就绪：redirect_uri=https://${STUDIO_HOST}/oauth2callback scope=${_ms_scope}"
+else
+    rm -f /app/.streamlit/secrets.toml
+    _log "未检测到 OAUTH_* 注入 → 登录门关闭（本地/无 OAuth 部署，属正常）"
+fi
+
 _log "Streamlit 启动: http://0.0.0.0:${RAG_HTTP_PORT:-7860}"
 exec python -m streamlit run chatbot.py \
     --server.address 0.0.0.0 \

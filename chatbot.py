@@ -4153,6 +4153,18 @@ def run_streamlit():
     import streamlit as st
     global _STATE
     st.set_page_config(layout="wide")  # 展示最大化：宽屏铺满视口
+    # ── 登录门：secrets.toml 有 [auth] 才启用；本地无配置自动跳过 ──
+    _auth = hasattr(st.user, "is_logged_in")   # 有 [auth] 才为 True，无需裸表达式（避免被 magic 渲染）
+    if _auth and not st.user.is_logged_in:
+        _, c, _ = st.columns([2, 1, 2])
+        with c:
+            if st.button("", icon="spinner", key="login", use_container_width=True):
+                st.login()
+        st.stop()
+    if _auth:
+        st.sidebar.caption(getattr(st.user, "name", "") or getattr(st.user, "sub", ""))
+        st.sidebar.button("", icon=":material/logout:", help="退出登录",
+                          on_click=st.logout, use_container_width=True)
     # 先把运行态单例钉到模块变量：脚本线程会在 cache_resource 之外再访问 load_lexicon 等
     # 懒加载，若预热/首查询线程抢先建了一份、脚本线程又建一份，就是"同一进程两套词表"。先
     # 赋值（值来自 cache_resource 指向的同一模块单例），其后所有懒加载都走这一个。

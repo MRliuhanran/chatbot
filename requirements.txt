@@ -11,6 +11,11 @@
 
 # --- 直接依赖（chatbot.py 显式 import / 使用）---
 streamlit==1.62.0
+# 登录（st.login / st.user / st.logout）走魔搭创空间内置 OAuth。Streamlit 把 Authlib 放在
+# [auth] 额外依赖里（等价 `streamlit[auth]`），单装 streamlit **不会**带上它 —— 缺失时
+# st.login 抛 StreamlitMissingAuthlibError（starlette_auth_routes 的 _create_oauth_client）。
+# 故显式锁定；entrypoint.sh 运行期用它把平台注入的 OAUTH_* 装配成 secrets.toml 的 [auth]。
+authlib==1.7.2
 requests==2.32.4
 qdrant-client==1.19.0
 # .env 加载（chatbot.py 顶部）。缺失即报错、不静默跳过 —— 静默跳过会让 .env 的
@@ -34,8 +39,10 @@ anyio==4.9.0
 attrs==25.3.0
 blinker==1.9.0
 certifi==2026.7.22
+cffi==2.0.0
 charset-normalizer==3.4.2
 click==8.2.1
+cryptography==48.0.0
 exceptiongroup==1.3.0
 filelock==3.18.0
 fsspec==2026.6.0
@@ -49,6 +56,7 @@ huggingface-hub==0.33.2
 idna==3.10
 itsdangerous==2.2.0
 jinja2==3.1.6
+joserfc==1.6.8
 jsonschema==4.24.0
 jsonschema-specifications==2025.4.1
 markupsafe==3.0.2
@@ -61,6 +69,7 @@ pillow==12.3.0
 portalocker==3.2.0
 protobuf==5.29.6
 pyarrow==25.0.1
+pycparser==3.0
 pydantic==2.11.7
 pydantic-core==2.33.2
 pydeck==0.9.3
