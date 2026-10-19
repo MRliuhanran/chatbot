@@ -79,7 +79,10 @@ _download_model() {
     local _i
     for _f in "$@"; do
         mkdir -p "${_tmp}/$(dirname "${_f}")"
-        curl -fsSL --retry 3 --connect-timeout 20 --max-time 3600 \
+        # --http1.1 + --retry-all-errors：ModelScope CDN 偶发 HTTP/2 流被掐断
+        # （curl: (92) HTTP/2 stream ... INTERNAL_ERROR），默认 --retry 不重试该类错误，
+        # 会导致单个大文件把整层烘焙拖挂。强制 HTTP/1.1 并整类重试，与本文件其它下载点一致。
+        curl -fsSL --http1.1 --retry 5 --retry-all-errors --connect-timeout 20 --max-time 3600 \
             "https://modelscope.cn/models/${_repo}/resolve/master/${_f}" \
             -o "${_tmp}/${_f}" &
         _pids+=("$!")
