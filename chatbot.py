@@ -4149,6 +4149,36 @@ def _st_engine():
     return st.cache_resource(show_spinner=False)(get_engine)()
 
 
+def _render_login_gate(st):
+    """渲染登录门。
+
+    创空间把应用放在 modelscope.cn 页面的 iframe 里，Streamlit 的 OAuth 会话与身份
+    Cookie 都是 SameSite=Lax（starlette_auth_routes 写死），跨站子框架的导航/子请求
+    不带它们：回调回来时服务端找不到 state，日志就是
+    "Missing provider for OAuth callback"，用户看到的是授权完又回到登录页。
+    因此部署在创空间（STUDIO_HOST 存在）时不在 iframe 里直接 st.login()，而是把
+    /auth/login 放到**新窗口**打开 —— 顶层上下文里 Cookie 同站，OAuth 全程可校验。
+    """
+    host = (os.environ.get("STUDIO_HOST") or "").strip().strip("/")
+    url = None
+    if host:
+        from urllib.parse import quote
+        try:
+            # 与前端 st.login() 同源的 provider token（JWT，短时效），省掉二次点击。
+            from streamlit.auth_util import encode_provider_token
+            url = f"https://{host}/auth/login?provider={quote(encode_provider_token('default'), safe='')}"
+        except Exception as exc:  # 内部 API 变动时不硬撑：退回原生登录按钮（顶层窗口仍可用）
+            log(f"⚠️  生成 OAuth 登录链接失败，退回原生 st.login(): {type(exc).__name__}: {exc}")
+        if url:
+            st.link_button("使用魔搭账号登录", url, icon=":material/key:", type="primary",
+                           use_container_width=True)
+            st.caption("登录在新窗口完成；创空间内嵌页不保存登录态，登录后请在新窗口使用。")
+            return
+    # 本地/非创空间（或链接生成失败）：没有 iframe 时 Streamlit 原生登录最直接
+    if st.button("", icon="spinner", key="login", use_container_width=True):
+        st.login()
+
+
 def run_streamlit():
     import streamlit as st
     global _STATE
@@ -4158,8 +4188,7 @@ def run_streamlit():
     if _auth and not st.user.is_logged_in:
         _, c, _ = st.columns([2, 1, 2])
         with c:
-            if st.button("", icon="spinner", key="login", use_container_width=True):
-                st.login()
+            _render_login_gate(st)
         st.stop()
     if _auth:
         st.sidebar.caption(getattr(st.user, "name", "") or getattr(st.user, "sub", ""))
