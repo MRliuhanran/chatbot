@@ -106,6 +106,8 @@ tenacity==9.1.4
 # GitHub Release 只发 musl 版（linux_x86_64，DT_NEEDED=libc.musl-x86_64.so.1）。在 bookworm
 # （glibc）上加载即失败 → llama.cpp 分词静默退化成 tokenizer.json。
 # 故 Dockerfile 用独立阶段 lcpwheel 从 sdist **源码编译出 glibc wheel**，放进 --find-links。
+# 2026-10-21 起 wheels/ 已收录 0.3.19 的 amd64 glibc 预编译 wheel（本地 Rosetta 编译，
+# 与魔搭构建机同基座）：lcpwheel 阶段优先复用现货，未命中才回退编译；升版本须重编入仓。
 # 本地/离线构建也可自行 `pip wheel llama-cpp-python==0.3.19` 后把产物丢进 wheels/。
 llama-cpp-python==0.3.19
 diskcache==5.6.3

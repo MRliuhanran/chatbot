@@ -67,17 +67,25 @@
 #             -v "$PWD/models:/app/models:ro" rag-chatbot
 #           （挂载本地模型仅为离线自测；不挂载则启动时自动下载）
 
-# ── 生成侧精确分词 wheel：源码编译 llama-cpp-python 的 GLIBC 版（独立阶段，不进最终镜像）──
-# 为什么必须自编：llama-cpp-python **0.3.x 全系列都没有 glibc wheel** —— PyPI 只有 sdist，
-# abetlen 的 cpu 索引与 GitHub Release 只发 musl 版（linux_x86_64，DT_NEEDED=libc.musl-x86_64.so.1）。
-# 在 python:3.10-slim-bookworm（glibc）上加载该 musl wheel 直接失败：
+# ── 生成侧精确分词 wheel：llama-cpp-python 的 GLIBC 版（独立阶段，不进最终镜像）──
+# 为什么必须自编：llama-cpp-python **0.3.x 全系列在 PyPI 只有 sdist**（glibc wheel 无处下载），
+# abetlen 的 cpu 索引与 GitHub Release 只发 musl 版（DT_NEEDED=libc.musl-x86_64.so.1），
+# 在 python:3.10-slim-bookworm（glibc）上加载直接失败：
 #   ⚠️ llama.cpp 分词不可用 … libc.musl-x86_64.so.1: cannot open shared object file
 #   → 生成侧精确分词**静默**退化成 tokenizer.json（2026-10-17 云端运行日志实测，违反"本地=云端"）。
 # 修法：用 build-essential+cmake 从 sdist 编译出 glibc wheel（实测 NEEDED=libc.so.6 /
 # libstdc++.so.6 / libgcc_s.so.1，RUNPATH=$ORIGIN → 自带 libggml*/libllama.so，不依赖系统额外库）。
 # 只产出 wheel，编译器不进最终镜像；版本**从 requirements.txt 现取**，避免与 pin 漂移（取不到即报错）。
-# 本阶段较慢，但输入仅 requirements.txt —— 层缓存命中即可整段跳过（不会拖慢日常重建）。
+#
+# ★ 复用优先（2026-10-21）★：源码编译是 #1–#18 里最贵的一段，而魔搭构建机**不保留跨次
+#   层缓存**，每次部署都真编译一遍。现把 amd64 的 glibc wheel 预编译好**提交进 wheels/**
+#   （本地 Rosetta 编译，与云端产物同源同基座），本阶段先按
+#   `llama_cpp_python-<pin>-cp310-cp310-*<arch>*.whl`（排除 musl）找仓内现货：命中即
+#   cp -p 复用（mtime 随 git checkout，层可复现），未命中才回退源码编译 —— requirements
+#   升版而忘重编 wheel 时走编译兜底，**慢但正确**，不会用错版本。arm64 本地构建仍走编译。
 FROM python:3.10-slim-bookworm AS lcpwheel
+# TARGETARCH 由 buildkit 注入（本阶段在 appbase 之前，显式声明）。
+ARG TARGETARCH
 # 与 appbase 同名 ARG 的默认值保持一致（本阶段在其之前，无法继承 appbase 的 ARG）。
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_FALLBACK_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
@@ -85,13 +93,35 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential cmake \
  && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
+COPY wheels/ /pre/
 RUN set -eux; \
     _v="$(sed -nE 's/^llama-cpp-python==([^[:space:]]+).*$/\1/p' requirements.txt | head -n1)"; \
     [ -n "${_v}" ] || { echo "[lcpwheel] ❌ requirements.txt 未找到 llama-cpp-python==<版本>"; exit 1; }; \
-    echo "[lcpwheel] 从源码编译 llama-cpp-python==${_v}（glibc）"; \
-    pip wheel --no-cache-dir --no-deps --wheel-dir /lcpwheel \
-        --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_FALLBACK_INDEX}" \
-        "llama-cpp-python==${_v}"; \
+    case "${TARGETARCH}" in \
+        amd64) _m=x86_64 ;; \
+        arm64) _m=aarch64 ;; \
+        *) echo "[lcpwheel] ❌ unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    _w="$(ls /pre/llama_cpp_python-"${_v}"-cp310-cp310-*"${_m}"*.whl 2>/dev/null | grep -v musl | head -n1 || true)"; \
+    mkdir -p /lcpwheel; \
+    if [ -n "${_w}" ]; then \
+        echo "[lcpwheel] ✅ 复用仓内 glibc wheel: $(basename "${_w}")"; \
+        # /lcpwheel 是本阶段产物目录：pip wheel 会自建它，**复用分支没有 pip 代劳**，
+        # 直接 cp 会报 "cannot create regular file '/lcpwheel/': Not a directory"
+        #（2026-10-21 本地实跑捕获）—— 复用即挂，恰好只在"现货真正生效"的那次炸。
+        mkdir -p /lcpwheel; \
+        cp -p "${_w}" /lcpwheel/; \
+    else \
+        echo "[lcpwheel] 仓内无 ${_m} 的 ${_v} wheel → 从 sdist 源码编译（glibc）"; \
+        # GGML_OPENMP=OFF：默认 ON 会把 libgomp.so.1 链进 libllama.so，而运行时基座
+        # （python:slim，无 build-essential）没有 libgomp → import 即失败（2026-10-21
+        # 本地 Rosetta 构建实测）。关掉后 NEEDED 回到 libc/libstdc++/libgcc（与文件头
+        # 注释记录的实测一致）；本 wheel 只用于分词，单线程无碍。
+        CMAKE_ARGS="-DGGML_OPENMP=OFF" pip wheel --no-cache-dir --no-deps --wheel-dir /lcpwheel \
+            --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_FALLBACK_INDEX}" \
+            "llama-cpp-python==${_v}"; \
+    fi; \
+    touch -d "@1710000000" /lcpwheel/*; \
     ls -l /lcpwheel
 
 # ── 基座与依赖：appbase 同时是 modelbake 与最终镜像的父层（同一份 apt/pip/ollama 只构建一次）
@@ -187,8 +217,9 @@ WORKDIR /app
 # uv 本身也走主源+兜底源，避免镜像滞后导致构建工具装不上。
 COPY requirements.txt .
 COPY wheels/ /tmp/wheels/
-# 生成侧精确分词的 glibc wheel 由文件顶部的 lcpwheel 阶段源码编译产出，放进同一个 find-links 目录；
-# wheels/ 里**不再放** llama-cpp-python 的预编译 wheel（0.3.x 的官方预编译只有 musl 版，在 bookworm 上不可用）。
+# 生成侧精确分词的 glibc wheel：lcpwheel 阶段**优先复用 wheels/ 里预编译的 amd64 现货**
+# （ Rosetta 与云端同基座编译，见该阶段头注释），仓内没有匹配 arch/版本才回退 sdist 编译，
+# 产物同样汇入这个 find-links 目录。musl 预编译版在 bookworm 上不可用（见 lcpwheel 头注释）。
 COPY --from=lcpwheel /lcpwheel/ /tmp/wheels/
 RUN set -eux; \
     _t0=$(date +%s); \
@@ -212,7 +243,9 @@ RUN set -eux; \
     && uv pip check --system \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
     && rm -rf /root/.cache \
-    && echo "[timing] Python 依赖 $(( $(date +%s) - _t0 ))s（pip/uv 缓存与 __pycache__ 已同层删除）"
+    && find /usr/local/lib/python3.10/site-packages -exec touch -d "@1710000000" {} + \
+    && find /usr/local/bin -maxdepth 1 -type f -exec touch -d "@1710000000" {} + \
+    && echo "[timing] Python 依赖 $(( $(date +%s) - _t0 ))s（pip/uv 缓存与 __pycache__ 已同层删除；mtime 已归一→层可复现）"
 
 # 检索模型服务（infinity）**不装进本镜像**：魔搭是 8G 单容器，运行档定为
 # RAG_EMBED_BACKEND/RAG_RERANK_BACKEND = torch（进程内），entrypoint 仅在 =http 时才拉起
@@ -235,6 +268,16 @@ SHELL ["/bin/bash", "-c"]
 #
 # 本阶段**只下载**，不产出镜像层：它把三份模型放 /bake/{embed,rerank,ollama_models}，
 # 由最终阶段 COPY --from 拆成三层（见文件头 B 条）。
+#
+# ★ 层可复现（mtime 归一，2026-10-21）★ —— 魔搭构建机不保留跨次层缓存，每次部署都是
+#   全量重建 + 全量重推；唯一可白嫖的缓存是**注册表按 blob digest 去重**（基础层每次
+#   都报 Layer already exists）。但烘焙产物每次重下后 mtime 都是"当下"→ 层 tar 不同 →
+#   digest 变 → 4 个 ~2.1G 模型层每次全量重传（2026-10-20 实测推送 12.4 分钟）。
+#   修法：收尾把 /bake 全树 touch 到固定时间戳，层字节跨次一致 → digest 稳定 →
+#   注册表直接跳过重传（部署侧拉取同样受益）。本地 buildkit 实验已验证：COPY --from
+#   会如实保留源 mtime（touch 组与 no-touch 组层链不同、同组内两次构建完全一致）；
+#   新版 buildkit 虽会归一 RUN 产物 mtime，但魔搭 runner 显然不会（否则层早就去重了），
+#   显式 touch 对两种实现都无害。
 FROM appbase AS modelbake
 
 # SHELL / WORKDIR 在 FROM <stage> 时按 Docker 语义继承自 appbase，但本机无法实跑构建验证，
@@ -364,6 +407,9 @@ RUN set -eux; \
     rm -f /tmp/ollama-pull.log /tmp/ollama-bake.log /tmp/model-download.status /tmp/mkdir.log; \
     rm -rf /bake/embed/*.part /bake/rerank/*.part /bake/embed/*.old /bake/rerank/*.old; \
     chmod -R a+rX /bake/embed /bake/rerank /bake/ollama_models; \
+    echo "[bake] ==================== 层可复现（mtime 归一）===================="; \
+    find /bake -type d -exec touch -d "@1710000000" {} +; \
+    find /bake -type f -exec touch -d "@1710000000" {} +; \
     echo "[bake] ==================== 产物汇总 ===================="; \
     du -sh /bake/embed /bake/rerank /bake/ollama_models; \
     echo "[timing] 烘焙总用时 $(( $(date +%s) - _T_ALL ))s（三段并行的墙钟，非各自之和）"
@@ -429,7 +475,7 @@ COPY --chmod=0777 storage/ ./storage/
 # 构建/运行期**同一解析器**（tools/fetch_models.sh），不另造一份 .env 解析。
 RUN set -eux; \
     . ./tools/fetch_models.sh; \
-    for _k in MODEL RAG_GEN_MODEL_MODELSCOPE RAG_OLLAMA_DL_CONNS RAG_EMBED_MODEL_PATH RAG_RERANK_MODEL_PATH; do \
+    for _k in MODEL RAG_GEN_MODEL_MODELSCOPE RAG_OLLAMA_DL_CONNS RAG_MODEL_DL_CONNS RAG_EMBED_MODEL_PATH RAG_RERANK_MODEL_PATH; do \
         _a="$(_env_get "${_k}" .env)"; \
         _b="$(_env_get "${_k}" tools/bake.env)"; \
         if [ "${_a}" != "${_b}" ]; then \

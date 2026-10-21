@@ -74,17 +74,14 @@ _download_model() {
     _tmp="${_dir}.part"
     rm -rf "${_tmp}"
     mkdir -p "${_tmp}"
-    _log "下载权重 ${_name}（checkpoint ${_weight}，主源 ModelScope:${_repo}，清单 $# 个文件，文件级并发）"
+    _log "下载权重 ${_name}（checkpoint ${_weight}，主源 ModelScope:${_repo}，清单 $# 个文件，文件级并发，大文件多段）"
     local -a _pids=()
     local _i
     for _f in "$@"; do
         mkdir -p "${_tmp}/$(dirname "${_f}")"
-        # --http1.1 + --retry-all-errors：ModelScope CDN 偶发 HTTP/2 流被掐断
-        # （curl: (92) HTTP/2 stream ... INTERNAL_ERROR），默认 --retry 不重试该类错误，
-        # 会导致单个大文件把整层烘焙拖挂。强制 HTTP/1.1 并整类重试，与本文件其它下载点一致。
-        curl -fsSL --http1.1 --retry 5 --retry-all-errors --connect-timeout 20 --max-time 3600 \
-            "https://modelscope.cn/models/${_repo}/resolve/master/${_f}" \
-            -o "${_tmp}/${_f}" &
+        # 单文件下载交给 _curl_model_file：≥16MiB 走多段并发（关键路径 embed 515s 的
+        # 瓶颈就是 2.27G 单流 ~4.4MB/s，2026-10-20 构建实测），失败回退单流、语义不变。
+        _curl_model_file "${_repo}" "${_f}" "${_tmp}/${_f}" &
         _pids+=("$!")
     done
     _ok=1
@@ -247,17 +244,22 @@ MCP5
     esac
 }
 
-# ── 官方 registry 多连接直下（绕开 ollama pull 的单流）─────────────────────────
-# 背景：ollama pull 每个 blob 都是**单条 TCP 流**，对官方源（registry.ollama.ai →
-#   307 跳 Cloudflare R2）在境外链路常远跑不满带宽。本组按 OCI 分发协议直接取
-#   manifest + blobs，对每个 blob 开 N 条 Range 连接**分片并行**拉，拼回、校验 sha256
-#   后，按 Ollama 的磁盘布局落盘：
-#       <OLLAMA_MODELS>/manifests/<host>/library/<name>/<tag>
-#       <OLLAMA_MODELS>/blobs/sha256-<hex>
-#   ollama 无需再 pull 即可识别（已用真实模型验证：手动落盘后 ollama list/show 正常）。
-# 连接数：RAG_OLLAMA_DL_CONNS（默认 16）；小文件按体积自动降连接数（每连接 ≥1MiB）。
+# ── 官方 registry / ModelScope CDN 多连接直下（绕开单流限速）─────────────────
+# 背景：大资产单条 TCP 流常跑不满带宽（ollama pull 每 blob 一条流；ModelScope CDN 单流
+#   实测 ~4.4MB/s，2.27G 的 bge-m3 要 8.6 分钟，是烘焙关键路径）。本组按 Range 分片并行：
+#   对每个大文件开 N 条 Range 连接拉分片、拼回、按内容校验后落盘。
+#   · Ollama blob：OCI manifest 报告 size + sha256，拼完按 digest 校验；
+#   · ModelScope 模型文件：307 直链 + `Content-Range: bytes 0-0/<total>` 探总大小，
+#     拼完按字节数校验（CDN 无 digest 可用）；校验不过或任一分片失败 → 删半截、
+#     回退单流（原 --http1.1/--retry 5 语义），不再有"半截文件被 -s 判成可用"的口子。
+# 连接数：Ollama 用 RAG_OLLAMA_DL_CONNS（默认 16）、模型文件用 RAG_MODEL_DL_CONNS
+#   （默认 16）；小文件按体积自动降连接数（每连接 ≥1MiB）。
 # 失败语义：任一步失败 → 返回非零 → 调用方**直接判失败**（构建报错结束）；官方源**不退回
 #   ollama pull**（有意去掉兜底：失败要响亮，别偷偷退成单流把问题藏起来）。
+# Ollama 侧按其磁盘布局落盘（manifest + blobs 拼好后 ollama 免 pull 直接识别，
+#   已用真实模型验证）：
+#       <OLLAMA_MODELS>/manifests/<host>/library/<name>/<tag>
+#       <OLLAMA_MODELS>/blobs/sha256-<hex>
 # ⚠️ manifest/blobs 均为标准 OCI 产物，content-addressed；sha256 校验后再原子 rename 落盘，
 #    半截文件绝不就位（沿用 _download_model 的"先暂存再换入"风格）。
 _sha256_of() {
@@ -289,7 +291,8 @@ _curl_multiseg() {
         _s=$(( _i * _seg ))
         [ "${_s}" -ge "${_size}" ] && break
         if [ "${_i}" -eq "$(( _conns - 1 ))" ]; then _e=$(( _size - 1 )); else _e=$(( _s + _seg - 1 )); fi
-        curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 --max-time 3600 \
+        # --http1.1：与全文件单流路径同一理由（CDN 偶发掐 HTTP/2 流且默认 --retry 不覆盖）
+        curl -fsSL --http1.1 --retry 3 --retry-all-errors --connect-timeout 20 --max-time 3600 \
             -r "${_s}-${_e}" "$_url" -o "${_dir}/$(printf '%05d' "${_i}")" &
         _pids+=("$!")
     done
@@ -299,6 +302,39 @@ _curl_multiseg() {
     fi
     rm -rf "${_dir}"
     return "${_rc}"
+}
+
+# _curl_model_file <repo> <文件> <输出路径>：ModelScope 单文件下载（大文件多段，小文件单流）。
+# 流程：解析 307 直链 → 探总大小 → ≥16MiB 才多段（分片骨架对小文件只添延迟与请求量）；
+# 多段成功还必须字节数 == CDN 报告的总大小，否则按失败处理：删半截、回退单流 —— 半截文件
+# 绝不以"存在"的姿态通过调用方后续的 -s 清单校验。
+_curl_model_file() {
+    local _repo="$1" _f="$2" _out="$3"
+    local _url="https://modelscope.cn/models/${_repo}/resolve/master/${_f}"
+    local _final _cr _total
+    _single() {
+        curl -fsSL --http1.1 --retry 5 --retry-all-errors --connect-timeout 20 --max-time 3600 \
+            "${_url}" -o "${_out}"
+    }
+    if ! _final="$(curl -fsSL --http1.1 --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+            -r 0-0 -o /dev/null -w '%{url_effective}' "${_url}" 2>/dev/null)" || [ -z "${_final}" ]; then
+        _single
+        return
+    fi
+    _cr="$(curl -sS --http1.1 --connect-timeout 20 --max-time 120 -r 0-0 -D - -o /dev/null \
+        "${_final}" 2>/dev/null | tr -d '\r' | awk 'tolower($1)=="content-range:"{print $3}')"
+    _total="${_cr##*/}"
+    case "${_total}" in
+        *[!0-9]*|"") _total="" ;;
+    esac
+    if [ -n "${_total}" ] && [ "${_total}" -ge $((16 * 1048576)) ]; then
+        if _curl_multiseg "${_final}" "${_out}" "${_total}" "${RAG_MODEL_DL_CONNS:-16}" \
+           && [ "$(wc -c < "${_out}" | tr -d ' ')" = "${_total}" ]; then
+            return 0
+        fi
+        rm -f "${_out}"
+    fi
+    _single
 }
 
 # _download_ollama_official <model>：官方源多连接直下并落到 Ollama 布局。
