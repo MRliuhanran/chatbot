@@ -121,7 +121,7 @@ RUN set -eux; \
             --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_FALLBACK_INDEX}" \
             "llama-cpp-python==${_v}"; \
     fi; \
-    touch -d "@1710000000" /lcpwheel/*; \
+    find /lcpwheel -exec touch -d "@1710000000" {} +; \
     ls -l /lcpwheel
 
 # ── 基座与依赖：appbase 同时是 modelbake 与最终镜像的父层（同一份 apt/pip/ollama 只构建一次）
@@ -244,7 +244,7 @@ RUN set -eux; \
     && find /usr/local/lib/python3.10/site-packages -type d -name '__pycache__' -prune -exec rm -rf {} + \
     && rm -rf /root/.cache \
     && find /usr/local/lib/python3.10/site-packages -exec touch -d "@1710000000" {} + \
-    && find /usr/local/bin -maxdepth 1 -type f -exec touch -d "@1710000000" {} + \
+    && find /usr/local/bin -maxdepth 1 -exec touch -d "@1710000000" {} + \
     && echo "[timing] Python 依赖 $(( $(date +%s) - _t0 ))s（pip/uv 缓存与 __pycache__ 已同层删除；mtime 已归一→层可复现）"
 
 # 检索模型服务（infinity）**不装进本镜像**：魔搭是 8G 单容器，运行档定为
