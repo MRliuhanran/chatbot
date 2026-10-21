@@ -422,11 +422,20 @@ fi
 #     Streamlit 的默认 select_account 安全，无需覆盖。
 # 无 OAUTH_* 注入（本地裸跑 / Static）时删掉该文件：Dockerfile 会 COPY 整个 .streamlit/，
 # 不清掉的话镜像里烘焙的占位 secrets.toml 会被当成真配置，登录门拿占位 client_id 去请求。
+# RAG_LOGIN_ENABLED=0 时同样删掉：登录门总开关在仓库侧（chatbot.py 也读它），平台即使
+# 注入 OAUTH_* 也不启用登录（否则平台设置页的 OAuth 开关会越过仓库的意图）。
 # 诊断（只列**变量名**，绝不打印值）：部署后看这一行即可区分两种故障 ——
 #   [空]          → 平台没开 OAuth（或没重新部署），登录门必然关闭；
 #   有名字但没就绪 → 开了 OAuth 但变量名/取值与本脚本的判定对不上，据此改判定即可。
 _ms_envnames="$(env | cut -d= -f1 | grep -E '^(OAUTH_|OPENID|STUDIO_)' | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//' || true)"
 _log "环境变量体检（仅列名）: [${_ms_envnames:-空}]"
+# 登录门总开关（RAG_LOGIN_ENABLED，.env 可改，默认 1=启用）：0=关闭登录门，直接进应用。
+# 为什么平台开着 OAuth 也要认这个开关：平台的 OAuth 开关在创空间设置页，仓库侧改不到，
+# 仓库要能独立关掉登录门就只认这一个变量（它同时被 chatbot.py 的登录门读取，两处一致）。
+_ms_login_on=1
+case "$(printf '%s' "${RAG_LOGIN_ENABLED:-1}" | tr 'A-Z' 'a-z')" in
+    0|false|no|off) _ms_login_on=0 ;;
+esac
 _ms_oauth=0
 if [ -n "${OAUTH_CLIENT_ID:-}" ] && [ -n "${OAUTH_CLIENT_SECRET:-}" ] && [ -n "${STUDIO_HOST:-}" ]; then
     # TOML 基本字符串：值里出现 " \ 或换行会破坏文件，直接拒绝（正常 client id/secret 不会含）。
@@ -437,7 +446,7 @@ if [ -n "${OAUTH_CLIENT_ID:-}" ] && [ -n "${OAUTH_CLIENT_SECRET:-}" ] && [ -n "$
     esac
     _ms_oauth=1
 fi
-if [ "${_ms_oauth}" = 1 ]; then
+if [ "${_ms_oauth}" = 1 ] && [ "${_ms_login_on}" = 1 ]; then
     mkdir -p /app/.streamlit
     _ms_cookie_secret="$(printf '%s' "${OAUTH_CLIENT_SECRET}" | sha256sum | awk '{print $1}')"
     _ms_scope="${OAUTH_SCOPES:-openid profile}"
@@ -458,7 +467,11 @@ EOF
     _log "OAuth 登录就绪：redirect_uri=https://${STUDIO_HOST}/oauth2callback scope=${_ms_scope}"
 else
     rm -f /app/.streamlit/secrets.toml
-    _log "未检测到 OAUTH_* 注入 → 登录门关闭（本地/无 OAuth 部署，属正常）"
+    if [ "${_ms_login_on}" = 0 ]; then
+        _log "RAG_LOGIN_ENABLED=0 → 登录门关闭（平台注入的 OAUTH_* 已忽略，不生成 secrets.toml）"
+    else
+        _log "未检测到 OAUTH_* 注入 → 登录门关闭（本地/无 OAuth 部署，属正常）"
+    fi
 fi
 
 _log "Streamlit 启动: http://0.0.0.0:${RAG_HTTP_PORT:-7860}"

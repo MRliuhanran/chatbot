@@ -36,7 +36,7 @@ license: apache-2.0
 |---|---|---|
 | `chatbot.py` | 全部业务逻辑与唯一入口（CLI + Streamlit） | 本地 `:8501`，魔搭容器 `:7860` |
 | Qdrant | 稠密向量 + BM25 稀疏向量存储 | `localhost:6333`，经别名 `rag_current` 访问 |
-| Ollama | 生成模型（`qwen3.5:4b-q4_K_M`） | `localhost:11434` |
+| Ollama | 生成模型（`minicpm5-2b`，Q4_K_M） | `localhost:11434` |
 | 检索模型 | 嵌入 `bge-m3` + 重排 `bge-reranker-v2-m3` | 默认进程内 torch（MPS/CPU）；`RAG_*_BACKEND=http` 时外置为 infinity 服务（`:8001`） |
 
 本地四组件用 `tools/run_local.sh {start|stop|status|logs}` 一键起停，全部原生进程，不依赖 Docker。
@@ -111,8 +111,8 @@ python chatbot.py stages              四阶段指纹比对：A 分块 / B 稠�
      → 双通道召回：稠密 + 稀疏并发查询（零权重通道不融合也不召回）
      → 客户端加权 RRF → 按命中 id 精确回取 payload → 父块去重
      → rerank（对全体候选统一打分）
-     → 上下文装配：parent_text + <document> 边界标签 + [n]（来源：xxx）标头
-       system 恒为空字符串；整条 prompt 估算 token ≤ RAG_NUM_CTX − RAG_INPUT_RESERVE
+     → 上下文装配：资料以结构化 `<document index= source= id= chunk= score=>正文</document>`
+       注入（RAG_CONTEXT_META=1）；system 恒为空，资料恒以 user 角色随本轮提问发出（不寄生 system）
        历史超预算按整轮淘汰最旧；资料按整条从尾部丢
      → Ollama 流式生成（事件：retrieval / thinking / delta / error / done）
      → 仅 done 时写入会话历史；失败不入历史

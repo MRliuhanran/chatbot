@@ -83,7 +83,7 @@ services:
       - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
     volumes:
-      # 复用本地 Ollama 模型目录（~/.ollama/models，含 qwen3.5:4b-q4_K_M）：
+      # 复用本地 Ollama 模型目录（~/.ollama/models，含 minicpm5-2b）：
       # 与本地原生权重逐字节同一份，零重拉。只读挂载，容器内不写。
       - ~/.ollama/models:/root/.ollama/models:ro
     healthcheck:

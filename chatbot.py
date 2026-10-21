@@ -2825,36 +2825,35 @@ CONTEXT_LABELS = env_bool("RAG_CONTEXT_LABELS", True)
 # （"请听我说"之类）会被模型当成对它的指令——标签是"这是数据不是指令"的唯一防线。
 # 要连标签也裸掉（回到纯拼接）设 RAG_CONTEXT_TAGS=0。
 CONTEXT_TAGS = env_bool("RAG_CONTEXT_TAGS", True)
-# 资料元数据标头（与编号/来源、边界标签都正交）：在每条资料正文前加一行结构化元数据
-# —— 编号、来源、id、相关度（rerank_score）、分块位置（chunk_index/total_chunks）、
-# 父块 id。与 RAG_CONTEXT_LABELS 的关键区别：**元数据标头不受 LABELS 开关约束**，
-# 独立生效 —— 这样"全裸正文（LABELS=0）+ 结构化元数据"可以并存；关掉即回到"只有
-# [n]（来源：xxx）标头"的旧行为（LABELS 继续管那一行）。
+# 资料元数据：以**结构化标签**给出（模型最易解析的形式）——
+#   <document index="1" source="书一" id="a1" chunk="3/12" score="0.91">
+#   正文……
+#   </document>
+# 属性名固定英文、值一律转义，缺字段即省略该属性。与 RAG_CONTEXT_LABELS / RAG_CONTEXT_TAGS
+# 的关系：META=1 时以这个「带属性的 <document>」输出并**接管包裹**（不再看 TAGS/LABELS）；
+# META=0 时才回到 LABELS（[n]（来源）标头）与 TAGS（裸 <document> 包裹）的旧行为。
 CONTEXT_META = env_bool("RAG_CONTEXT_META", True)
 
 
-def _context_meta_header(i, r, source):
-    """单条资料的元数据标头：[i]（来源：…，id：…，相关度：…，分块 x/y，父块：…）。
+def _context_meta_open_tag(i, r, source):
+    """单条资料的结构化开始标签：<document index=.. source=.. id=.. chunk=.. score=..>。
 
-    编号 [i] 恒定（资料清单/引用回指靠它）；其余字段缺则略过，不写空占位 —— 写 "id："
-    这种空值反而会让模型把空字段当成信息。只有编号一项时返回裸的 "[i]"。
+    属性值走 quoteattr（正确转义引号/&/<），来源名或 id 里含特殊字符也不会破坏结构。
+    缺字段省略对应属性；index 恒有（资料清单/引用回指靠它）。
     """
-    parts = []
+    from xml.sax.saxutils import quoteattr
+    attrs = [("index", str(i))]
     if source:
-        parts.append(f"{SOURCE_LABEL}：{source}")
+        attrs.append(("source", str(source)))
     if r.get("id"):
-        parts.append(f"id：{r.get('id')}")
-    score = r.get("rerank_score")
-    if score is not None:
-        parts.append(f"相关度：{float(score):.4f}")
+        attrs.append(("id", str(r.get("id"))))
     ci, ct = r.get("chunk_index"), r.get("total_chunks")
     if ct:
-        parts.append(f"分块：{int(ci or 0) + 1}/{int(ct)}")
-    if r.get("parent_id"):
-        parts.append(f"父块：{r.get('parent_id')}")
-    if not parts:
-        return f"[{i}]"
-    return f"[{i}]（" + "，".join(parts) + "）"
+        attrs.append(("chunk", f"{int(ci or 0) + 1}/{int(ct)}"))
+    score = r.get("rerank_score")
+    if score is not None:
+        attrs.append(("score", f"{float(score):.2f}"))
+    return "<document " + " ".join(f"{k}={quoteattr(v)}" for k, v in attrs) + ">"
 
 
 def context_blocks(results):
@@ -2870,17 +2869,17 @@ def context_blocks(results):
     blocks = []
     for i, r in enumerate(results, 1):
         source = _source_of(r)
+        text = r.get("parent_text") or ""
         if CONTEXT_META:
-            # 元数据标头始终带编号，且不依赖 CONTEXT_LABELS（见 CONTEXT_META 注释）。
-            head = _context_meta_header(i, r, source)
-        elif CONTEXT_LABELS:
-            head = f"[{i}]" + (f"（{SOURCE_LABEL}：{source}）" if source else "")
+            # 结构化档：一条资料 = 一个带属性 <document> 块，元数据与正文同处一个元素。
+            block = f"{_context_meta_open_tag(i, r, source)}\n{text}\n</document>"
         else:
             head = ""
-        text = r.get("parent_text") or ""
-        block = "\n".join(part for part in (head, text) if part)
-        if CONTEXT_TAGS:
-            block = f"<document>\n{block}\n</document>"
+            if CONTEXT_LABELS:
+                head = f"[{i}]" + (f"（{SOURCE_LABEL}：{source}）" if source else "")
+            block = "\n".join(part for part in (head, text) if part)
+            if CONTEXT_TAGS:
+                block = f"<document>\n{block}\n</document>"
         blocks.append(block)
     return blocks
 
@@ -4149,16 +4148,23 @@ def _st_engine():
     return st.cache_resource(show_spinner=False)(get_engine)()
 
 
+# 登录门总开关：1=启用（默认），0=关闭 —— 关闭后即使 secrets.toml 有 [auth]
+# （创空间 = 平台注入 OAUTH_* → entrypoint 生成）也不渲染登录门，直接进应用。
+# 为什么需要这个开关而不是"删掉 [auth]"：平台的 OAuth 开关在**创空间设置页**（不在仓库里），
+# 仓库侧改不到；要让仓库自己说了算，就只能在这里留一个开关。
+LOGIN_ENABLED = env_bool("RAG_LOGIN_ENABLED", True)
+
+
 def _render_login_gate(st):
     """渲染登录门。
 
     只能留在 iframe 里登录：创空间网关对**顶层导航**一律 302 回
     /studios/<owner>/<name>?mode=full（实测），所以"新窗口打开 /auth/login"会被弹回
-    创空间页面、看到的仍是这个登录门。iframe 内 OAuth 能否成立取决于浏览器是否接受
-    跨站 Cookie：Streamlit 1.6x 的 _streamlit_session / _streamlit_user_tokens 都是
-    SameSite=None; Secure; Partitioned，Chrome 实测可正常存取；Safari 或关闭第三方
-    Cookie 的浏览器会丢弃，回调于是报 "Missing provider for OAuth callback"。
-    这里把 Cookie 名打进日志（只名字、无值），部署后据此判断是浏览器丢了 Cookie，
+    创空间页面。iframe 内 OAuth 能否成立取决于浏览器是否接受跨站 Cookie：
+    Streamlit 1.6x 的 _streamlit_session / _streamlit_user_tokens 都是
+    SameSite=None; Secure; Partitioned，Chrome 可正常存取；Safari / 关闭第三方 Cookie
+    的浏览器会丢弃，回调就报 "Missing provider for OAuth callback"。
+    这里把 Cookie 名打进日志（只名字、无值），部署后据此判断是浏览器丢了 Cookie
     还是流程本身失败。
     """
     try:
@@ -4174,8 +4180,10 @@ def run_streamlit():
     import streamlit as st
     global _STATE
     st.set_page_config(layout="wide")  # 展示最大化：宽屏铺满视口
-    # ── 登录门：secrets.toml 有 [auth] 才启用；本地无配置自动跳过 ──
-    _auth = hasattr(st.user, "is_logged_in")   # 有 [auth] 才为 True，无需裸表达式（避免被 magic 渲染）
+    # ── 登录门：RAG_LOGIN_ENABLED=1 且 secrets.toml 有 [auth] 才启用 ──
+    # 两个条件都满足才启用：开关（仓库侧，.env 可改）与 [auth]（运行期是否存在，
+    # 取决于平台是否注入 OAUTH_*）。本地无配置自动跳过。
+    _auth = LOGIN_ENABLED and hasattr(st.user, "is_logged_in")   # 有 [auth] 才为 True，无需裸表达式（避免被 magic 渲染）
     if _auth and not st.user.is_logged_in:
         _, c, _ = st.columns([2, 1, 2])
         with c:
