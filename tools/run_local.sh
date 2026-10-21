@@ -89,6 +89,37 @@ MODELS_LOG="${ROOT}/infinity.log"
 APP_PIDFILE="${ROOT}/.streamlit.pid"
 APP_LOG="${ROOT}/streamlit.log"
 
+# ── 应用的判据走"命令行匹配本项目 chatbot.py 的 Streamlit 监听者"，pid 文件只作记账 ──
+# 教训：os.execv 同进程替换也会出现 pid 文件与真实监听者对不上（exec 派生/孤儿形态），
+# 只看 pid 文件会漏杀孤儿；而只看端口健康会把"跑着旧代码/.env 的孤儿子进程"误判成
+# 可复用 —— 复用判据必须是「pid 文件进程活着 && 它就是监听者」，二者缺一就清残留重启。
+_app_listener_pids() {
+    local _out="" _pid _cmd
+    for _pid in $(lsof -nP -tiTCP:"${APP_PORT}" -sTCP:LISTEN 2>/dev/null | sort -u); do
+        _cmd="$(ps -p "${_pid}" -o command= 2>/dev/null)" || continue
+        case "${_cmd}" in *"streamlit run"*"${ROOT}/chatbot.py"*) _out="${_out:+${_out} }${_pid}" ;; esac
+    done
+    printf '%s' "${_out}"
+}
+
+_app_reap() {
+    local _pids="$(_app_listener_pids)" _i
+    [ -n "${_pids}" ] || return 0
+    _log "  清理本项目 Streamlit 残留/孤儿监听进程：${_pids}"
+    kill ${_pids} 2>/dev/null || true
+    for _i in $(seq 1 20); do
+        _pids="$(_app_listener_pids)"
+        [ -z "${_pids}" ] && return 0
+        sleep 0.5
+    done
+    _pids="$(_app_listener_pids)"
+    if [ -n "${_pids}" ]; then
+        _log "  仍未退出，强制 kill -9：${_pids}"
+        kill -9 ${_pids} 2>/dev/null || true
+        sleep 1
+    fi
+}
+
 _log() { printf '[run_local] %s\n' "$*"; }
 _die() { printf '[run_local] ❌ %s\n' "$*" >&2; exit 1; }
 
@@ -225,8 +256,20 @@ _start_app() {
         _log "    先把检索模型服务起起来（tools/run_local.sh start 的第 3 步），或把后端改回 torch。"
     fi
     if _http_ok "${APP_URL}/_stcore/health"; then
-        _log "  已有实例在服务：${APP_URL} —— 复用（改过代码要先 stop 再 start）"
-        return 0
+        _pidadm="$(cat "${APP_PIDFILE}" 2>/dev/null || true)"
+        if _pid_alive "${_pidadm}" && case " $(_app_listener_pids) " in *" ${_pidadm} "*) true ;; *) false ;; esac; then
+            _log "  pid=${_pidadm} 在听且健康 —— 复用（改代码/改 .env 后必须 stop 再 start，复用跑的是旧进程）"
+            return 0
+        fi
+        # 端口健康但记账失真（pid 文件失效/指的不是监听者）：监听者跑的是旧代码或旧 .env，
+        # "复用"等于假发布 —— 清掉重启，让新代码与新配置真正加载进来。
+        _log "  端口健康，但 pid 文件指的不是监听者（监听=[$(_app_listener_pids)]，记账=${_pidadm:-无}）—— 清残留后重启"
+        _app_reap
+        rm -f "${APP_PIDFILE}"
+    elif [ -n "$(_app_listener_pids)" ]; then
+        _log "  服务未就绪但端口被本项目 Streamlit 占着 —— 先清残留再启动"
+        _app_reap
+        rm -f "${APP_PIDFILE}"
     fi
     if _running_pid "${APP_PIDFILE}" >/dev/null; then
         _log "  已有实例在运行，等待就绪"
@@ -264,6 +307,7 @@ _do_start() {
 
 _do_stop() {
     _stop_pidfile "应用" "${APP_PIDFILE}"
+    _app_reap   # pid 文件只杀得掉"记账进程"；真实监听者（exec/子进程形态）按命令行兜底收干净
     _stop_pidfile "检索模型服务" "${MODELS_PIDFILE}"
     _stop_pidfile "Ollama" "${OLLAMA_PIDFILE}"
     "$ROOT/tools/run_qdrant.sh" stop
