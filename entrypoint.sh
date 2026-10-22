@@ -148,25 +148,54 @@ else
 fi
 
 # ── 0. 运行期目录与下载源 ────────────────────────────────────────────────────
-# Ollama 权重落在 /app 下（不依赖 HOME，非 root 也可写）；平台若给持久卷可挂到这里。
-export OLLAMA_MODELS="${OLLAMA_MODELS:-/app/ollama_models}"
 # 嵌入/重排权重的备源 HF 镜像；主源用魔搭自己的 hub（创空间内必达）。
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+
+# ── 0.1 权重根目录三级策略（2026-10-22，与 no-bake 配套）────────────────────────
+# 必须落在「目录创建 / ollama serve / 各消费方」之前：这是 MODELS_DIR / OLLAMA_MODELS 的
+# 最终定值处。三层按优先级：
+#   ① 烘焙镜像里已带权重（/app/models 的模型目录含 config.json，或 ollama manifests 已在
+#      /app/ollama_models）→ 忠于镜像根目录（已就绪，实时可用）；
+#   ② 非烘焙 + 平台持久盘 /mnt/workspace 可写 → 两个根目录都迁过去：首启下载 ~6GB 一次，
+#      此后**再部署/重启直接命中盘上清单**（_download_models 与 _pull_ollama_model 的
+#      就绪判据本就"清单齐备即跳过"），配合 no-bake 的 ~12min 部署 = 全程达成零重下；
+#   ③ 都不满足 → /app/models、/app/ollama_models（原行为，可就地下载）。
+# 显式 MODELS_DIR（.env / 环境）最高优先级，本策略不覆盖——".env 里写了就是用户的意图"。
+_con_w_baked=0
+[ -f "/app/models/$(basename "${RAG_EMBED_MODEL_PATH:-bge-m3}")/config.json" ] && _con_w_baked=1
+[ -f "/app/models/$(basename "${RAG_RERANK_MODEL_PATH:-bge-reranker-v2-m3}")/config.json" ] && _con_w_baked=1
+_oll_baked=0
+[ -d /app/ollama_models/manifests ] && _oll_baked=1
+_mnt_ok=0
+[ -d /mnt/workspace ] && [ -w /mnt/workspace ] && _mnt_ok=1
+if [ -n "${MODELS_DIR:-}" ]; then
+    _log "权重根目录: MODELS_DIR=${MODELS_DIR} 已显式指定（三级策略不覆盖）"
+elif [ "${_con_w_baked}" = 1 ]; then
+    export MODELS_DIR=/app/models
+else
+    if [ "${_mnt_ok}" = 1 ]; then
+        export MODELS_DIR=/mnt/workspace/models
+        _log "权重根目录: 非烘焙 + 持久盘可写 → MODELS_DIR=${MODELS_DIR}（权重只下一次，再部署命中清单即跳过下载）"
+    else
+        export MODELS_DIR=/app/models
+    fi
+fi
+if [ "${_oll_baked}" = 0 ] && [ "${_mnt_ok}" = 1 ]; then
+    export OLLAMA_MODELS=/mnt/workspace/ollama_models
+fi
 # 这是全脚本唯一不 exit 1 的启动前置条件（脚本没有 set -e）：磁盘满/配额超/只读挂载
 # 时 Ollama 与权重目录建不出来，后面却照常往下走，最后表现为"容器起来了但一个模型都
 # 没有"，且日志里没有任何一条指向根因。
 # 权重根目录与 fetch_models.sh / infinity / 自检门禁同源（MODELS_DIR 可被 .env 覆盖，
 # 见评审 #8；默认 /app/models 不变，只是不再写死）。
-if ! mkdir -p "${OLLAMA_MODELS}" "${MODELS_DIR:-/app/models}" 2>/tmp/mkdir.log; then
+if ! mkdir -p "${OLLAMA_MODELS}" "${MODELS_DIR}" 2>/tmp/mkdir.log; then
     _log "❌ 无法创建运行期目录（磁盘满 / 配额超 / 只读挂载？），详见 /tmp/mkdir.log："
     cat /tmp/mkdir.log
     exit 1
 fi
 
-# ── 0.1 持久卷探测（no-bake 观测项，见 Dockerfile "默认关烘焙" 2026-10-22）──────────
-# 纯探测、不改行为：若平台给持久盘（/mnt/workspace），权重根后续可迁过去做跨重启缓存
-# （运行期下载一次、之后零成本）；探测行写进 run 日志，据此决定是否迁移 MODELS_DIR。
+# ── 0.2 持久卷探测（观测行，随三级策略保留）──────────────────────────────────
 if [ -d /mnt/workspace ]; then
     _mnt_av="$(df -Pk /mnt/workspace 2>/dev/null | awk 'NR==2{printf "%d", $4/1048576}')"
     _mnt_st="存在（可用 ${_mnt_av:-?}G"
