@@ -164,6 +164,18 @@ if ! mkdir -p "${OLLAMA_MODELS}" "${MODELS_DIR:-/app/models}" 2>/tmp/mkdir.log; 
     exit 1
 fi
 
+# ── 0.1 持久卷探测（no-bake 观测项，见 Dockerfile "默认关烘焙" 2026-10-22）──────────
+# 纯探测、不改行为：若平台给持久盘（/mnt/workspace），权重根后续可迁过去做跨重启缓存
+# （运行期下载一次、之后零成本）；探测行写进 run 日志，据此决定是否迁移 MODELS_DIR。
+if [ -d /mnt/workspace ]; then
+    _mnt_av="$(df -Pk /mnt/workspace 2>/dev/null | awk 'NR==2{printf "%d", $4/1048576}')"
+    _mnt_st="存在（可用 ${_mnt_av:-?}G"
+    [ -w /mnt/workspace ] && _mnt_st="${_mnt_st}，可写）" || _mnt_st="${_mnt_st}，只读）"
+    _log "持久卷探测: /mnt/workspace ${_mnt_st}"
+else
+    _log "持久卷探测: 无 /mnt/workspace"
+fi
+
 if [ ! -f .env ]; then
     _log "⚠️ 缺少 .env（git 推送前没 git add -f .env？）：将退到代码默认配置"
 fi

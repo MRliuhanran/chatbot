@@ -1,9 +1,9 @@
 # 单镜像全栈：Qdrant + Ollama(CPU) + RAG 应用（魔搭创空间 Docker 类型用，端口 7860）
 #
 # ★ 最小化策略（2026-09-27）★
-#   1) 模型默认在**构建期烘焙**进镜像（BAKE_MODELS/BAKE_OLLAMA，见下方 modelbake 阶段）：
-#      容器可写层不持久，运行期下载=每次重启重下数 GB、且"构建完"并不"能用"。置 0 退回运行期
-#      按需下载（镜像回到 ~2.5G，但首启要等下载）。清单唯一来源 tools/fetch_models.sh。
+#   1) 模型**默认不烘焙**（BAKE_MODELS=0 / BAKE_OLLAMA=0，2026-10-22 no-bake 切换，见下方
+#      modelbake 阶段注释）：权重改运行期后台下载。要回到"构建完即能用"的烘焙镜像，把两个
+#      ARG 置 1（2026-10-20 起烘焙曾是 3.4G 镜像版）。清单唯一来源 tools/fetch_models.sh。
 #   2) Ollama 自带 CUDA/ROCm 运行库在无 GPU 服务器上是纯浪费，构建时删除（约省 2.1G）。
 #   3) 本地数据全部打进镜像：.env / artifacts / storage / corpus / lexicon，
 #      开箱即用、无需在服务器重建（2 核重建索引远超 73 分钟）。
@@ -89,9 +89,6 @@ ARG TARGETARCH
 # 与 appbase 同名 ARG 的默认值保持一致（本阶段在其之前，无法继承 appbase 的 ARG）。
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_FALLBACK_INDEX=https://repo.huaweicloud.com/repository/pypi/simple
-RUN apt-get update \
- && apt-get install -y --no-install-recommends build-essential cmake \
- && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 COPY wheels/ /pre/
 RUN set -eux; \
@@ -113,6 +110,12 @@ RUN set -eux; \
         cp -p "${_w}" /lcpwheel/; \
     else \
         echo "[lcpwheel] 仓内无 ${_m} 的 ${_v} wheel → 从 sdist 源码编译（glibc）"; \
+        # 编译器只在**编译分支**装（2026-10-22 从前置 RUN 挪进来）：import 在本阶段结束
+        # 就被 COPY --from 取走 wheel 而丢弃，复用分支完全不需要 —— 装一次浪费 30-60s
+        # 且平添一层。先前无条件 apt 是"复用优先"上线前的残留写法。
+        apt-get update \
+            && apt-get install -y --no-install-recommends build-essential cmake \
+            && rm -rf /var/lib/apt/lists/*; \
         # GGML_OPENMP=OFF：默认 ON 会把 libgomp.so.1 链进 libllama.so，而运行时基座
         # （python:slim，无 build-essential）没有 libgomp → import 即失败（2026-10-21
         # 本地 Rosetta 构建实测）。关掉后 NEEDED 回到 libc/libstdc++/libgcc（与文件头
@@ -278,6 +281,15 @@ SHELL ["/bin/bash", "-c"]
 #   会如实保留源 mtime（touch 组与 no-touch 组层链不同、同组内两次构建完全一致）；
 #   新版 buildkit 虽会归一 RUN 产物 mtime，但魔搭 runner 显然不会（否则层早就去重了），
 #   显式 touch 对两种实现都无害。
+#
+# ★ 默认关烘焙（2026-10-22，no-bake）★ —— 两轮部署实测推倒重来：同 commit 连续两次构建，
+#   **连 3KB 层的 blob digest 都每次变**（runner 的 buildkit 打包非确定，非我们产物差异），
+#   注册表去重永远打不中 → push 时长 ≈ 镜像大小 / 跨境带宽（HK 构建机 ~8-10MB/s），
+#   与 mtime 归一无关。部署 39min = bake 12min + export/import 6.5min + push 13.4min，
+#   三者都随镜像大小线性缩放、根因都是 6GB 权重在镜像里。故 ARG 默认走运行期下载：
+#   镜像 ~4.6G → ~1.4G，部署 ~12min；权重改由 entrypoint 后台下载（应用侧
+#   MODEL_WAIT_SECS=900 轮询等权重，页面先起）。要回烘焙：把下面两个 ARG 置 1
+#   （代价与收益见上，烘焙版首启不等下载，但每次部署多 ~27min）。
 FROM appbase AS modelbake
 
 # SHELL / WORKDIR 在 FROM <stage> 时按 Docker 语义继承自 appbase，但本机无法实跑构建验证，
@@ -296,8 +308,11 @@ COPY tools/bake.env ./.env
 # _load_dotenv，与运行期逐字同源（避免"构建期一套、运行期一套"的第二条注入路径）。
 COPY tools/fetch_models.sh tools/dotenv.sh ./tools/
 
-ARG BAKE_MODELS=1
-ARG BAKE_OLLAMA=1
+# —— 烘焙开关（**默认 0 = 关烘焙**，2026-10-22 起；理由见上方"默认关烘焙"注释）——
+ARG BAKE_MODELS=0
+ARG BAKE_OLLAMA=0
+# 开烘焙时留意 BAKE_MIN_*_MB：与所选模型实测大小对齐，清单齐备但偏小=半截下载。
+
 # 磁盘预检下限（GB）：并行烘焙同时容纳"下载区 + 最终镜像层"两份，低于下限直接判失败
 # （半途 ENOSPC 只会产出更难归因的残层）。构建机磁盘紧时：清缓存，或置 BAKE_*=0。
 ARG BAKE_MIN_FREE_GB=8
@@ -311,14 +326,18 @@ ARG BAKE_MIN_OLLAMA_MB=1200
 RUN set -eux; \
     _T_ALL=$(date +%s); \
     mkdir -p /bake/embed /bake/rerank /bake/ollama_models; \
-    echo "[bake] ==================== 磁盘预检（要下 ~7.7G）===================="; \
-    df -h / /bake; \
-    _free=$(df -Pk /bake | awk 'NR==2{printf "%d", $4/1048576}'); \
-    echo "[bake] /bake 可用 ${_free}G（下限 BAKE_MIN_FREE_GB=${BAKE_MIN_FREE_GB}G）"; \
-    if [ "${_free}" -lt "${BAKE_MIN_FREE_GB}" ]; then \
-        echo "[bake] ❌ 可用空间 ${_free}G < ${BAKE_MIN_FREE_GB}G：并行烘焙需同时容纳下载区与最终镜像层" >&2; \
-        echo "[bake]    出路：① 清理构建机磁盘 ② BAKE_MODELS=0 / BAKE_OLLAMA=0 退回运行期下载。" >&2; \
-        exit 1; \
+    if [ "${BAKE_MODELS}" = "1" ] || [ "${BAKE_OLLAMA}" = "1" ]; then \
+        echo "[bake] ==================== 磁盘预检（要下 ~7.7G）===================="; \
+        df -h / /bake; \
+        _free=$(df -Pk /bake | awk 'NR==2{printf "%d", $4/1048576}'); \
+        echo "[bake] /bake 可用 ${_free}G（下限 BAKE_MIN_FREE_GB=${BAKE_MIN_FREE_GB}G）"; \
+        if [ "${_free}" -lt "${BAKE_MIN_FREE_GB}" ]; then \
+            echo "[bake] ❌ 可用空间 ${_free}G < ${BAKE_MIN_FREE_GB}G：并行烘焙需同时容纳下载区与最终镜像层" >&2; \
+            echo "[bake]    出路：① 清理构建机磁盘 ② BAKE_MODELS=0 / BAKE_OLLAMA=0 退回运行期下载。" >&2; \
+            exit 1; \
+        fi; \
+    else \
+        echo "[bake] BAKE_*=0：跳过下载与磁盘预检（镜像只承载代码/数据，权重走运行期下载）"; \
     fi; \
     . ./tools/dotenv.sh; \
     _load_dotenv; \
