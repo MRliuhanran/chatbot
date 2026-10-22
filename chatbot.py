@@ -304,7 +304,19 @@ class _LockedRotatingFileHandler(RotatingFileHandler):
     CLI（process/index/…）与常驻服务（api/serve）可能同时写同一份 rag.log：两个进程
     同时进 doRollover 会互相覆盖 *.log.N，日志丢行甚至把轮转中的文件写坏。fcntl 不可用
     的平台退回基类行为（单进程安全，多进程轮转尽力而为，不让日志把主流程带崩）。
+
+    flock 之外还要修第二个失效源（stale fd）：进程 A 轮转 rename 后，进程 B 手里
+    持有的 fd 仍指向已被改名的 rag.log.N —— 只凭 fd 偏移继续写，日志会落进旧编号
+    文件直到 B 自己触发下一次轮转。emit 里按「当前路径的 inode/大小」复核：
+    fd 已脱离现行文件就重开，当前路径真实大小超限就按它轮转。
     """
+
+    def shouldRollover(self, record, msg):
+        """禁用基类 fd 位置轮转：BaseRotatingHandler.emit 的默认流程还会走一遍
+        (stream.tell() + len(msg)) >= maxBytes —— fd 陈旧时这是**旧文件的偏移**，结论不可
+        靠（实测：每条 emit 轮转两次、备份文件只剩目标交替）。轮转的唯一触发点交给
+        _rotate_if_current_is_full（按当前路径真实大小），本钩子恒 False。"""
+        return False
 
     def emit(self, record):
         try:
@@ -319,9 +331,48 @@ class _LockedRotatingFileHandler(RotatingFileHandler):
             return
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            super().emit(record)
+            self._resync_borrowed_fd()
+            if self.stream is None:
+                self.stream = self._open()
+            self._rotate_if_current_is_full()
+            logging.FileHandler.emit(self, record)
         finally:
             os.close(fd)  # close 即释放 flock
+
+    def _resync_borrowed_fd(self):
+        """fd 指向的文件若已不是当前 backing 文件（他人轮转 rename 走过），重开到现行文件。"""
+        try:
+            st_path = os.stat(self.baseFilename)
+        except OSError:
+            return
+        if self.stream is None:
+            return
+        try:
+            st_fd = os.fstat(self.stream.fileno())
+        except OSError:
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = self._open()
+            return
+        if (st_fd.st_dev, st_fd.st_ino) != (st_path.st_dev, st_path.st_ino):
+            self.stream.close()
+            self.stream = self._open()
+
+    def _rotate_if_current_is_full(self):
+        """按**当前路径真实大小**判定轮转：stream.tell() 在 fd 陈旧时是旧文件的偏移，不可信。"""
+        if not self.maxBytes:
+            return
+        try:
+            if os.path.getsize(self.baseFilename) < self.maxBytes:
+                return
+        except OSError:
+            return
+        try:
+            self.doRollover()
+        except Exception:
+            pass  # 轮转失败按原文件继续写（保守：不丢日志，占盘风险交给下一次 emit 重试）
 
 
 _LOG_FILE = None
@@ -373,14 +424,15 @@ def log(*parts):
 
 
 # ── 运行态单例（模块级缓存/锁的统一定义处）──
-# 会话、tokenizer、词表、别名解析结果都属于"每个进程只应有一份、且懒加载要加锁"的状态。
-# 集中放一个 _RuntimeState：多线程（预热线程/API 请求）与 Streamlit 多次 rerun 之间不会
+# tokenizer、词表、别名解析结果都属于"每个进程只应有一份、且懒加载要加锁"的状态。
+# Ollama 的 requests.Session **不在**这里：requests.Session 不保证线程安全，进程级
+# 单例会让预热线程与多个会话线程并发共用同一个连接池。它按线程各持一份（_OLLAMA_SESSION_TLS，
+# 线程结束随线程回收，keep-alive 收益不减），集合进 _RuntimeState 反而制造跨线程竞争。
+# 集中放一个 _RuntimeState：多线程（预热线程/UI 脚本线程）与 Streamlit 多次 rerun 之间不会
 # 出现"同一载荷两份缓存"的分叉；__init__ 里析构即可。属性全部在模块级初始化，保证任何
 # 线程首个访问者拿到的都只这一份（_state_ref 双检锁）。
 class _RuntimeState:
     def __init__(self):
-        self.ollama_session = None
-        self.ollama_session_lock = threading.Lock()
         self.lexicon = None
         self.lexicon_lock = threading.Lock()
         self.gen_tokenizer = None
@@ -412,7 +464,7 @@ def _streamlit_runtime_state():
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 API_URL = f"{OLLAMA_BASE_URL}/api/chat"
 MODEL = os.getenv("MODEL", "qwen3.5:2b-q4_K_M")
-# 思维链唯一开关：模型/页面/API/会话共用（默认关）；开启时只当场展示、永不进入生成上下文。
+# 思维链唯一开关：模型/页面/API/会话共用（默认关）；开启时只展示（历史与正文同栏）、永不进入生成上下文。
 THINK = env_bool("RAG_THINK", False)
 # num_ctx / num_predict 与思维链开关解耦：固定预算，不随开关浮动。
 # 解析必须走 env_int（具名报错）；下限在 GEN_INPUT_RESERVE 定义处与它交叉校验。
@@ -446,14 +498,22 @@ GEN_SEED = env_int("RAG_GEN_SEED", -1)
 # 由服务端上下文移位从最前面按 token 丢续写；空答/截断/报错原样交给上层。
 
 
+_OLLAMA_SESSION_TLS = threading.local()
+
+
 def _ollama_session():
-    """Ollama HTTP 连接复用：单例 Session 走 keep-alive，省每请求的 TCP 握手。"""
-    state = _state_ref()
-    with state.ollama_session_lock:
-        if state.ollama_session is None:
-            import requests
-            state.ollama_session = requests.Session()
-        return state.ollama_session
+    """Ollama HTTP 连接复用：**线程本地** Session 走 keep-alive，省每请求的 TCP 握手。
+
+    旧写法是进程级单例 Session：requests.Session 官方不保证线程安全，预热线程与多个
+    会话线程并发复用同一连接池/适配器会竞争内部状态，且一份会话的连接故障会传染到所有
+    会话。线程本地各持一份后 keep-alive 收益不减，跨线程竞争消失。
+    """
+    session = getattr(_OLLAMA_SESSION_TLS, "session", None)
+    if session is None:
+        import requests
+        session = requests.Session()
+        _OLLAMA_SESSION_TLS.session = session
+    return session
 
 
 
@@ -859,6 +919,9 @@ QDRANT_TIMEOUT = env_int_min("RAG_QDRANT_TIMEOUT", 60, 1)
 # Qdrant 写批并发度（index）：0/未设 = 派生（见 qdrant_write_workers，规则来自实测 RTT +
 # Little 定律）；显式值只用来压测/限流，正常路径不该填。sparse 的页并发共用同一个派生。
 INDEX_WRITE_WORKERS = env_int_min("RAG_INDEX_WRITE_WORKERS", 0, 0)
+# Streamlit 会话内 count 缓存时长（秒）：rerun 期间点数不会变，TTL 内直接复用缓存值，
+# 省每次 rerun 一趟网络。index 重建生效后最迟 TTL 走完就取新值；0 = 禁用缓存。
+COLLECTION_COUNT_TTL_S = env_int_min("RAG_COLLECTION_COUNT_TTL_S", 300, 0)
 COLLECTION_BASE = os.getenv("RAG_COLLECTION_BASE", "rag_documents_v1")
 COLLECTION_NAME = COLLECTION_BASE
 COLLECTION_ALIAS = os.getenv("RAG_COLLECTION_ALIAS", "rag_current")
@@ -1127,15 +1190,24 @@ NORMALIZE_QUOTES = env_bool("NORMALIZE_QUOTES", True)
 FTFY_FIX = { "fix_encoding": True, "unescape_html": False, "remove_terminal_escapes": False, "fix_latin_ligatures": False, "fix_character_width": False, "uncurl_quotes": False, "fix_line_breaks": False, "fix_surrogates": False, "remove_control_chars": False, }
 TEXT_OPENCC = (os.getenv("RAG_TEXT_OPENCC") or "t2s").strip()
 _OPENCC_INSTANCE = None
+_OPENCC_LOCK = threading.Lock()
 
 
 def _opencc():
-    """惰性取 OpenCC 转换器（首次调用才 import，符合"第三方依赖全部惰性"）。"""
+    """惰性取 OpenCC 转换器（首次调用才 import，符合"第三方依赖全部惰性"）。
+
+    双检锁：预热线程与首个查询并发归一时，旧写法会各建一份转换器（一份白占内存一份
+    被 GC，词典加载白付一趟）。与 lexicon 单例双检锁同一纪律。
+    """
     global _OPENCC_INSTANCE
-    if _OPENCC_INSTANCE is None:
-        from opencc import OpenCC
-        _OPENCC_INSTANCE = OpenCC(TEXT_OPENCC)
-    return _OPENCC_INSTANCE
+    instance = _OPENCC_INSTANCE
+    if instance is None:
+        with _OPENCC_LOCK:
+            if _OPENCC_INSTANCE is None:
+                from opencc import OpenCC
+                _OPENCC_INSTANCE = OpenCC(TEXT_OPENCC)
+        instance = _OPENCC_INSTANCE
+    return instance
 
 
 def normalize_text(text):
@@ -2325,8 +2397,6 @@ def build_index():
             _miss = sorted(_RECORD_FIELDS - set(all_chunks[0]))
             _extra = sorted(set(all_chunks[0]) - _RECORD_FIELDS)
             raise RuntimeError(f"{CHUNKS_JSON} 记录键集与当前契约不一致（多 {_extra}、少 {_miss}）——通常是改了 RAG_SOURCE_FIELD 等字段配置，请重跑 process 后再 index")
-    if not all_chunks:
-        raise ValueError("chunks.json 为空")
     log(f"加载分块数据: {len(all_chunks)} 条（{meta.get('total_parents', '?')} 个父块）")
     build_id = uuid.uuid4().hex
     lexicon_id = lexicon_fingerprint()
@@ -2347,9 +2417,26 @@ def build_index():
     # 不必知道设备、不必加载 torch 与嵌入模型（约 600MB 峰值，原本只为猜"读哪个精度
     # 的文件名"和拿 hidden_size 而付）。cands 同时供下面的增量路径复用，同一份文件
     # 不会读两遍。
-    cands = _inspect_embed_caches(keys) if EMBED_CACHE_ENABLED else []
+    cands = _inspect_embed_caches(keys) if (EMBED_CACHE_ENABLED and total) else []
     hit = _full_embed_cache(cands)
-    if hit is not None:
+    if not total:
+        # 空产物 =「已清空」的合法边界（corpus 被清空，见 _document_paths / build_chunks）：
+        # 与正常重建同法写入 0 点新集合并切别名 —— 写出就是一个**已清空**的知识库，
+        # 而不是在此 raise 把"清空"变成不可达状态（serve/stages 永远指向死路）。
+        # 清空集合同样需要一个稠密维度：嵌入模型目录缺失在 verify_chunks_freshness 的
+        # 切分指纹里已先行报错，这里 config.json 缺 hidden_size 是最后防线。
+        dense_dim = _expected_embed_dim()
+        if not dense_dim:
+            raise RuntimeError(
+                f"嵌入模型目录读不出稠密维度（config.json 缺失或 hidden_size 为空，{EMBED_MODEL_PATH!r}）："
+                "空集合同样需要维度，先恢复模型目录再重跑 index"
+            )
+        dense_dim = int(dense_dim)
+        precision, device, cache_path = None, None, None
+        cache, missing, cache_entries = {}, [], 0
+        tokenizer = model = None
+        log("⚠️  chunks.json 为空（corpus 已清空）：跳过嵌入阶段，按清空语义写入 0 点集合并切换别名")
+    elif hit is not None:
         precision, cache_path, cache, missing = hit
         device = None
         use_gpu = False
@@ -2411,33 +2498,37 @@ def build_index():
             elapsed = time.time() - t0
             speed = done / elapsed if elapsed > 0 else 0
             log(f"  计算进度 {done / len(missing) * 100:5.1f}% ({done}/{len(missing)}) {speed:.0f} 条/秒")
-    holes = [i for i, e in enumerate(embeddings) if e is None]
-    if holes:
-        raise RuntimeError(f"{len(holes)} 个槽位没有被填充（例如 {holes[:5]}）：缓存命中数与待计算集合不一致")
-    dims = {int(np.asarray(e).shape[-1]) for e in embeddings}
-    if len(dims) != 1:
-        raise RuntimeError(f"向量维度不一致: {sorted(dims)} —— 通常意味着缓存里混入了别的模型的向量，请删掉 {cache_path} 后重跑或设 RAG_EMBED_CACHE=0")
-    # 1710: 上方 embeddings 是 list[ndarray|None]（槽位填充），从这里起是整块矩阵 —— 同名两义正是类型报错根源，矩阵一侧改名 matrix。
-    matrix = np.vstack([np.asarray(e, dtype="float32") for e in embeddings])
-    # 显式 raise 而非 assert：`python -O` 会剥离 assert，不变量静默消失
-    if matrix.shape[0] != total:
-        raise RuntimeError(f"向量条数 {matrix.shape[0]} 与分块数 {total} 不一致")
-    if EMBED_CACHE_ENABLED:
-        # 命中且无冗余时整份重写是纯浪费：np.savez 在峰值里再摊一份 zip 缓冲，
-        # 磁盘上 73MB 也原地重写一遍。判据要两条一起看才严 —— missing==0 保证每个
-        # key 都在缓存里，条数相等才排除"缓存里残留已删文档的旧条目"（那种仍需重写清理）。
-        # ★ 两侧口径必须都去重：cache 是 dict（键天然唯一），keys 是逐块列表 —— 只要两条
-        #   分块正文逐字相同（重复段落/重复标题很常见），len(keys) 就恒大于 len(cache)，
-        #   判据恒真，index 每次都整份重写 npz（判据恒真式浪费，日志却写"全部命中"）。
-        if missing or cache_entries != len(set(keys)):
-            _save_embed_cache(cache_path, keys, matrix)
-            log(f"向量缓存已更新: {cache_path}（重算 {len(missing)} 条）")
-        else:
-            log(f"向量缓存无需更新（{len(keys)} 条全部命中且无冗余）: {cache_path}")
+    if total:
+        holes = [i for i, e in enumerate(embeddings) if e is None]
+        if holes:
+            raise RuntimeError(f"{len(holes)} 个槽位没有被填充（例如 {holes[:5]}）：缓存命中数与待计算集合不一致")
+        dims = {int(np.asarray(e).shape[-1]) for e in embeddings}
+        if len(dims) != 1:
+            raise RuntimeError(f"向量维度不一致: {sorted(dims)} —— 通常意味着缓存里混入了别的模型的向量，请删掉 {cache_path} 后重跑或设 RAG_EMBED_CACHE=0")
+        # 1710: 上方 embeddings 是 list[ndarray|None]（槽位填充），从这里起是整块矩阵 —— 同名两义正是类型报错根源，矩阵一侧改名 matrix。
+        matrix = np.vstack([np.asarray(e, dtype="float32") for e in embeddings])
+        # 显式 raise 而非 assert：`python -O` 会剥离 assert，不变量静默消失
+        if matrix.shape[0] != total:
+            raise RuntimeError(f"向量条数 {matrix.shape[0]} 与分块数 {total} 不一致")
+        # 维度下游（create_collection / 一致性校验）一律引用 dense_dim：它与矩阵生命周期
+        # 解耦，清空重建（total==0）_branch 上方从模型目录读出，两条路都有一份。
+        dense_dim = int(matrix.shape[1])
+        if EMBED_CACHE_ENABLED:
+            # 命中且无冗余时整份重写是纯浪费：np.savez 在峰值里再摊一份 zip 缓冲，
+            # 磁盘上 73MB 也原地重写一遍。判据要两条一起看才严 —— missing==0 保证每个
+            # key 都在缓存里，条数相等才排除"缓存里残留已删文档的旧条目"（那种仍需重写清理）。
+            # ★ 两侧口径必须都去重：cache 是 dict（键天然唯一），keys 是逐块列表 —— 只要两条
+            #   分块正文逐字相同（重复段落/重复标题很常见），len(keys) 就恒大于 len(cache)，
+            #   判据恒真，index 每次都整份重写 npz（判据恒真式浪费，日志却写"全部命中"）。
+            if missing or cache_entries != len(set(keys)):
+                _save_embed_cache(cache_path, keys, matrix)
+                log(f"向量缓存已更新: {cache_path}（重算 {len(missing)} 条）")
+            else:
+                log(f"向量缓存无需更新（{len(keys)} 条全部命中且无冗余）: {cache_path}")
     del keys, model, tokenizer
     if device == "mps":
         _mps_empty_cache()
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY)
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
     alias_ok = USE_COLLECTION_ALIAS
     if alias_ok:
         try:
@@ -2454,7 +2545,7 @@ def build_index():
         except Exception:
             pass
     log(f"写入 Qdrant (稠密+稀疏混合) → 集合 {target_collection}")
-    client.create_collection( collection_name=target_collection, vectors_config={ DENSE_VECTOR_NAME: VectorParams( size=matrix.shape[1], distance=Distance.COSINE, ) }, sparse_vectors_config={ SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF) }, )
+    client.create_collection( collection_name=target_collection, vectors_config={ DENSE_VECTOR_NAME: VectorParams( size=dense_dim, distance=Distance.COSINE, ) }, sparse_vectors_config={ SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF) }, )
     for field, schema in ( (SOURCE_FIELD, PayloadSchemaType.KEYWORD), ("parent_id", PayloadSchemaType.KEYWORD), ):
         try:
             client.create_payload_index( collection_name=target_collection, field_name=field, field_schema=schema )
@@ -2585,8 +2676,8 @@ def build_index():
         )
     coll_dense_size = next(iter(info.config.params.vectors.values())).size  # type: ignore[union-attr]
     # 显式 raise 而非 assert（-O 会剥离 assert，维度错配就静默放行了）
-    if coll_dense_size != matrix.shape[1]:
-        raise RuntimeError(f"集合稠密维度 {coll_dense_size} 与本次编码维度 {matrix.shape[1]} 不一致（集合名 {target_collection}）")
+    if coll_dense_size != dense_dim:
+        raise RuntimeError(f"集合稠密维度 {coll_dense_size} 与本次编码维度 {dense_dim} 不一致（集合名 {target_collection}）")
     log(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} (size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")  # type: ignore[union-attr]
     log("  索引构建完成: 稠密向量 + 稀疏向量（Qdrant 内置 BM25，分词在服务端 multilingual）")
     if alias_ok:
@@ -3472,15 +3563,14 @@ class RAGEngine:
                 "索引未记录分块指纹（旧索引），无法与当前切分指纹比对："
                 "可能在服务过期分块，请运行 `python chatbot.py index` 重建后再检索。"
             )
-        try:
-            # 与 build_chunks / verify_chunks_freshness 用**同一个**函数：配置 + 源文本 sha。
-            # 只算配置时，"改语料 + 只跑 process"会让索引里的旧指纹与"当前"仍然相等，
-            # 闸门恒等放行 —— 用户静默吃到旧知识库（失效原型：静默 + 判据恒真）。
-            paths = _document_paths()
-            current = _chunking_fingerprint(_sources_fingerprint(paths))
-        except Exception as exc:
-            log(f"⚠️  无法计算当前切分指纹，暂缓分块新鲜度检查: {type(exc).__name__}: {exc}")
-            return
+        # fail-closed：本地路径只涉及文件读取与哈希（不碰网络），失败就显式报错，
+        # 不允许"暂缓核对"——旧写法吞掉异常继续检索，等于把"结果未知"当"一致"放行，
+        # 坏指纹缓存过期索引能谎称新鲜整整一个进程生命周期。
+        # 与 build_chunks / verify_chunks_freshness 用**同一个**函数：配置 + 源文本 sha。
+        # 只算配置时，"改语料 + 只跑 process"会让索引里的旧指纹与"当前"仍然相等，
+        # 闸门恒等放行 —— 用户静默吃到旧知识库（失效原型：静默 + 判据恒真）。
+        paths = _document_paths()
+        current = _chunking_fingerprint(_sources_fingerprint(paths))
         if index_fp == current:
             self._chunk_fp_checked = True
             return
@@ -3497,11 +3587,9 @@ class RAGEngine:
                 "索引未记录词表指纹（旧索引）：稀疏通道新旧无从判断，"
                 "请运行 `python chatbot.py sparse` 重建后再检索。"
             )
-        try:
-            current = lexicon_fingerprint(self._get_client())
-        except Exception as exc:
-            log(f"⚠️  无法计算当前词表指纹，暂缓词表一致性检查: {type(exc).__name__}: {exc}")
-            return
+        # fail-closed：与分块闸门同理由。词表指纹要读 Qdrant 里的词表点，失败≠暂缓——
+        # 计算失败（词表损坏/点缺失）意味着稀疏通道状态未知，安静放行就是静默错配。
+        current = lexicon_fingerprint(self._get_client())
         if index_lexicon_id == current:
             self._lexicon_checked = True
             return
@@ -3823,29 +3911,81 @@ def cmd_process(args=None):
     return build_chunks()
 
 
-# ── index 单例锁：同一 artifacts 目录只允许一个重建在跑 ──
+# ── index 单例锁：同一 artifacts 目录只允许一个重建（index/**sparse** 共用）在跑 ──
 # 为什么必须 fail-fast（而不是等待/跳过）：两个 index 会写**同一个**稠密缓存 tmp
 # （_save_embed_cache 用 "<path>.tmp.npz" + os.replace）—— 一方还在写、另一方就把它 rename，
 # 得到的半截缓存**看起来完全正常**（维度对、条数对），却少了一批向量；而写缓存失败只被 catch
 # 成一条 warning。这正是本项目反复点名的"状态"失效原型：不崩，只留下一个像正常的坏文件。
+# sparse 同样必须进这把锁：它按启动时的别名目标原地更新向量，index 中途切别名并删除旧集合，
+# 会让 sparse 的页更新打到已删除的集合上，留下"已更新前缀 + 旧指纹后缀"的混合态。
 # 语义：拿不到锁 = 明确报错退出（exit 1）。"另一个重建正在跑"与"本次跳过重建"是两件事，
 # 后者会让调用方以为索引已经更新。
 INDEX_LOCK_FILE = os.path.join(_ARTIFACTS_DIR, ".index.lock")
 
 
-def _pid_alive(pid):
-    """pid 是否还活着。判不了（权限/异常）一律按"活着"处理 —— 保守地不抢别人的锁。"""
+def _ps_etime_seconds(pid):
+    """进程已运行秒数（ps -o etime=）。
+
+    ps 的输出形如 [[dd-]hh:]mm:ss：无天数时两个数字段是 **mm:ss**，
+    带 `dd-` 前缀时是 hh(:mm(:ss))——小时位出现与否由有没有天数决定。
+    观测工具缺席/失败返回 None（保守回退）。
+    """
+    import subprocess
+    try:
+        out = subprocess.run( ["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True, timeout=5 ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out:
+        return None
+    dd, _, rest = out.partition("-")
+    has_days = bool(rest)
+    if not has_days:
+        dd, rest = "0", out
+    try:
+        days = int(dd or "0")
+        parts = [int(p) for p in rest.split(":")]
+    except ValueError:
+        return None
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        # 无天数 → mm:ss；有天数 → hh:mm（ps 的秒位必定出现）
+        if has_days:
+            hours, minutes, seconds = parts[0], parts[1], 0
+        else:
+            hours, minutes, seconds = 0, parts[0], parts[1]
+    else:
+        return None
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _pid_alive(pid, since=None):
+    """pid 是否还活着。判不了（权限/ps 缺席）一律按"活着"处理 —— 保守地不抢别人的锁。
+
+    PID 复用补充判据（since = 锁的写入时刻）：这个 pid 的进程启动时间晚于锁写入时刻，
+    说明它是冒名顶替的新进程（旧持有者已死、pid 被复用），锁视作陈旧。不引入该判据时，
+    容器内一次异常退出后若 pid 恰被新进程复用，index 会被永久判"有人在跑"。
+    """
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except (PermissionError, OSError):
         return True
+    if since is not None:
+        elapsed = _ps_etime_seconds(pid)
+        if elapsed is not None:
+            started = datetime.datetime.now() - datetime.timedelta(seconds=elapsed)
+            if started > since:
+                log(f"⚠️  pid={pid} 的启动时刻（{started:%Y-%m-%d %H:%M:%S}）晚于锁写入时刻"
+                    f"（{since:%Y-%m-%d %H:%M:%S}）—— 判定为 PID 复用，锁视作陈旧")
+                return False
     return True
 
 
 def acquire_index_lock():
-    """取 index 单例锁；拿到返回锁路径，被别人持有则抛 RuntimeError（调用方报错退出）。
+    """取 index 单例锁（index 与 sparse 共用：两个重建并发会互相毁掉共享状态）；
+    拿到返回锁路径，被别人持有则抛 RuntimeError（调用方报错退出）。
 
     陈旧锁（持有 pid 已不存在：容器被杀、断电、崩溃残留）自动接管并告警 —— 否则一次异常退出
     就会让 index 永久跑不起来（比并发更糟的失效：功能被一把死锁永久关闭）。
@@ -3862,11 +4002,18 @@ def acquire_index_lock():
                 holder = ""
             parts = holder.split()
             pid = int(parts[0]) if parts and parts[0].isdigit() else None
-            if pid is not None and _pid_alive(pid):
+            # 锁的写入时刻给 PID 复用判据：启动晚于锁写入的 pid 是冒名顶替的新进程
+            lock_ts = None
+            if len(parts) > 1:
+                try:
+                    lock_ts = datetime.datetime.fromisoformat(parts[1])
+                except ValueError:
+                    lock_ts = None
+            if pid is not None and _pid_alive(pid, since=lock_ts):
                 raise RuntimeError(
-                    f"另一个 index 正在运行（pid={pid}，锁 {INDEX_LOCK_FILE}，起始 {parts[1] if len(parts) > 1 else '未知'}）——"
-                    f"并发重建会写坏同一份稠密缓存，本进程直接退出（不等待、不跳过）。"
-                    f"确认对方已结束后重跑；确实没有别的 index 在跑时删锁: rm -f {INDEX_LOCK_FILE}"
+                    f"另一个 index/sparse 正在运行（pid={pid}，锁 {INDEX_LOCK_FILE}，起始 {parts[1] if len(parts) > 1 else '未知'}）——"
+                    f"并发重建会写坏同一份稠密缓存、把 sparse 写到被删除的集合上，本进程直接退出（不等待、不跳过）。"
+                    f"确认对方已结束后重跑；确实没有别的 index/sparse 在跑时删锁: rm -f {INDEX_LOCK_FILE}"
                 ) from None
             log(f"⚠️  发现陈旧 index 锁（内容 {holder or '空'}）：持有进程已不存在，自动接管 {INDEX_LOCK_FILE}")
             try:
@@ -3931,6 +4078,33 @@ def _streamlit_pids():
     return [int(p) for p in out.split() if p.isdigit() and int(p) != os.getpid()]
 
 
+def _document_paths():
+    """corpus 文档清单：与 build_segments 同一选路（DATA_DIR × DOC_GLOB），目录缺失=空。"""
+    import glob as _glob
+    if not os.path.isdir(DATA_DIR):
+        return []
+    return sorted(
+        p for p in _glob.glob(os.path.join(DATA_DIR, DOC_GLOB), recursive=True)
+        if os.path.isfile(p)
+    )
+
+
+def _corpus_has_searchable_content():
+    """corpus 是否至少有一份文档含可检索内容（去 BOM/空白后的纯标点不算，同 build_chunks）。
+
+    与**查询谓词** _has_searchable_content(text)（拦纯标点查询，见 line 742 附近）名分明确：
+    前者判语料、后者判单个查询字符串，导出的语义不同，必须两个名字。
+    """
+    for path in _document_paths():
+        try:
+            text = read_book_text(path)
+        except Exception:
+            continue
+        if text and text.strip():
+            return True
+    return False
+
+
 def _qdrant_gate():
     """serve/api 共用的启动门禁：连不上或集合为空则报错退出，返回 (coll, count)。
 
@@ -3951,11 +4125,17 @@ def _qdrant_gate():
             log("  请先确认服务已启动: docker compose up -d")
             sys.exit(1)
         if count == 0:
-            log("错误: 向量数据库为空")
-            log("请先运行:")
-            log("  python chatbot.py process")
-            log("  python chatbot.py index")
-            sys.exit(1)
+            # 0 条 ≠ 一律"没构建"：corpus 是空目录（或全部只含封面页）时这是"已清空"
+            # 的**合法终态**（见 build_chunks / build_index 的清空语义），让用户原样启动
+            # 空知识库，只提示检索将零命中；语料非空才是"没建库"，指路重跑。
+            if _corpus_has_searchable_content():
+                log("错误: 向量数据库为空（corpus 非空但从未构建）")
+                log("请先运行:")
+                log("  python chatbot.py process")
+                log("  python chatbot.py index")
+                sys.exit(1)
+            log("⚠️  语料已清空，知识库为空: 欢迎使用，但检索将一律零命中（问答退化为纯对话）")
+            return coll, count
         return coll, count
     finally:
         try:
@@ -3989,14 +4169,12 @@ def cmd_serve(args=None):
 
 # ── 交互入口：Streamlit 主界面 ──
 def _render_stored_message(msg):
-    """历史消息渲染：正文/错误，以及已存的思维链（折叠区；只有 RAG_THINK 开启时才会入历史）。"""
+    """历史消息渲染：思维链与正文同栏输出、不做任何区分（只有 RAG_THINK 开启时才会入历史）。"""
     import streamlit as st
     with st.chat_message(msg["role"]):
-        if msg.get("thinking"):
-            with st.expander("思维链", expanded=False):
-                st.markdown(msg["thinking"])
-        if msg.get("content"):
-            st.markdown(msg["content"])
+        text = msg.get("thinking", "") + msg.get("content", "")
+        if text.strip():
+            st.markdown(text)
         elif msg.get("error"):
             st.error(msg["error"])
 
@@ -4022,25 +4200,43 @@ def _gen_failure_hint(gen_error):
 
 def _stream_reply(events):
     """流式渲染本轮答案：生成失败与 num_predict 截断必须可见（静默失效违背项目不变量）。
-    返回 (thinking, answer, gen_error, done)；done 为空即生成未正常结束（与 API 侧同判据）。
-    界面最简：思维链与正文都是裸 markdown 流——无图标、无状态框；error/warning 只在失败态出现。"""
+    返回 (thinking, answer, gen_error, done)；done 为空即生成未正常结束（与入历史判据一致）。
+    思维链与正文共用同一个输出栏、按到达顺序原样拼接——无折叠区、无分开的占位、无任何区分。"""
     import streamlit as st
-    think_ph = st.empty() if THINK else None
-    answer_ph = st.empty()
+    ph = st.empty()
+    shown = {"thinking": "", "answer": ""}
+
+    def render():
+        ph.markdown(shown["thinking"] + shown["answer"])
+
+    def on_thinking(_chunk, total):
+        shown["thinking"] = total
+        render()
+
+    def on_delta(_chunk, total):
+        shown["answer"] = total
+        render()
+
+    def on_error(chunk, _total):
+        # 流中途的错误必须当场留痕：UI 侧要等整流耗尽才装配收尾元素，rag.log 第一时间可见
+        log(f"⚠️  生成流中途错误: {chunk}")
+
     thinking, answer, gen_error, done = drain_events(
-        events,
-        on_thinking=(lambda _chunk, total: think_ph.markdown(total)) if think_ph is not None else None,
-        on_delta=lambda _chunk, total: answer_ph.markdown(total),
+        events, on_thinking=on_thinking, on_delta=on_delta, on_error=on_error,
     )
+    # 流末对齐一次全文，防尾块丢失。必须在错误装配**之前**：render() 会整块替换 ph 的内容，
+    # 放在 ph.error("⚠️") 之后会把刚装进去的错误/占位符清掉 —— 用户拿到的是残缺正文、
+    # 错误看不见（失效原型：静默）。错误改走独立元素（st.error），与 ph 里的残缺正文并存。
+    render()
     if gen_error:
-        answer_ph.error(gen_error)
+        st.error(gen_error)
         hint = _gen_failure_hint(gen_error)
         if hint:
             st.caption(hint)
     elif not answer:
         # 空答案与错误必须一样显眼：think 开启时预算被思考吃光正是这样收场的
         # （done 齐全、正文 0 字），只画一个 ⚠️ 会让用户以为是网络问题。
-        answer_ph.markdown("⚠️")
+        ph.markdown("⚠️")
         st.warning(
             "生成正常结束但没有产出任何正文"
             + (f"（done_reason={done.get('done_reason')}, eval_count={done.get('eval_count')}）"
@@ -4048,8 +4244,6 @@ def _stream_reply(events):
             + ("：思维链吃掉了输出预算，关掉 RAG_THINK 或调大 RAG_NUM_PREDICT。"
                if THINK else "：调大 RAG_NUM_PREDICT 或换个问法重试。")
         )
-    if think_ph is not None and thinking:
-        think_ph.markdown(thinking)  # 流末对齐一次全文，防尾块丢失
     if done and done.get("done_reason") == "length":
         # 调大 num_predict 在 think 开启时会连带撞内存墙（预算同时归思考与正文用），
         # 那种情形下先关思维链才是对的下一步。
@@ -4063,8 +4257,9 @@ def _stream_reply(events):
 
 def answer_is_good(gen_error, done, answer):
     """生成是否算"本轮成功"：无错误、有 done 事件、正文非空（trim 后）。
-    只供 Streamlit 决定是否入历史；/_ask 无闸（空答/done_reason=length 原样交上层，
-    done 事件如实携带 answer_chars）——不存在"两侧各写一套判据"的问题，别给 /ask 加闸。"""
+    只供 Streamlit 决定是否入历史（run_turn 的唯一 UI 消费方）；空答/done_reason=length
+    原样交上层（done 事件如实携带 answer_chars），不存在"两侧各写一套判据"的问题。
+    将来若新增 API 消费点，应让消费方各自声明起闸与否，不要把闸移进 run_turn 层。"""
     return not gen_error and bool(done) and bool(answer and answer.strip())
 
 
@@ -4198,22 +4393,37 @@ def run_streamlit():
     # 赋值（值来自 cache_resource 指向的同一模块单例），其后所有懒加载都走这一个。
     _STATE = _streamlit_runtime_state()
     engine = _st_engine()
-    # 集合点数按会话只取一次：rerun 时 Qdrant 点数不会变，反复 count() 只会白等网络。
-    if "collection_count" not in st.session_state:
+    # 会话内 TTL 缓存 count：rerun（点数不会变）直接用值，不白等网络；index 中途切别名
+    # 是生效过程，TTL 过期后的新 rerun 自然取新数。"按会话只取一次"的旧缓存能骗一整个
+    # 长会话（index 已生效仍报 stale 点数）——收集后晚点引入的 TTL 缓存修复了"用户
+    # 改了点数但 24h 都没刷新"的错觉。TTL<=0 视为禁用缓存（每次 rerun 都 re-count）。
+    _now = time.time()
+    _cached = st.session_state.get("collection_count")
+    _cached_ts = st.session_state.get("collection_count_ts", 0)
+    if _cached is None or COLLECTION_COUNT_TTL_S <= 0 or _now - _cached_ts >= COLLECTION_COUNT_TTL_S:
         try:
             st.session_state["collection_count"] = engine.count()
+            st.session_state["collection_count_ts"] = _now
         except Exception as exc:
             st.session_state.pop("collection_count", None)
+            st.session_state.pop("collection_count_ts", None)
             st.error(f"无法访问向量库: {type(exc).__name__}: {exc}")
             st.stop()
     if st.session_state["collection_count"] == 0:
-        st.error("向量库为空，先跑：python chatbot.py process && python chatbot.py index")
-        st.stop()
+        # 同 _qdrant_gate：0 条不一定是"没建库"——corpus 空目录是清空语义的合法终态，
+        # 让会话原样跑空知识库（检索零命中走纯对话兜底），语料非空才报错指路。
+        if _corpus_has_searchable_content():
+            st.error("向量库为空，先跑：python chatbot.py process && python chatbot.py index")
+            st.stop()
+        st.info(
+            "语料已清空，当前是空知识库：检索将一律零命中、问答退化为纯对话。"
+            "放入文档后重跑 `python chatbot.py process && python chatbot.py index` 即可恢复检索。"
+        )
     if "messages" not in st.session_state:
         st.session_state.messages = []
     for msg in list(st.session_state.messages):
         _render_stored_message(msg)
-    # 思维链有无只看 RAG_THINK 配置（_stream_reply 按 THINK 建/不建思考区），前端不做选择。
+    # 思维链有无只看 RAG_THINK 配置：开启时思考与正文同行输出（前后端均不区分）。
     if prompt := st.chat_input("", submit_mode="stop"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -4424,6 +4634,25 @@ def cmd_compare_chunks(args=None):
 
 # ── 工具：稀疏向量重建 ──
 def cmd_sparse(args=None):
+    """sparse 权重重建入口：**与 index 共用单实例锁**（INDEX_LOCK_FILE）。
+
+    为什么必须互斥：sparse 按启动时解析的集合名**原地**更新向量，index 中途会原子切
+    别名并删除旧目标集合 —— 并发时 sparse 的页更新会打到被删/被换的集合上，留下
+    "已更新前缀 + 旧指纹后缀"的混合态（词表指纹闸门虽能事后兜住，但重建已白做）。
+    拿不到锁 = 明确报错退出（exit 1），与 index 语义一致。
+    """
+    try:
+        acquire_index_lock()
+    except RuntimeError as exc:
+        log(f"错误: {exc}")
+        return 1
+    try:
+        return _sparse_rebuild()
+    finally:
+        release_index_lock()
+
+
+def _sparse_rebuild():
     from qdrant_client import QdrantClient, models
     # 批量重建会话较长：客户端给普通查询 2 倍超时，逐页 scroll 沿用 QDRANT_TIMEOUT。
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
@@ -4434,9 +4663,36 @@ def cmd_sparse(args=None):
     if not total:
         log(f"❌ 集合 {COLL} 为空，无事可做；请先运行: python chatbot.py process && python chatbot.py index")
         return 1
+    lexicon_id = lexicon_fingerprint(client)
+    # 写入前哨兵自检（fail-fast）：空文本短语必须查不到**任何**点（词表批量产物是惰性的，
+    # online=False），一旦命中说明库里存在能把空短语编成稀疏"全词表"向量的非法条目 ——
+    # 全部文档都在给它让权重，之后一路问零命中。这轮重建不落盘，先修词表。
+    try:
+        probe = client.query_points(
+            COLL,
+            query=models.Document(text=_EMPTY_SPARSE_TEXT, model=BM25_MODEL_NAME, options=bm25_options()),
+            using=SPARSE_VECTOR_NAME,
+            limit=1,
+            timeout=QDRANT_TIMEOUT,
+        )
+    except Exception as exc:
+        # 服务端把空 token 拒收（400/422/empty 类报错）同样符合契约：断言的是"不会算出稀疏向量"
+        _msg = str(exc)
+        _low = _msg.lower()
+        if "empty" in _low or "400" in _msg or "422" in _msg:
+            log("  哨兵自检通过: 空短语被服务端拒收/0 命中（符合契约，不落库）")
+        else:
+            log(f"  ⚠️  哨兵自检无法执行（{type(exc).__name__}: {exc}），校验跳过——不拦截重建")
+    else:
+        if probe.points:
+            log(
+                f"❌ 哨兵校验失败: 空短语 {_EMPTY_SPARSE_TEXT!r} 命中 {len(probe.points)} 点 —— "
+                "存在把空短语编成'全词表'向量的词表项，重建中止；先修 lexicon/stopwords 再重跑"
+            )
+            return 1
+        log("  哨兵自检通过: 空短语 0 命中")
     t0 = time.time()
     done = 0
-    lexicon_id = lexicon_fingerprint(client)
     offset = None
     scroll_failures = 0
     # 页更新与 scroll **互不依赖**：页内 id 互不相交，set_payload 写的是同一个 lexicon_id，
@@ -4513,6 +4769,7 @@ def cmd_sparse(args=None):
         log(f"❌ 只更新了 {done}/{total} 条，请重跑")
         return 1
     sample, _ = client.scroll(COLL, limit=5, with_vectors=True, timeout=30)
+    log("  抽样校验（5 条点；**非全量契约**——全量契约由词表指纹闸门承担，抽样只看链路）:")
     for p in sample:
         sp = p.vector.get(SPARSE_VECTOR_NAME)  # type: ignore[union-attr]
         log(f"  校验 point {p.id}: 稠密 {len(p.vector.get(DENSE_VECTOR_NAME, []))} 维, 稀疏 {len(sp.indices) if sp else 0} terms")  # type: ignore[arg-type, union-attr]
