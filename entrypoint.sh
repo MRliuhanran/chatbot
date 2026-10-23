@@ -195,6 +195,30 @@ if ! mkdir -p "${OLLAMA_MODELS}" "${MODELS_DIR}" 2>/tmp/mkdir.log; then
     exit 1
 fi
 
+# ── 0.1d 检索模型路径随 MODELS_DIR 解析（2026-10-23 创空间事故回归补丁）─────────
+# .env 的 RAG_EMBED_MODEL_PATH / RAG_RERANK_MODEL_PATH 是**相对路径**（./models/bge-m3），
+# chatbot.py 原样使用（cwd=/app → /app/models/...）。而 0.1 三级策略 ② 会把权重迁到
+# /mnt/workspace/models —— 旧行为下两处各持一套根、互不桥接：权重下载得再成功（status=ok），
+# 应用侧永远看到 /app/models/bge-m3 缺失；指纹闸门 fail-closed 当场拒答，加载路径则空等
+# MODEL_WAIT_SECS（900s×2 = 上次 FC 1800s 超时的来源）—— 正是 2026-10-23 21:07
+# 「chatbot.py:1416 嵌入模型目录缺失或为空」的事故链。
+# 此处把"根"知识收敛回 MODELS_DIR 单一来源：**相对值**解析成 ${MODELS_DIR}/<basename>
+# （模型选择即 basename，不覆盖——与三级策略"显式不受扰"同一分寸；空值落到既有默认
+# basename，与 0.1 烘焙判据、下文 infinity argv 同款），**绝对值**保留（绝对路径 =
+# 用户意图，与三级策略"不覆盖"同一分寸）。
+# 位置约束：必须在 mkdir 之后、任何消费方（下载侧 fetch_models、infinity、启动自检、
+# exec 传给 Streamlit 的进程环境）之前 —— 四者共享同一最终值，路径解析知识只此一处。
+case "${RAG_EMBED_MODEL_PATH:-}" in
+    /*) : ;;  # 绝对路径 = 显式意图，按 0.1 同一分寸保留
+    *)  export RAG_EMBED_MODEL_PATH="${MODELS_DIR:-/app/models}/$(basename "${RAG_EMBED_MODEL_PATH:-./models/bge-m3}")" ;;
+esac
+case "${RAG_RERANK_MODEL_PATH:-}" in
+    /*) : ;;
+    *)  export RAG_RERANK_MODEL_PATH="${MODELS_DIR:-/app/models}/$(basename "${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-base}")" ;;
+esac
+# 生效值留痕（与"生成侧服务端参数"同款）：出事故时这一行足以判别"下到哪/找哪儿"。
+_log "检索模型最终路径: embed=${RAG_EMBED_MODEL_PATH:-<未设>} rerank=${RAG_RERANK_MODEL_PATH:-<未设>}（相对值已按 MODELS_DIR 解析，绝对值保留）"
+
 # ── 0.2 持久卷探测（观测行，随三级策略保留）──────────────────────────────────
 if [ -d /mnt/workspace ]; then
     _mnt_av="$(df -Pk /mnt/workspace 2>/dev/null | awk 'NR==2{printf "%d", $4/1048576}')"
@@ -423,20 +447,29 @@ _supervise ollama   /tmp/ollama.log   _ollama_start   "${_ollama_pid}"   &
 # 秒，平台健康探针等不到监听 → 容器反复重启（2026-10-16 实测 2 分钟内 6 次冷启动）。
 # 默认只跑「生成探针」（不导入 torch，进程几十 MB，与真实查询重叠也不会撑爆 8G）；
 # 需要验收检索侧时再开 RAG_BOOT_SELFTEST_FULL=1。RAG_BOOT_SELFTEST=0 可整体关掉。
+# ★ no-bake 补跑（2026-10-23）★：旧写法"boot 时判 config.json 不在就永久跳过"，切到
+# 运行期下载（BAKE_*=0）后**判定恒假、且权重晚到也不补跑**——自检与 KV/FA 实证链路
+# 整体缺席（2026-10-22 两次部署实测）。改为**等待权重出现再跑**（不是"在-boot 判定）：
+# 烘焙模式目录即刻存在=行为不变（延迟 RAG_BOOT_SELFTEST_DELAY 后开跑）；运行期下载
+# 模式下权重就绪（清单齐备、embed/rerank 落位）后先等 RAG_BOOT_SELFTEST_DELAY 再跑。
+# 等待上限 RAG_SELFTEST_WAIT_SECS（默认 900s）兜底；RAG_SKIP_MODEL_DOWNLOAD=1（本地挂
+# 载自测）时挂载点无 config.json 也按"等不到"退出，不产生误导性死等行。
 if [ "${RAG_BOOT_SELFTEST:-1}" != 0 ]; then
-    # 目录名**从 .env 推导**（与下面 271-272 行同源）：写死 bge-m3/bge-reranker-v2-m3 会让
-    _sel_embed="${MODELS_DIR:-/app/models}/$(basename "${RAG_EMBED_MODEL_PATH:-bge-m3}")"
-    _sel_rerank="${MODELS_DIR:-/app/models}/$(basename "${RAG_RERANK_MODEL_PATH:-bge-reranker-v2-m3}")"
-    if [ -f "${_sel_embed}/config.json" ] || [ -f "${_sel_rerank}/config.json" ]; then
-        (
-            sleep "${RAG_BOOT_SELFTEST_DELAY:-45}"
-            _log "启动自检开始（前缀 [自检]；服务已就绪，自检不阻塞端口）"
-            timeout 900 python /app/tools/boot_selftest.py || \
-                _log "⚠️ 启动自检超时/异常退出（非致命，服务照常提供）"
-        ) &
-    else
-        _log "启动自检跳过：检索权重尚未就位（运行期下载中或未挂载）"
-    fi
+    (
+        # 目录名从 .env 推导（与 271-272 行同源）；MODELS_DIR 由 0.1 三级策略已定值。
+        _sel_embed="${MODELS_DIR:-/app/models}/$(basename "${RAG_EMBED_MODEL_PATH:-bge-m3}")"
+        _sel_rerank="${MODELS_DIR:-/app/models}/$(basename "${RAG_RERANK_MODEL_PATH:-bge-reranker-v2-m3}")"
+        _i=0
+        while [ ! -f "${_sel_embed}/config.json" ] && [ ! -f "${_sel_rerank}/config.json" ]; do
+            [ "${_i}" -lt "${RAG_SELFTEST_WAIT_SECS:-900}" ] || { _log "启动自检跳过：等待检索权重 ${RAG_SELFTEST_WAIT_SECS:-900}s 仍未就位"; exit 0; }
+            sleep 3
+            _i=$((_i + 3))
+        done
+        sleep "${RAG_BOOT_SELFTEST_DELAY:-45}"
+        _log "启动自检开始（前缀 [自检]；服务已就绪，自检不阻塞端口）"
+        timeout 900 python /app/tools/boot_selftest.py || \
+            _log "⚠️ 启动自检超时/异常退出（非致命，服务照常提供）"
+    ) &
 fi
 
 # ── 5. Streamlit：前台运行（容器主进程），端口按创空间要求固定 7860 ────────────
