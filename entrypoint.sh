@@ -195,29 +195,55 @@ if ! mkdir -p "${OLLAMA_MODELS}" "${MODELS_DIR}" 2>/tmp/mkdir.log; then
     exit 1
 fi
 
-# ── 0.1d 检索模型路径随 MODELS_DIR 解析（2026-10-23 创空间事故回归补丁）─────────
+# ── 0.1d 检索模型路径落位（2026-10-23 二次回归修复，取代"重写环境变量"一版）────
 # .env 的 RAG_EMBED_MODEL_PATH / RAG_RERANK_MODEL_PATH 是**相对路径**（./models/bge-m3），
 # chatbot.py 原样使用（cwd=/app → /app/models/...）。而 0.1 三级策略 ② 会把权重迁到
-# /mnt/workspace/models —— 旧行为下两处各持一套根、互不桥接：权重下载得再成功（status=ok），
-# 应用侧永远看到 /app/models/bge-m3 缺失；指纹闸门 fail-closed 当场拒答，加载路径则空等
-# MODEL_WAIT_SECS（900s×2 = 上次 FC 1800s 超时的来源）—— 正是 2026-10-23 21:07
-# 「chatbot.py:1416 嵌入模型目录缺失或为空」的事故链。
-# 此处把"根"知识收敛回 MODELS_DIR 单一来源：**相对值**解析成 ${MODELS_DIR}/<basename>
-# （模型选择即 basename，不覆盖——与三级策略"显式不受扰"同一分寸；空值落到既有默认
-# basename，与 0.1 烘焙判据、下文 infinity argv 同款），**绝对值**保留（绝对路径 =
-# 用户意图，与三级策略"不覆盖"同一分寸）。
-# 位置约束：必须在 mkdir 之后、任何消费方（下载侧 fetch_models、infinity、启动自检、
-# exec 传给 Streamlit 的进程环境）之前 —— 四者共享同一最终值，路径解析知识只此一处。
-case "${RAG_EMBED_MODEL_PATH:-}" in
-    /*) : ;;  # 绝对路径 = 显式意图，按 0.1 同一分寸保留
-    *)  export RAG_EMBED_MODEL_PATH="${MODELS_DIR:-/app/models}/$(basename "${RAG_EMBED_MODEL_PATH:-./models/bge-m3}")" ;;
-esac
-case "${RAG_RERANK_MODEL_PATH:-}" in
-    /*) : ;;
-    *)  export RAG_RERANK_MODEL_PATH="${MODELS_DIR:-/app/models}/$(basename "${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-base}")" ;;
-esac
-# 生效值留痕（与"生成侧服务端参数"同款）：出事故时这一行足以判别"下到哪/找哪儿"。
-_log "检索模型最终路径: embed=${RAG_EMBED_MODEL_PATH:-<未设>} rerank=${RAG_RERANK_MODEL_PATH:-<未设>}（相对值已按 MODELS_DIR 解析，绝对值保留）"
+# /mnt/workspace/models —— 不桥接时应用侧永远看到 /app/models/bge-m3 缺失（2026-10-23
+# 21:07「嵌入模型目录缺失或为空」事故链）。
+# 一版修复（0.1d 首版）把相对值**重写**成 ${MODELS_DIR}/<basename>：目录缺失解决了，
+# 但这个字面量直接进切分指纹（chatbot._chunking_config_fingerprint 的 embed_model
+# 字段）——本地建索引时算 "./models/bge-m3"、创空间运行时算
+# "/mnt/workspace/models/bge-m3"，同一 .env 两侧指纹**永远对不上**，检索闸门
+# fail-closed（本地实测：字面量 923236fe7e4acc7c / 重写 e316a5d282d8ee88，后者与
+# 21:33 线上报错完全同值——因果闭环）。**正解：字面量一个字不动**（指纹两侧同源），
+# 落位交给 symlink：${MODELS_DIR}/<basename> 链到 ./models/<basename>。
+# · 绝对值仍保留（绝对路径 = 用户意图，同 0.1 分寸）；
+# · src==dst（烘焙态 MODELS_DIR=/app/models）跳过，防自环、防动真实目录；
+# · ./models 下已存在**真实目录**（烘焙态部分清单）也跳过——下载会落在
+#   ${MODELS_DIR}=同一目录，应用侧本来就看得见；
+# · symlink 失败才回退旧重写：可用性优先于指纹，回退留痕、闸门会在首查询集中报错。
+# 位置约束：必须在 mkdir 之后、任何消费方（fetch_models、infinity、自检、Streamlit
+# 进程环境）之前；CWD 于第 6 行已 cd /app。fetch_models 只取 basename，不受影响。
+_link_retrieval_model() {
+    _var="$1"
+    eval "_val=\"\${${_var}:-}\""
+    if [ -z "${_val}" ]; then   # 未设时补默认值：给消费方与日志留痕一个具体值
+        _val="$2"
+        eval "export ${_var}=\"${_val}\""
+    fi
+    case "${_val}" in
+        /*) _log "检索模型落位: ${_var}=${_val}（绝对路径保留）"; return 0 ;;
+    esac
+    _bas="$(basename "${_val}")"
+    _src="${MODELS_DIR:-/app/models}/${_bas}"
+    _dst="models/${_bas}"
+    _dst_abs="${PWD}/models/${_bas}"
+    if [ "${_src}" = "${_dst_abs}" ] || { [ -d "${_dst}" ] && [ ! -L "${_dst}" ]; }; then
+        _log "检索模型落位: ${_var}=${_val}（${MODELS_DIR:-/app/models}/${_bas} 已是真实目录或同位）"
+        return 0
+    fi
+    mkdir -p models 2>>/tmp/link.log
+    [ -d "${_dst}" ] && [ ! -L "${_dst}" ] && rmdir "${_dst}" 2>>/tmp/link.log
+    if ln -snf "${_src}" "${_dst}" 2>>/tmp/link.log; then
+        _log "检索模型落位: ${_dst} → ${_src}（${_var} 字面量保留，切分指纹两侧同源）"
+    else
+        export ${_var}="${_src}"   # 回退 = 一版重写行为：先保目录可用，指纹不一致
+        _log "⚠️ symlink 失败（见 /tmp/link.log），回退重写 ${_var}=${_src}——" \
+             "此时切分指纹可能与本地产物不同源，检索闸门将在首次查询集中报错留痕"
+    fi
+}
+_link_retrieval_model RAG_EMBED_MODEL_PATH "./models/bge-m3"
+_link_retrieval_model RAG_RERANK_MODEL_PATH "./models/bge-reranker-base"
 
 # ── 0.2 持久卷探测（观测行，随三级策略保留）──────────────────────────────────
 if [ -d /mnt/workspace ]; then

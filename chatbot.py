@@ -3384,6 +3384,7 @@ class RAGEngine:
         self._collection_name = COLLECTION_NAME
         self._lexicon_checked = False
         self._chunk_fp_checked = False
+        self._chunk_fp_logged = False  # 首次指纹比对留痕一次（部署后从日志即可判"产物是否同源"）
         self._empty_warned = {}  # 集合名 -> 已告警过：空回取告警按集合记，别名切新集合后不会被旧告警状态压掉
         # 加载（懒初始化）与推理分开两把锁：加载慢、推理短，共用一把会拖慢并发查询。
         # 查询侧前向/rerank 用推理锁串行（MPS 单模型不做真并行），加载持初始化锁。
@@ -3571,6 +3572,9 @@ class RAGEngine:
         # 闸门恒等放行 —— 用户静默吃到旧知识库（失效原型：静默 + 判据恒真）。
         paths = _document_paths()
         current = _chunking_fingerprint(_sources_fingerprint(paths))
+        if not self._chunk_fp_logged:  # 每进程只留痕一次：部署后从运行日志判"产物是否同源"
+            self._chunk_fp_logged = True
+            log(f"🔧 分块指纹: 索引={index_fp} / 当前={current}（一致才放行检索）")
         if index_fp == current:
             self._chunk_fp_checked = True
             return
