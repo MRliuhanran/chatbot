@@ -4329,8 +4329,6 @@ def _stream_reply(events):
     思维链与正文共用同一个输出栏、按到达顺序原样拼接——无折叠区、无分开的占位、无任何区分。"""
     import streamlit as st
     ph = st.empty()
-    # 首个 token 之前必须给出"正在生成"的可见状态：否则慢/卡时页面看起来像"只有输入没有输出"。
-    ph.markdown("⏳ 正在生成…（长上下文或内存紧张时首字可能较慢）")
     shown = {"thinking": "", "answer": ""}
 
     def render():
@@ -4420,9 +4418,7 @@ def _run_assistant_turn(engine, prompt, history):
         events = run_turn(engine, prompt, history, top_k=TOP_K)
         # 首事件恒为 retrieval，必须消费掉（drain_events 的事件契约），且消费时显式断言
         # 非契约形态（first_retrieval）：最简前端暂不展示本轮资料清单，编号对照能力给 API 侧。
-        # 检索阶段通常数秒到十几秒：给个 spinner，避免页面在首个 token 前完全空白。
-        with st.spinner("🔎 正在检索…"):
-            first_retrieval(events)
+        first_retrieval(events)
         thinking, answer, gen_error, done = _stream_reply(events)
     except Exception as exc:
         # 只打「类型: 消息」无法定位（stat(None) 这类消息看不出是哪一行）：完整调用栈必须落盘，
