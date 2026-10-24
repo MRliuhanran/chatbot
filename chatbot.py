@@ -510,6 +510,11 @@ THINK = env_bool("RAG_THINK", False)
 NUM_CTX = env_int("RAG_NUM_CTX", 8192)
 NUM_PREDICT = env_int("RAG_NUM_PREDICT", 4096)
 TIMEOUT = env_float_min("OLLAMA_TIMEOUT", 180, 1.0)
+# 生成流的读空闲超时（无任何新数据即判超时）与整轮硬上限：
+# 先前的"无时间闸"让 Ollama/llama-server 僵死时前端只能永久空白；这两个闸只负责
+# 把"无进展"变成显式错误，不限制正常生成长度（正常流持续有 chunk 不会触发）。
+STREAM_READ_TIMEOUT = env_float_min("RAG_STREAM_READ_TIMEOUT", 300, 10.0)
+TURN_TIMEOUT = env_float_min("RAG_TURN_TIMEOUT", 1800, 60.0)
 # 采样温度：0=贪心（问答类检索场景的默认）；改它走 RAG_TEMPERATURE，不改代码。
 TEMPERATURE = env_float("RAG_TEMPERATURE", 0.0)
 # 惩罚回看窗口：repeat/presence/frequency 三类惩罚共用同一历史窗口（llama.cpp 采样链）。
@@ -642,8 +647,10 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
     （num_ctx / num_predict；temperature 未传时取全局生效值）。
 
     think=None 取全局 RAG_THINK；显式传入即覆盖。
-    本函数**不设长度/时间闸、也不重试**：输出与思考都不限长，窗口（num_ctx）是唯一上限，
+    本函数**不设输出长度闸、也不重试**：输出与思考都不限长，窗口（num_ctx）是唯一上限，
     超窗由服务端上下文移位从最前面按 token 遗忘续写；空答/截断/报错原样交给上层。
+    但设**读空闲超时**（RAG_STREAM_READ_TIMEOUT，默认 300s 无新数据 → EVENT_ERROR）与
+    **整轮硬上限**（RAG_TURN_TIMEOUT，默认 1800s）：只把卡死变显式错误，不影响正常长回答。
     """
     options = _chat_options(temperature, num_ctx, num_predict)
     use_think = THINK if think is None else bool(think)
@@ -655,20 +662,26 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
         # 不发请求级 keep_alive：驻留/卸载交给 Ollama 服务端自身策略（上游默认 5m），
         # 应用层不编排生成模型内存（2026-10-24 定稿：不做互斥/自适应）。
         payload = { "model": MODEL, "messages": messages, "stream": True, "think": use_think, "options": options, }
-        r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=TIMEOUT, )
+        # (connect, read) 分开：连接 10s；读空闲 STREAM_READ_TIMEOUT（默认 300s）。
+        # 模型加载/首 token 可能慢，但不应无限等待；超时由下面的 except 转成 EVENT_ERROR。
+        r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, STREAM_READ_TIMEOUT), )
         if r.status_code != 200 and _gen_gpu_fallback(f"HTTP {r.status_code} {r.text[:160]!r}"):
             # auto 模式 + 本进程首次：去掉 num_gpu 重发一次。此刻**尚未产出任何 token**
             # （流都还没开始读），所以不构成"生成重试"，没有任何已生成内容被丢弃。
             # options 重新组装（而不是就地 pop）：回落状态已翻转，_chat_options 自然不再放 num_gpu。
             r.close()
             payload["options"] = _chat_options(temperature, num_ctx, num_predict)
-            r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=TIMEOUT, )
+            r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, STREAM_READ_TIMEOUT), )
         if r.status_code != 200:
             yield EVENT_ERROR, f"HTTP {r.status_code} {r.text[:300]}"
             return
+        _gen_started = time.monotonic()
         for line in r.iter_lines():
             if not line:
                 continue
+            if TURN_TIMEOUT and (time.monotonic() - _gen_started) > TURN_TIMEOUT:
+                yield EVENT_ERROR, f"生成超时：本轮超过 {TURN_TIMEOUT:.0f}s（RAG_TURN_TIMEOUT）"
+                return
             chunk = json.loads(line)
             if chunk.get("error"):
                 # return 而不是 continue：本函数对外承诺「error 与 done 互斥」，消费侧
@@ -694,7 +707,12 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
             if chunk.get("done"):
                 yield EVENT_DONE, { "done_reason": chunk.get("done_reason"), "eval_count": chunk.get("eval_count"), "prompt_eval_count": chunk.get("prompt_eval_count"), }
     except Exception as exc:
-        yield EVENT_ERROR, f"{type(exc).__name__}: {exc}"
+        _ename = type(exc).__name__
+        if _ename in ("ReadTimeout", "Timeout", "ConnectionError", "ChunkedEncodingError"):
+            yield EVENT_ERROR, (f"生成超时/连接中断：等待超过 {STREAM_READ_TIMEOUT:.0f}s 无新数据"
+                               f"（{_ename}；可调 RAG_STREAM_READ_TIMEOUT / 看 ollama 日志）")
+        else:
+            yield EVENT_ERROR, f"{_ename}: {exc}"
     finally:
         if r is not None:
             r.close()
@@ -4311,6 +4329,8 @@ def _stream_reply(events):
     思维链与正文共用同一个输出栏、按到达顺序原样拼接——无折叠区、无分开的占位、无任何区分。"""
     import streamlit as st
     ph = st.empty()
+    # 首个 token 之前必须给出"正在生成"的可见状态：否则慢/卡时页面看起来像"只有输入没有输出"。
+    ph.markdown("⏳ 正在生成…（长上下文或内存紧张时首字可能较慢）")
     shown = {"thinking": "", "answer": ""}
 
     def render():
@@ -4400,7 +4420,9 @@ def _run_assistant_turn(engine, prompt, history):
         events = run_turn(engine, prompt, history, top_k=TOP_K)
         # 首事件恒为 retrieval，必须消费掉（drain_events 的事件契约），且消费时显式断言
         # 非契约形态（first_retrieval）：最简前端暂不展示本轮资料清单，编号对照能力给 API 侧。
-        first_retrieval(events)
+        # 检索阶段通常数秒到十几秒：给个 spinner，避免页面在首个 token 前完全空白。
+        with st.spinner("🔎 正在检索…"):
+            first_retrieval(events)
         thinking, answer, gen_error, done = _stream_reply(events)
     except Exception as exc:
         # 只打「类型: 消息」无法定位（stat(None) 这类消息看不出是哪一行）：完整调用栈必须落盘，
@@ -4595,6 +4617,11 @@ def _warm_engine(engine):
                     f"eval_count={(data or {}).get('eval_count')!r}）—— 链路通但一个字都没产出"
                 )
             log(f"模型预热完成（嵌入/重排/生成，探针 {_reply.strip()[:20]!r}）")  # type: ignore[union-attr]
+            try:
+                with open("/tmp/warm_ready", "w", encoding="utf-8") as _wf:
+                    _wf.write("1")
+            except OSError:
+                pass
         except Exception as exc:
             log(f"⚠️  预热未完成（不影响服务，首次查询冷加载）: {type(exc).__name__}: {exc}")
     threading.Thread(target=_warm, daemon=True).start()

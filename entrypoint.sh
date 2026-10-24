@@ -387,22 +387,37 @@ fi
 # 等场景）、或 memory.current 读不到内容时正是空串 —— 于是 [mem] 行整条消失、无任何
 # 痕迹，而 chatbot.py 的 _gen_failure_hint 与 .env 都让运维来看这一行判断 OOM。
 (
+    _mem_i=0
     while :; do
         _m="[mem]"
         if [ -r /proc/meminfo ]; then
             _m="${_m} $(awk '/MemTotal|MemAvailable/{printf "%s %sM ", $1, int($2/1024)}' /proc/meminfo)"
         fi
         if [ -r /sys/fs/cgroup/memory.current ] && [ -r /sys/fs/cgroup/memory.max ]; then
+            # cgroup v2
             _cg="$(awk 'NR==1{printf "%d", $1/1048576}' /sys/fs/cgroup/memory.current 2>/dev/null)"
             _anon="$(awk '/^anon /{printf "%d", $2/1048576; exit}' /sys/fs/cgroup/memory.stat 2>/dev/null)"
             _max="$(tr -d '[:space:]' </sys/fs/cgroup/memory.max 2>/dev/null)"
             [ -n "${_cg}" ] && _m="${_m} cg_cur:${_cg}M"
             _m="${_m} cg_max:${_max:-?}"
             [ -n "${_anon}" ] && _m="${_m} anon:${_anon}M"
+        elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+            # cgroup v1（魔搭容器实测走这里；旧实现只读 v2，导致 [mem] 没有 cg/anon，
+            # OOM 前后无法判断真实容器占用与峰值）
+            _cg="$(awk 'NR==1{printf "%d", $1/1048576}' /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
+            _anon="$(awk '/^anon /{printf "%d", $2/1048576; exit}' /sys/fs/cgroup/memory/memory.stat 2>/dev/null)"
+            _max="$(tr -d '[:space:]' </sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
+            _peak="$(awk 'NR==1{printf "%d", $1/1048576}' /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null)"
+            [ -n "${_cg}" ] && _m="${_m} cg_cur:${_cg}M"
+            _m="${_m} cg_max:${_max:-?}"
+            [ -n "${_anon}" ] && _m="${_m} anon:${_anon}M"
+            [ -n "${_peak}" ] && _m="${_m} peak:${_peak}M"
         fi
         _m="${_m} top:$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -4 | awk '{printf "%s(%sM) ", $2, int($1/1024)}')"
         printf '%s\n' "${_m}"
-        sleep 30
+        # 启动前 2 分钟 5s 一次（捕捉自检/warm-up 峰值），之后 30s 一次（稳态）。
+        _mem_i=$((_mem_i + 1))
+        if [ "${_mem_i}" -le 24 ]; then sleep 5; else sleep 30; fi
     done
 ) &
 
@@ -655,7 +670,20 @@ if [ "${RAG_BOOT_SELFTEST:-1}" != 0 ]; then
             sleep 3
             _i=$((_i + 3))
         done
-        sleep "${RAG_BOOT_SELFTEST_DELAY:-45}"
+        # 等应用侧 warm-up 完成再跑：自检会把生成模型推到 131072 KV 峰值（日志实测
+        # MemAvailable 2996MB / llama-server 4436MB），与 warm-up 的检索模型加载叠加
+        # 会把 8G 容器逼到极限。等不到（warm-up 失败/未开）就按超时继续，不让自检永久缺席。
+        _w=0
+        while [ ! -f /tmp/warm_ready ] && [ "${_w}" -lt "${RAG_SELFTEST_WARM_WAIT:-300}" ]; do
+            sleep 3
+            _w=$((_w + 3))
+        done
+        if [ -f /tmp/warm_ready ]; then
+            _log "自检等待 warm-up 完成（${_w}s）"
+        else
+            _log "自检等待 warm-up 超时（${_w}s），按原延迟继续"
+        fi
+        sleep "${RAG_BOOT_SELFTEST_DELAY:-5}"
         _log "启动自检开始（前缀 [自检]；服务已就绪，自检不阻塞端口）"
         timeout 900 python /app/tools/boot_selftest.py || \
             _log "⚠️ 启动自检超时/异常退出（非致命，服务照常提供）"

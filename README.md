@@ -142,8 +142,8 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 | 分块 | `RAG_PARENT_MAX_TOKENS`(512)、`RAG_CHILD_MAX_TOKENS`(128)、`RAG_CHUNK_OVERLAP`(32) |
 | 检索 | `RAG_TOP_K`、`RAG_RERANK_TOP_K`、`RAG_RERANK_BATCH`、`RAG_RRF_SPARSE_WEIGHT` |
 | 检索模型后端 | `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND`（`torch`=进程内，`http`=infinity 服务）、`RAG_EMBED_URL`、`RAG_EMBED_MODEL_PATH`、`RAG_RERANK_MODEL_PATH` |
-| 生成 | `MODEL`、`RAG_NUM_CTX`、`RAG_NUM_PREDICT`(0=不限长)、`RAG_THINK`、`RAG_TEMPERATURE`(0=贪心)、`RAG_GEN_NUM_GPU`（`auto`=GPU 优先失败回落 CPU）、`RAG_GEN_TOKENIZER_PATH`（模型官方 tokenizer 目录/文件）、`OLLAMA_TIMEOUT` |
-| 运行态与巡检 | 应用不做内存编排（无互斥/自适应/请求级 keep_alive；§11.4）、`RAG_PRELOAD`（0=启动不预热）、`RAG_INDEX_MIN_FREE_MB`（离线重建内存闸门）、`RAG_TURN_STATS`（可选台账，默认 0）、entrypoint 进程级巡检（`RAG_WATCHDOG_INTERVAL`/`RAG_WATCHDOG_FAILS`） |
+| 生成 | `MODEL`、`RAG_NUM_CTX`、`RAG_NUM_PREDICT`(0=不限长)、`RAG_THINK`、`RAG_TEMPERATURE`(0=贪心)、`RAG_GEN_NUM_GPU`（`auto`=GPU 优先失败回落 CPU）、`RAG_GEN_TOKENIZER_PATH`（模型官方 tokenizer 目录/文件）、`OLLAMA_TIMEOUT`、`RAG_STREAM_READ_TIMEOUT`（无新数据超时，默认 300s）、`RAG_TURN_TIMEOUT`（整轮硬上限，默认 1800s） |
+| 运行态与巡检 | 应用不做内存编排（无互斥/自适应/请求级 keep_alive；§11.4）、`RAG_PRELOAD`（0=启动不预热）、`RAG_INDEX_MIN_FREE_MB`（离线重建内存闸门）、`RAG_TURN_STATS`（可选台账；默认 0，当前线上临时 1 用于定位卡死）、entrypoint 进程级巡检（`RAG_WATCHDOG_INTERVAL`/`RAG_WATCHDOG_FAILS`） |
 | 索引与路径 | `RAG_COLLECTION_BASE`、`RAG_COLLECTION_ALIAS`、`RAG_ARTIFACTS_DIR`、`RAG_LEXICON_DIR` |
 
 ## 8. 部署
@@ -255,7 +255,7 @@ streamlit（运行时还包括 infinity）逐个健康检查；检查连续失�
 代码不读取的键 = 失效。启动日志 `[config]` 打印 .env sha256 与关键生效值，`tools/deploy-check.sh`
 的配置审计会在发布前拦下失效键/三源漂移。
 
-**可选诊断**：`RAG_TURN_STATS=1`（默认 0，项目不做基准测量）时每轮写一行
+**可选诊断**：`RAG_TURN_STATS=1`（默认 0；2026-10-24 线上临时置 1 排查“只有输入无输出”）时每轮写一行
 `artifacts/turns.jsonl`，用 `python tools/turn_stats.py` 汇总；只在临时排查时打开、看完即关。
 
 开发校验：`ruff check chatbot.py`、`python -m py_compile chatbot.py`、`bash -n entrypoint.sh tools/*.sh`、`python tools/config-audit.py`。
