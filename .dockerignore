@@ -62,7 +62,7 @@ repo_tmp/
 # **运行期必须保留，勿加排除**（grep 核实）：
 #   artifacts/chunks.json        64MB   chatbot.py:CHUNKS_JSON，检索产物唯一读取源
 #   artifacts/chunks.meta.json   100KB  chatbot.py:CHUNKS_META_JSON，产物指纹/meta_version
-#   artifacts/gen_tokenizer/     5.8MB  .env:243 RAG_GEN_TOKENIZER_PATH → 生成侧精确分词
+#   artifacts/gen_tokenizer/     ~16MB  .env RAG_GEN_TOKENIZER_PATH → 生成侧精确分词（官方文件 + 旧版兼容副本）
 artifacts/quant/
 artifacts/opencode-sessions/
 artifacts/eval/
