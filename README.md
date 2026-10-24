@@ -46,7 +46,7 @@ license: apache-2.0
 | 路径 | 说明 |
 |---|---|
 | `chatbot.py` | 业务代码单文件（约 4100 行），按依赖顺序分节，见第 3 节 |
-| `.env` | 配置生效值（唯一配置权威，见第 7 节） |
+| `.env` | 配置覆盖层（代码默认值为唯一权威，见第 7 节） |
 | `corpus/` | 语料目录（默认 `RAG_DATA_DIR`，`*.txt`） |
 | `artifacts/` | 离线产物：`chunks.json` + `chunks.meta.json`（分块与切分指纹）、`docs/`（逐文档分块缓存）、`embeddings/`（稠密向量缓存）、`gen_tokenizer/`（生成模型 tokenizer） |
 | `lexicon/` | 领域词表：`aliases.txt`（别名归一）、`stopwords.txt`，整表替换即可换领域 |
@@ -67,7 +67,7 @@ license: apache-2.0
 | 基础设施：环境配置与日志 | 1 | `env_*` 配置解析（非法值启动即报错）、双写日志 |
 | 运行态单例 | 184 | `_RuntimeState`：模块级缓存/锁（会话、tokenizer、词表） |
 | 采样/惩罚、生成客户端 | 239 | `_chat_options` 单点组装 Ollama options；`stream_chat` 流式请求 |
-| 单例协调（模型互斥驻留） | 424 | `RAG_EXCLUSIVE_MODELS`：检索与生成模型交替装卸 |
+| 生成客户端与驻留策略 | 424 | 不做应用层内存编排（无互斥/gate/请求级 keep_alive）；Ollama 与检索进程各自管理内存 |
 | 领域与检索侧配置 | 494 | 语料/来源字段/检索/嵌入后端等配置常量 |
 | 模型加载与向量化 | 728 | 嵌入/重排模型懒加载、`embed()`、设备选型 |
 | 分块 | 830 | 归一化（ftfy + OpenCC）→ `semantic-text-splitter` 父子分块 → `build_chunks()` |
@@ -134,7 +134,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 
 ## 7. 配置
 
-配置以 `.env` 为准：代码默认值权威，同名环境变量覆盖，非法值启动即报错。主要分组（完整列表见 `.env` 注释）：
+配置以**代码默认值为准**，`.env` 只做覆盖层：缺行 = 用代码默认（不是错误）；写了代码不读取的键 = 失效（`tools/deploy-check.sh` 的配置审计会提示）；非法值启动即报错。主要分组（完整列表见 `.env` 注释）：
 
 | 分组 | 代表变量 |
 |---|---|
@@ -143,7 +143,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 | 检索 | `RAG_TOP_K`、`RAG_RERANK_TOP_K`、`RAG_RERANK_BATCH`、`RAG_RRF_SPARSE_WEIGHT` |
 | 检索模型后端 | `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND`（`torch`=进程内，`http`=infinity 服务）、`RAG_EMBED_URL`、`RAG_EMBED_MODEL_PATH`、`RAG_RERANK_MODEL_PATH` |
 | 生成 | `MODEL`、`RAG_NUM_CTX`、`RAG_NUM_PREDICT`(0=不限长)、`RAG_THINK`、`RAG_TEMPERATURE`(0=贪心)、`RAG_GEN_NUM_GPU`（`auto`=GPU 优先失败回落 CPU）、`OLLAMA_TIMEOUT` |
-| 内存与驻留 | `RAG_EXCLUSIVE_MODELS`（模型互斥驻留）、`RAG_GEN_KEEP_ALIVE`、`RAG_PRELOAD` |
+| 运行态与巡检 | 应用不做内存编排（无互斥/自适应/请求级 keep_alive；§11.4）、`RAG_PRELOAD`（0=启动不预热）、`RAG_INDEX_MIN_FREE_MB`（离线重建内存闸门）、`RAG_TURN_STATS`（可选台账，默认 0）、entrypoint 进程级巡检（`RAG_WATCHDOG_INTERVAL`/`RAG_WATCHDOG_FAILS`） |
 | 索引与路径 | `RAG_COLLECTION_BASE`、`RAG_COLLECTION_ALIAS`、`RAG_ARTIFACTS_DIR`、`RAG_LEXICON_DIR` |
 
 ## 8. 部署
@@ -152,7 +152,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 |---|---|
 | 本地原生（默认） | `tools/run_local.sh start` 依次拉起 Qdrant / Ollama / 应用（GPU 档：Metal + MPS），已在跑的实例复用 |
 | 容器（本地 Docker / 自有服务器） | `docker-compose.yml` 四容器：qdrant / ollama / app / embed；NVIDIA 主机叠加 `docker-compose.gpu.yml` |
-| 魔搭创空间 | 平台不支持 compose：仓库根 `Dockerfile` 单容器跑三进程，`entrypoint.sh` 拉起 + 健康等待 + 存活哨兵，仅暴露 7860；规格见 `ms_deploy.json` |
+| 魔搭创空间 | 平台不支持 compose：仓库根 `Dockerfile` 单容器跑三进程，`entrypoint.sh` 拉起 + 健康等待 + **进程级巡检自愈**（每个进程健康检查不过即就地重启；容器整体退出由平台重拉容器，均不重新部署），仅暴露 7860；规格见 `ms_deploy.json` |
 
 发布前闸门：`tools/deploy-check.sh`。
 
@@ -167,6 +167,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 | `rerank_parity.py` | 进程内重排与 `/v1/rerank` 分数比对 |
 | `prepare_infinity_view.py` | 为 infinity 生成模型影子视图（不动真实权重目录） |
 | `build_gen_tokenizer.py` | 从 GGUF 离线抽出生成模型 tokenizer |
+| `turn_stats.py` | 可选单轮台账摘要（`turns.jsonl` → 检索/生成耗时 p50/p95、prefill 比值；默认关闭） |
 
 ## 10. 约束与不变量
 
@@ -175,6 +176,8 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 - **变更代价**：改切分/分块参数 → `process` + `index`；改语料 → `process` + `index`；改词表 → `sparse`；改模型 → `index` + 重新度量；改检索参数 → 重新度量。以 `python chatbot.py stages` 输出为准。
 - **不支持并发访问**（单用户本地/单容器形态；多用户规划见 §11 B 档，属改不变量的版本迁移）。
 - **第三方依赖全部惰性导入**（模块级仅标准库，`dotenv` 例外且须先于配置常量）。
+- **重建与服务同机隔离的机械化表达**：`index` / `sparse` 有可开内存闸门 `RAG_INDEX_MIN_FREE_MB`（低于门槛 fail-closed 拒跑）——"重建时别与 serve/生成权重同机驻留"这条纪律不再靠人记，§11.4。
+- **运行时内存不编排**：应用不互斥/不 gate/不发请求级 `keep_alive`；进程异常由容器内进程级巡检就地重启（§11.4）。
 
 ## 11. 关注领域与缺口（基准日 2026-10-21，锚函数名不锚行号）
 
@@ -184,7 +187,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 
 | 领域 | 已闭环 | 缺口 |
 |---|---|---|
-| 模型内存 | 互斥驻留（`RAG_EXCLUSIVE_MODELS`、`RAG_GEN_KEEP_ALIVE`）、MPS 分配闸门、KV 档位 `.env` 单点管 | 并发下总预算 → B3 |
+| 模型内存 | 各进程自管（Ollama 服务端 keep_alive 默认；检索模型懒加载后常驻）、MPS 分配闸门、index 内存闸门、entrypoint 进程级巡检自愈（§11.4） | 并发下总预算 → B3 |
 | 检索构建（离线） | 四阶段 + 指纹 fail-closed、内容哈希增量缓存、原子切别名 | 规模增长应对 → C1 |
 | 检索查询（在线） | 空查询守卫 → 双路召回 → RRF → 按 id 回取 → 父块去重 → 重排 | 多轮查询未改写 → A1 |
 | 构建优化 | 嵌入/分块缓存 + 离线度量（`quant_bench`、`hw_profile`、`quant_parity`） | 每轮在线指标 → A2 |
@@ -198,7 +201,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 | # | 缺口 | 处置 |
 |---|---|---|
 | A1 | `run_turn` 直用原始 query 进 `hybrid_search`，历史不参与检索："那它呢？"类指代必差，多轮×检索间缺桥 | 短提示词把"历史+当前问"改写成独立完整查询；命中率变化由 A3 验收 |
-| A2 | 检索/重排耗时、TTFT、上下文取舍数无结构化记录，一切优化结论不可证 | `run_turn` 采固定字段 → 轮转 JSONL → 工具出摘要 |
+| A2 | 检索/重排耗时、TTFT、上下文取舍数无结构化记录 | 可选台账（`RAG_TURN_STATS=1`，默认关闭）：run_turn done/error 写固定字段 → `artifacts/turns.jsonl`，`tools/turn_stats.py` 汇总检索/生成耗时与 prefill 比值。TTFT 未单列；项目不做基准测量，只在临时排查时启用 |
 | A3 | `eval_retrieval.py`（重建前后自拍）与 `rerank_parity.py`（分数对拍）都答不了"答得好不好" | 30~50 条 golden QA（问题+期望来源+关键点），进发布闸门 |
 | A4 | 生成侧"不重试/不拒答/无时间闸"是显式设计但未录缘由，出现答非所问时无决策依据可查 | 200 字决策记录落档，改动先过它 |
 | A5 | 故障"体感"未定义：组件挂 = 重启/报错气泡/空白？Ollama 卡死是否无限等待？ | 故障 × 行为 × 期望矩阵，改码顺手补齐 |
@@ -210,7 +213,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 | # | 缺口 | 处置 |
 |---|---|---|
 | B1 | `st.session_state` 刷新/重启即失；登录门 `RAG_LOGIN_ENABLED=0` 当前关 | 会话按登录 ID 持久化；登录门变硬前提 |
-| B2 | 互斥驻留靠锁串行：并发即排队——上限/公平/超时/装卸抖动全未定义 | 核心技术风险位：排队与背压设计 |
+| B2 | 单容器内三进程共享内存/串行：并发即排队——上限/公平/超时/内存超限后的重启抖动全未定义 | 核心技术风险位：排队与背压设计 |
 | B3 | KV cache 随并发×131K 窗口增长；三进程同容器 8G（2vCPU） | 先立 KV≈f(并发, ctx) 预算公式，再定并发上限（估 1~2） |
 | B4 | 全库对所有用户可见、无限流、资料正文未防提示注入 | Qdrant 租户 filter；限流与 B2 合流计数；提示词隔离约定 |
 | B5 | `rag.log` 全记用户查询与资料正文（10MB×3） | 启用前定留存/脱敏策略，写进交付说明 |
@@ -219,9 +222,40 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 
 ### 11.3 执行顺序与冲突提醒
 
-- **P0**：A2（其余一切的测量前提）、A7（有真实事故背书，成本极低）。
-- **P1**：A3 → A1（先立验收尺，再改检索行为）；A4/A5/A6 各 2h 级。
+- **P0**：A7（有真实事故背书，成本极低）。A2 台账已实现且默认关闭——项目不做基准测量，只在临时排查时打开。
+- **P1**：A1（多轮查询改写，人工抽查验收即可，不做测试代码）；A4/A5/A6 各 2h 级。A3（golden QA 测试集）**不做**：与"不写测试代码"的现行要求冲突。
 - **触发条件**：B 档以"决定做多用户"的评审为起点；C 档随对应变化启动。
 - **冲突提醒**：改生成侧"不重试/不拒答/无闸"（§5）必先过 A4 决策记录；A3 接入 `tools/deploy-check.sh` 时与指纹新鲜度检查分开执行，不得变成每次提交必跑。
 
-开发校验：`ruff check chatbot.py`、`python -m py_compile chatbot.py`、`bash -n tools/*.sh`。
+### 11.4 内存与进程策略（2026-10-24 定稿）
+
+**策略**：不做应用层内存编排——无互斥驻留、无自适应/水位、无压力闸，请求不带 `keep_alive`。
+每个进程按自身策略使用内存：Ollama 按服务端 `keep_alive` 自身默认（上游 5m；容器未覆盖时不改）；
+检索模型首次用到后在应用进程内常驻；Qdrant 自管。`RAG_INDEX_MIN_FREE_MB` 仅用于离线
+`index`/`sparse` 的重建前检查（与服务进程隔离的纪律），不属于运行时编排。
+
+**为什么**（2026-10-24 拍板）：此前三档（1/auto/0）与 gate/水位/保险闸都消除不了
+131072+8G 的容量矛盾，只是把 OOM 时机挪来挪去；既然容量不能靠应用层解决，就删掉这套编排，
+把"进程活着"作为可运维目标。
+
+**已知后果与兜底**：8G 单容器同时驻留生成模型与检索模型时，anon 超限会导致 cgroup OOM kill
+（常杀 llama-server）。兜底不在应用内，而在 `entrypoint.sh` 的进程级巡检：qdrant / ollama /
+streamlit（运行时还包括 infinity）逐个健康检查；检查连续失败或进程退出 → 就地重启该进程
+（指数退避 5s→120s），**不重新部署**。因此 OOM 表现是"服务短暂不可用后自动恢复"，不是
+"整个容器/部署失败"。
+
+**重启的层级分工**：单个进程崩溃/僵死 → entrypoint 在容器内就地拉起（镜像、部署版本都不变）；
+若 PID 1 / 容器整体退出（例如 OOM 杀了主 shell），由平台重拉容器 —— 这同样是**重启运行**，
+不是重新部署（不重新构建、不重新推送镜像）。
+
+**已移除的配置**（代码不再读取；`deploy-check.sh` 会审计并提示）：`RAG_EXCLUSIVE_MODELS`、
+`RAG_GEN_KEEP_ALIVE`、`RAG_EXCLUSIVE_AUTO_FREE_MB`、`RAG_TURN_MIN_FREE_MB`；.env 若残留这些键不会生效。
+
+**配置权威**：代码默认值为唯一权威，.env 只是覆盖层——缺行 = 用代码默认（不是错误）；写了
+代码不读取的键 = 失效。启动日志 `[config]` 打印 .env sha256 与关键生效值，`tools/deploy-check.sh`
+的配置审计会在发布前拦下失效键/三源漂移。
+
+**可选诊断**：`RAG_TURN_STATS=1`（默认 0，项目不做基准测量）时每轮写一行
+`artifacts/turns.jsonl`，用 `python tools/turn_stats.py` 汇总；只在临时排查时打开、看完即关。
+
+开发校验：`ruff check chatbot.py`、`python -m py_compile chatbot.py`、`bash -n entrypoint.sh tools/*.sh`、`python tools/config-audit.py`。

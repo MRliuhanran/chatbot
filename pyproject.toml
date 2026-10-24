@@ -1,4 +1,4 @@
-# 工具配置（ruff / mypy / pytest）。项目不是可安装包，此文件仅供工具读取，
+# 工具配置（ruff / mypy）。项目不是可安装包，此文件仅供工具读取，
 # 不参与 pip install -r requirements.txt（运行时依赖的唯一真相仍是 requirements.txt）。
 
 [tool.ruff]
@@ -11,7 +11,7 @@ target-version = "py310"
 #   内（_SOURCE 的稀疏指纹单元）—— 修任何一处 = 指纹漂移 = 全量重建稀疏索引。
 #   同规则要么全改要么不改，故整体不选。
 # - BLE001（blind catch Exception）/ S110（try-except-pass）：健康检查、降级、诊断
-#   路径的有意设计（AGENTS 失效原型要求诊断路径不能崩），其中 1 处在禁改的
+#   路径的有意设计（README §10 失效原型要求诊断路径不能崩），其中 1 处在禁改的
 #   _hard_split_by_tokens（切分指纹单元）。
 select = ["E4", "E7", "E9", "F", "I"]
 ignore = []
@@ -25,12 +25,8 @@ check_untyped_defs = true
 # _split_into_children / parse_aliases）—— 给它们加注解或 # type: ignore 都会进
 # inspect.getsource = 切分/稀疏指纹漂移 = 全量重建。非指纹区的同类错误已修完，
 # 故这 3 码的豁免 ≈ 精确豁免指纹区。代价：未来非指纹区新写 `x = []` 缺注解不会被
-# mypy 提示，补注解仍是人工约定（指纹区加注解则会先被 tests/test_fingerprint.py 拦下）。
+# mypy 提示，补注解仍是人工约定（指纹区加注解同样会造成指纹漂移，评审时核对指纹单元清单）。
 disable_error_code = ["var-annotated", "operator", "type-var"]
 # 加注解只允许加在指纹单元之外 —— 注解写进指纹函数源码 = 切分/稀疏指纹漂移 = 全量重建。
-# 单文件项目无法 per-file 豁免，靠这条约定 + tests/test_fingerprint.py 的指纹守卫兜底。
+# 单文件项目无法 per-file 豁免，靠这条约定 + 评审时人工核对指纹单元清单兜底。
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-addopts = "-q"

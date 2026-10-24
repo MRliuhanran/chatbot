@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 单容器编排：Qdrant → Ollama → 权重按需下载 → 检索模型服务(infinity，可选) → 生成模型按需拉取 → Streamlit（前台）
+# 单容器编排：Qdrant → Ollama → 权重按需下载 → 检索模型服务(infinity，可选) → 生成模型按需拉取 → Streamlit（前台监督）
+# 运行期：每个进程（含 Streamlit）都有健康巡检与崩溃/僵死自愈，只重启进程、不重新部署。
 # 端口与地址全部走 CLI 参数，不改仓库内任何配置文件（CLI 优先级高于 .streamlit/config.toml）。
 set -u
 
@@ -12,8 +13,8 @@ _log() { printf '[entrypoint] %s\n' "$*"; }
 . /app/tools/fetch_models.sh || _log "⚠️ 缺少 /app/tools/fetch_models.sh，模型按需下载不可用"
 
 # ── 0.1 进程存活判据（唯一一份）─────────────────────────────────────────────
-# `kill -0` 对**僵尸**返回 0：exec 之后 Streamlit 是 PID 1、没人 wait，qdrant/ollama
-# 运行期崩溃只会变成僵尸，于是 `! kill -0` 恒为假 —— 存活哨兵一次都不会喊（判据恒假，
+# `kill -0` 对**僵尸**返回 0：进程退出后、在被父进程 wait 收尸之前一直是 Z 状态、占着
+# pid。巡检/自愈必须把 Z 当死 —— 否则僵尸会被当成"还在运行"，重启永不发生（判据恒真，
 # 正是它声称要捕获的静默故障）。故必须显式排除 Z 状态。ps 不可用时退回 kill -0
 # —— 这一支必须 return 0：ps 缺失时按"判死"处理会让下面的启动检查把正常进程杀掉。
 _pid_alive() {
@@ -50,7 +51,7 @@ _wait_http_ready() {
     fi
 }
 
-# ── 0.1c 进程自愈：运行期崩溃自动拉起（指数退避）────────────────────────────
+# ── 0.1c 进程自愈：运行期崩溃 / 僵死自动拉起（指数退避 + 健康巡检）────────────
 # 旧实现（4.5）只告警不重启，顾虑是"Qdrant 崩溃循环 + 反复打开损坏 WAL 比直接停机更糟"。
 # 退避公式本身就把顾虑消掉了：崩溃越频繁，间隔拉得越长，最后稳定在 120s 一次，与直接
 # 停机相比差的只是"每 120s 一次的重启尝试"，而换来崩溃自愈 —— 故不再设熔断/计次上限
@@ -60,41 +61,68 @@ _wait_http_ready() {
 #   BASE=5s CAP=120s → 5 / 10 / 20 / 40 / 80 / 120s，此后恒 120s
 #   可调 RAG_SUPERVISE_BASE / RAG_SUPERVISE_CAP（公式参数，非开关）
 # 只负责"运行期崩溃"：首启失败仍由 _wait_http_ready 直接 exit 1（交给平台重拉容器）。
-# 子进程回收：重启出来的实例是本监督者的子进程，用 wait 收尸——否则 PID 1=Streamlit
-#      不 wait，死进程会积成僵尸（_pid_alive 已排除 Z，但僵尸仍占 pid 槽）。
+# ★ 健康巡检（2026-10-24）★：只靠"进程还在"不够 —— 进程活着但 HTTP 挂了（死锁、事件循环
+# 阻塞、模型加载失败后不收请求）同样服务不可用，平台侧只看到 502/超时。故存活期间每
+# RAG_WATCHDOG_INTERVAL（默认 5s）用 curl -fsS -m 3 打 _svc_health 返回的端点，连续
+# RAG_WATCHDOG_FAILS（默认 6）次失败 → kill -9 该 pid、日志打 🩺，随后走下面的退避重启。
+# 只重启**进程**，不动容器/部署 —— 这是本模块的核心行为。
+# 子进程回收：重启出来的实例是本监督者的子进程，用 wait 收尸；首启实例（主脚本拉起）
+#      由主 shell 在 Streamlit 巡检循环里顺手 wait（僵尸仍占 pid 槽，_pid_alive 已排除 Z）。
 _svc_health() {
     case "$1" in
-        qdrant)   printf 'http://127.0.0.1:6333/healthz' ;;
-        ollama)   printf 'http://127.0.0.1:11434/api/version' ;;
-        infinity) printf 'http://127.0.0.1:%s/health' "${_inf_port:-8001}" ;;
+        qdrant)    printf 'http://127.0.0.1:6333/healthz' ;;
+        ollama)    printf 'http://127.0.0.1:11434/api/version' ;;
+        infinity)  printf 'http://127.0.0.1:%s/health' "${_inf_port:-8001}" ;;
+        streamlit) printf 'http://127.0.0.1:%s/_stcore/health' "${_st_port:-${RAG_HTTP_PORT:-7860}}" ;;
     esac
 }
 _supervise() {
     local _name="$1" _logf="$2" _startfn="$3" _pid="${4:-}"
     local _base="${RAG_SUPERVISE_BASE:-5}" _cap="${RAG_SUPERVISE_CAP:-120}"
-    local _n=0 _svc_pid _i _ok _t0 _up _d _jit _url
+    local _n=0 _svc_pid _i _ok _t0 _up _d _jit _url _fails
     _url="$(_svc_health "${_name}")"
     while :; do
+        # 停机中（trap 已置标记，见 0.1c4）：不再拉起，退出监督循环，别和 docker stop 抢进程。
+        [ -f "${_SHUTDOWN_FLAG}" ] && return 0
         if [ -n "${_pid}" ] && _pid_alive "${_pid}"; then
             : # 首启实例由主脚本拉起，这里只接管监控（不重复起第二个）
         else
             _svc_pid=""
             "${_startfn}"
             _pid="${_svc_pid}"
-            _ok=0
-            for _i in $(seq 1 60); do
-                if curl -fsS "${_url}" >/dev/null 2>&1; then _ok=1; break; fi
-                _pid_alive "${_pid}" || break
-                sleep 1
-            done
-            # 仅"进程活着但健康检查失败"才告警；进程已死由下面的崩溃分支说明，别重复喊。
-            if [ "${_ok}" != 1 ] && _pid_alive "${_pid}"; then
-                _log "⚠️ ${_name} 拉起后 60 秒未就绪（pid=${_pid}，进程在但健康检查失败），继续观察"
-            fi
         fi
+        _write_pid "${_name}" "${_pid}"
+        # 统一就绪宽限（60s）：首启 qdrant/ollama 已被 _wait_http_ready 等过（此处立即通过）；
+        # infinity 首启在后台等权重 + 加载模型，必须给宽限，否则会被下面的巡检当"僵死"杀掉。
+        _ok=0
+        for _i in $(seq 1 60); do
+            if curl -fsS -m 3 "${_url}" >/dev/null 2>&1; then _ok=1; break; fi
+            _pid_alive "${_pid}" || break
+            sleep 1
+        done
+        # 仅"进程活着但健康检查失败"才告警；进程已死由下面的崩溃分支说明，别重复喊。
+        if [ "${_ok}" != 1 ] && _pid_alive "${_pid}"; then
+            _log "⚠️ ${_name} 拉起后 60 秒未就绪（pid=${_pid}，进程在但健康检查失败），继续观察"
+        fi
+        # ★ 存活期健康巡检 ★：每 _watch_interval 秒打一次健康端点，连续 _watch_fails 次失败
+        # = 进程僵死（在跑但不服务）→ kill -9，落到下面同一条崩溃重启路径（退避公式不变）。
         _t0="$(date +%s)"
-        while _pid_alive "${_pid}"; do sleep 3; done
+        _fails=0
+        while _pid_alive "${_pid}" && [ ! -f "${_SHUTDOWN_FLAG}" ]; do
+            if curl -fsS -m 3 "${_url}" >/dev/null 2>&1; then
+                _fails=0
+            else
+                _fails=$(( _fails + 1 ))
+                if [ "${_fails}" -ge "${_watch_fails}" ]; then
+                    _log "🩺 ${_name} 连续 ${_fails} 次健康检查失败（${_url}，间隔 ${_watch_interval}s）→ kill -9 pid=${_pid}，转入崩溃重启"
+                    kill -9 "${_pid}" 2>/dev/null || true
+                    break
+                fi
+            fi
+            sleep "${_watch_interval}"
+        done
         wait "${_pid}" 2>/dev/null || true # 回收自己拉起的子进程（非自身子进程时无副作用）
+        [ -f "${_SHUTDOWN_FLAG}" ] && return 0
         _up=$(( $(date +%s) - _t0 ))
         _n=$(( _n + 1 ))
         _d="$(awk -v b="${_base}" -v n="${_n}" -v c="${_cap}" \
@@ -106,6 +134,76 @@ _supervise() {
         _pid=""
     done
 }
+
+# ── 0.1c2 巡检参数（唯一一份：_supervise 与 Streamlit 监督循环共用）──────────────
+# 间隔/阈值可调，但非法值（空/非数字/0）必须退回默认：sleep 0 + 紧循环会把这台 2vCPU
+# 容器直接打满。case 做纯数字校验，不引入 expr/awk。
+_watch_interval="${RAG_WATCHDOG_INTERVAL:-5}"
+case "${_watch_interval}" in ''|*[!0-9]*) _watch_interval=5 ;; esac
+[ "${_watch_interval}" -ge 1 ] || _watch_interval=5
+_watch_fails="${RAG_WATCHDOG_FAILS:-6}"
+case "${_watch_fails}" in ''|*[!0-9]*) _watch_fails=6 ;; esac
+[ "${_watch_fails}" -ge 1 ] || _watch_fails=6
+
+# ── 0.1c3 当前 pid 落盘（写者=各监督循环，读者=[watchdog] 汇总与 trap）──────────
+# _supervise 在子 shell 里重启服务，主 shell 的 ${_qdrant_pid} 只代表首启实例、会过期；
+# pid 文件是两侧"当前 pid"的唯一通道（只写一行，读不到就当没有）。
+_write_pid() { printf '%s\n' "$2" > "/tmp/$1.pid" 2>/dev/null || true; }
+_read_pid()  { head -n1 "/tmp/$1.pid" 2>/dev/null || true; }
+
+# ── 0.1c3b 可中断 sleep（只在主 shell 用）────────────────────────────────────
+# 主 shell 是 PID 1 且装了 TERM/INT trap，而 bash 只在"当前前台命令结束"后才执行 trap：
+# 普通 sleep 会让主循环的巡检间隔、以及最长 120s 的重启退避段完全不可中断 —— docker stop
+# 的租约等不到就变 SIGKILL，不叫"正常停止"。`sleep & wait $!` 让 wait 被信号打断后立刻
+# 执行 trap（子 shell 的 _supervise 不需要：子 shell 不继承 trap，TERM 直接生效）。
+_sleep_int() {
+    local _sp
+    sleep "$1" &
+    _sp=$!
+    wait "${_sp}" 2>/dev/null || true
+}
+
+# ── 0.1c4 停止路径：docker stop → SIGTERM/INT ────────────────────────────────
+# 改造前 Streamlit 由 exec 成为 PID 1，TERM 直接结束它、容器随之退出。改成前台监督循环
+# 后主 shell 是 PID 1：不显式转发 TERM 的话，docker stop 只能等租约超时再 SIGKILL，
+# Qdrant 拿不到 TERM 就没有正常 flush。顺序：
+#   ① 置停机标记（各 _supervise 循环看到后不再拉起，见 4.5）；
+#   ② TERM 监督循环自身（它们只会 wait，不转发信号）；
+#   ③ TERM Streamlit 与 qdrant/ollama/infinity 的**当前** pid（从 pid 文件读，重启过也对）；
+#   ④ 等它们退出（≤6s），仍未退的 KILL，wait 收尸，exit 0 —— docker stop 正常返回。
+_SHUTDOWN_FLAG="/tmp/.entrypoint-shutdown"
+rm -f "${_SHUTDOWN_FLAG}"
+# 同一容器内重复起脚本时，上一轮的 pid 文件可能是**已复用**的 pid：启动时清掉，别让 trap 误杀。
+rm -f /tmp/qdrant.pid /tmp/ollama.pid /tmp/infinity.pid /tmp/streamlit.pid
+_supervise_pids=""
+_st_pid=""
+_graceful_stop() {
+    trap - TERM INT
+    : > "${_SHUTDOWN_FLAG}"
+    _log "🛑 收到停止信号（TERM/INT）：停止 streamlit / qdrant / ollama${_infinity_pid:+ / infinity}"
+    local _p _pids="" _i _alive
+    for _p in ${_supervise_pids:-}; do
+        kill -TERM "${_p}" 2>/dev/null || true
+    done
+    for _p in "${_st_pid:-}" "$(_read_pid qdrant)" "$(_read_pid ollama)" "$(_read_pid infinity)"; do
+        [ -n "${_p}" ] || continue
+        kill -TERM "${_p}" 2>/dev/null || true
+        _pids="${_pids} ${_p}"
+    done
+    for _i in 1 2 3 4 5 6; do
+        _alive=0
+        for _p in ${_pids}; do _pid_alive "${_p}" && _alive=1; done
+        [ "${_alive}" = 0 ] && break
+        sleep 1
+    done
+    for _p in ${_pids}; do
+        _pid_alive "${_p}" && kill -KILL "${_p}" 2>/dev/null || true
+        wait "${_p}" 2>/dev/null || true
+    done
+    _log "已停止（streamlit + 子进程收尸完成），退出"
+    exit 0
+}
+trap '_graceful_stop' TERM INT
 
 # ── 0.2 从 .env 补齐本脚本要用的变量（唯一实现：tools/dotenv.sh）────────────────
 # 旧写法在本脚本里自带一份解析器，run_local.sh 又自带第三份、fetch_models.sh 另有一份取值
@@ -146,6 +244,28 @@ else
     _log "❌ 缺少 /app/tools/hw_profile.sh（硬件适配参数的薄封装；实现是 tools/hw_profile.py）—— 退出"
     exit 1
 fi
+
+# ── 0.2c 启动配置指纹（一次部署打一行，事后归因"线上到底跑的是什么"）──────────────
+# 2026-10-24 内存策略定稿后，应用层不再做互斥驻留/自适应/压力闸（见 chatbot.py 顶部），
+# 但容器里仍在读 .env。启动第一屏把**生效值**与**已废弃变量**一次打全：
+#   · .env sha256 —— 容器里的 .env 是构建期 COPY 进去的，线上与仓库是不是同一份只能看这个；
+#   · MODEL / RAG_NUM_CTX / OLLAMA_KEEP_ALIVE / RAG_MODEL_DL_CONNS / RAG_GEN_TOKENIZER_PATH
+#     —— 排障时最常被问"线上生效的是哪个档"的五个键（未设就写 <unset>，别让读者猜）；
+#   · 已废弃键 —— 写了也不生效，但会让人误以为策略还在；告警不退出（残留值本身无害）。
+_env_sha="(无 .env)"
+if [ -f .env ]; then
+    _env_sha="$(sha256sum .env 2>/dev/null | awk '{print $1}')"
+    _env_sha="${_env_sha:-读不到}"
+fi
+_log "[config] .env sha256=${_env_sha} MODEL=${MODEL:-<unset>} RAG_NUM_CTX=${RAG_NUM_CTX:-<unset>} OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-<unset>} RAG_MODEL_DL_CONNS=${RAG_MODEL_DL_CONNS:-<unset>} RAG_GEN_TOKENIZER_PATH=${RAG_GEN_TOKENIZER_PATH:-<unset>}"
+# 已废弃（2026-10-24 定稿，以代码为准）：chatbot.py 已不再读取下列变量。仍被 .env / 平台
+# 注入时打 ⚠️ 说明"此项不生效"，避免把旧档位的残留当成现行策略。
+for _dep_var in RAG_EXCLUSIVE_MODELS RAG_GEN_KEEP_ALIVE RAG_EXCLUSIVE_AUTO_FREE_MB RAG_TURN_MIN_FREE_MB; do
+    eval "_dep_val=\"\${${_dep_var}:-}\""
+    [ -n "${_dep_val}" ] || continue
+    _log "⚠️  废弃变量 ${_dep_var}=${_dep_val}：当前代码已不再读取（以代码为准），此项不生效；可从 .env / 平台环境删除"
+done
+unset _dep_var _dep_val
 
 # ── 0. 运行期目录与下载源 ────────────────────────────────────────────────────
 # 嵌入/重排权重的备源 HF 镜像；主源用魔搭自己的 hub（创空间内必达）。
@@ -299,17 +419,23 @@ _qdrant_start() {
 : > /tmp/qdrant.log
 _qdrant_start
 _qdrant_pid="${_svc_pid}"
+_write_pid qdrant "${_qdrant_pid}"   # 当前 pid 落盘（[watchdog] 汇总与 trap 用）
 _log "qdrant 启动中（storage=${QDRANT__STORAGE__STORAGE_PATH}）"
 _wait_http_ready qdrant http://127.0.0.1:6333/healthz "${_qdrant_pid}" /tmp/qdrant.log
 _log "qdrant 就绪（http://127.0.0.1:6333）"
 
 # ── 2. Ollama ──────────────────────────────────────────────────────────────
-# 生成模型常驻：Ollama 默认 5 分钟卸载，闲置后再问一次就要重新加载 3.4GB（首字多等数秒）。
-# 这是**服务端**变量；单例模式（RAG_EXCLUSIVE_MODELS=1）下客户端每次请求都带
-# keep_alive=RAG_GEN_KEEP_ALIVE（=0），**请求级字段覆盖这里**，故本默认值只在
-# 非单例/其它客户端访问时生效。容器内 ollama serve 由本脚本拉起，故在此显式导出默认值
-# —— 若部署方在 .env 设了 OLLAMA_KEEP_ALIVE，_load_dotenv 已导出，${VAR:-...} 会沿用。
-export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
+# 生成模型驻留策略（2026-10-24 定稿）：本脚本**不再替 Ollama 设默认值**。
+# 旧行为 export OLLAMA_KEEP_ALIVE=-1（永驻）是"应用层互斥驻留"方案的一部分，该方案已
+# 整体废弃 —— 应用层不编排生成模型内存，每个进程按自身策略使用内存（见 chatbot.py 顶部）。
+# 现在由 Ollama 服务端变量 OLLAMA_KEEP_ALIVE 决定：未显式设置时采用 **Ollama 自身默认**
+# （上游 5m，闲置后自动卸载）；.env / 平台注入了显式值就原样沿用（_load_dotenv 已导出，
+# ollama serve 从本 shell 继承）。这里只把"实际采用哪一种"写进日志，不设默认值。
+if [ -n "${OLLAMA_KEEP_ALIVE:-}" ]; then
+    _log "OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE}（沿用 .env/平台显式值，覆盖 Ollama 默认）"
+else
+    _log "OLLAMA_KEEP_ALIVE 未设置 → 采用 Ollama 自身默认（上游 5m，闲置后自动卸载生成模型）"
+fi
 # ── 生成侧服务端参数：语义项来自 .env，硬件项来自 hw_profile（Dockerfile 两者都不再注入）──
 # 为什么不再注入 ENV：ENV 与 .env 是**两套注入机制**，效果相同、来源不同，改一处必漏
 # 另一处；且 _load_dotenv 是"进程环境优先"，只要 Dockerfile 预设了同名 ENV，.env 里的值就
@@ -348,6 +474,7 @@ _ollama_start() {
 : > /tmp/ollama.log
 _ollama_start
 _ollama_pid="${_svc_pid}"
+_write_pid ollama "${_ollama_pid}"   # 当前 pid 落盘（[watchdog] 汇总与 trap 用）
 _wait_http_ready ollama http://127.0.0.1:11434/api/version "${_ollama_pid}" /tmp/ollama.log
 _log "ollama 就绪（http://127.0.0.1:11434, models=${OLLAMA_MODELS}）"
 # 生成侧是否真的用上了量化 KV / flash attention：llama.cpp 只在**模型加载后**把
@@ -376,8 +503,8 @@ _download_models &
 # 不再持有检索模型；查询侧按 OpenAI /v1/embeddings 与 Cohere 风格 /v1/rerank 调它。
 # **必须在权重就绪之后**（infinity 启动时找不到模型目录会直接退出），故先轮询目录再拉起。
 # 命令行只此一处（_infinity_argv 数组），首启与运行期自愈（4.5）共用，避免 argv 漂移。
-# 注意：单例（RAG_EXCLUSIVE_MODELS=1）下 infinity 常驻它的两个模型且**没有卸载接口**，
-# 互斥只能从另一侧保证 —— 生成模型答完即卸（RAG_GEN_KEEP_ALIVE=0）。
+# 注意：infinity 常驻它的两个检索模型，服务本身没有卸载接口；内存策略已改为"应用层不
+# 编排、各进程按自身策略用内存"（2026-10-24 定稿），这里只负责进程存活与健康巡检。
 _infinity_pid=""
 # http 后端 = 需要 infinity。先算"要不要"，再单独做 command -v 判据（评审 #7），最后才进
 # 启动块 —— 启动块本体（argv/等待/自愈复用）一行不动，避免大段缩进带来的改错风险。
@@ -436,6 +563,7 @@ if [ "${_infinity_wanted}" = 1 ]; then
     : > /tmp/infinity.log
     ( _infinity_wait_models; exec "${_infinity_argv[@]}" >>/tmp/infinity.log 2>&1 ) &
     _infinity_pid=$!
+    _write_pid infinity "${_infinity_pid}"   # 当前 pid 落盘（[watchdog] 汇总与 trap 用）
 fi
 
 # ── 4. 生成模型：缺失则后台拉取，不阻塞对外服务（首启多等几分钟，期间问答会失败）──
@@ -452,24 +580,60 @@ else
     _pull_ollama_model "${_model}" &
 fi
 
-# ── 4.5 运行期自愈：进程崩溃自动拉起 ─────────────────────────────────────────
-# exec 让 Streamlit 当 PID 1，容器里没人 wait：qdrant/ollama 运行期崩了只会变僵尸，
-# 既不重启也不告警 —— 上面两处存活检查只在启动期跑一次。表现为"页面照常 200、检索或
-# 生成全失败"，而日志里一条线索都没有（失效原型：状态失步 + 静默）。
-# 现改为自愈：_supervise 指数退避（公式与顾虑见 0.1c 注释），无条件启用，不设开关 ——
-# 有开关就迟早有人把它关掉，然后静默与状态失步又回来了；不想要自动重启的是"编排层
-# 应该重拉容器"的场景，那由首启失败 exit 1 处理，不归这里管。
+# ── 4.5 运行期自愈：进程崩溃/僵死自动拉起 ────────────────────────────────────
+# 旧版 exec 让 Streamlit 当 PID 1，容器里没人 wait：qdrant/ollama 运行期崩了只会变僵尸，
+# 既不重启也不告警 —— 启动期的存活检查只跑一次。表现为"页面照常 200、检索或生成全失败"，
+# 而日志里一条线索都没有（失效原型：状态失步 + 静默）。
+# 现为三层自愈，无条件启用、不设开关（有开关就迟早被关掉，静默与状态失步又回来）：
+#   ① 崩溃重启：进程退出 → 指数退避后拉起（公式与顾虑见 0.1c 注释）；
+#   ② 健康巡检：进程活着但 HTTP 连续失败 → kill -9 后走 ①（见 0.1c）；
+#   ③ Streamlit 同样在前台监督循环里巡检/重启（见 5.1），主 shell 从此兼作 PID 1 监督者。
+# 不想要自动重启的是"编排层应该重拉容器"的场景，那由首启失败 exit 1 处理，不归这里管。
 _supervise qdrant   /tmp/qdrant.log   _qdrant_start   "${_qdrant_pid}"   &
+_supervise_pids="${_supervise_pids} $!"
 _supervise ollama   /tmp/ollama.log   _ollama_start   "${_ollama_pid}"   &
-[ -n "${_infinity_pid}" ] && \
+_supervise_pids="${_supervise_pids} $!"
+if [ -n "${_infinity_pid}" ]; then
     _supervise infinity /tmp/infinity.log _infinity_start "${_infinity_pid}" &
+    _supervise_pids="${_supervise_pids} $!"
+fi
+
+# ── 4.5b [watchdog] 巡检汇总：每 60s 一行 pid + health ─────────────────────────
+# _supervise 只在"出事"时打日志（🩺 / 🔴）；常态心跳用来区分"真的没事"与"巡检循环
+# 自己死了"—— 后者完全静默，正是本仓库反复点名的失效原型。pid 读 pid 文件拿**当前**值
+# （重启过的话主 shell 的 ${_qdrant_pid} 已过期），健康判据与 _supervise 同一个 _svc_health。
+_watchdog_report() {
+    local _n _p _u _h _line=""
+    for _n in qdrant ollama streamlit infinity; do
+        if [ "${_n}" = infinity ] && [ "${_infinity_wanted:-0}" != 1 ]; then
+            _line="${_line} infinity=未启用"
+            continue
+        fi
+        _p="$(_read_pid "${_n}")"
+        if [ -n "${_p}" ] && _pid_alive "${_p}"; then
+            _u="$(_svc_health "${_n}")"
+            if curl -fsS -m 3 "${_u}" >/dev/null 2>&1; then _h=ok; else _h=fail; fi
+        else
+            _p="-"; _h=fail
+        fi
+        _line="${_line} ${_n}(pid=${_p},health=${_h})"
+    done
+    _log "[watchdog]${_line}"
+}
+(
+    while :; do
+        sleep 60
+        [ -f "${_SHUTDOWN_FLAG}" ] && exit 0
+        _watchdog_report
+    done
+) &
 
 # ── 4.6 冷启动自检：生成链路（默认）/ 完整检索+生成（可选）──────────────────────
 # 8G 档 llama-server 被 cgroup OOM 杀时（`signal: killed`），业务侧只表现为一次 500，
 # 运行日志里既无 KV 规模也无峰值内存；而容器外又驱动不了 Streamlit（脚本只在浏览器
 # websocket 会话建立后才跑，curl 只拿静态壳）。故把验收前移到启动期，把结果与内存
 # 现场直接写进运行日志（前缀 [自检]）。
-# **必须后台 + 延迟**：早期版本在 exec Streamlit 之前同步跑，自检占住 7860 端口 85~240
+# **必须后台 + 延迟**：早期版本在启动 Streamlit 之前同步跑，自检占住 7860 端口 85~240
 # 秒，平台健康探针等不到监听 → 容器反复重启（2026-10-16 实测 2 分钟内 6 次冷启动）。
 # 默认只跑「生成探针」（不导入 torch，进程几十 MB，与真实查询重叠也不会撑爆 8G）；
 # 需要验收检索侧时再开 RAG_BOOT_SELFTEST_FULL=1。RAG_BOOT_SELFTEST=0 可整体关掉。
@@ -498,7 +662,7 @@ if [ "${RAG_BOOT_SELFTEST:-1}" != 0 ]; then
     ) &
 fi
 
-# ── 5. Streamlit：前台运行（容器主进程），端口按创空间要求固定 7860 ────────────
+# ── 5. Streamlit：前台监督循环（巡检 + 自愈），端口按创空间要求固定 7860 ──────
 # 0.0.0.0 是**容器语境的正确值**（容器内直连 127.0.0.1 拿不到宿主端口映射）；不要照搬
 # 到裸机 —— 裸机上 Streamlit 默认绑 localhost，对外暴露需自己显式选 --server.address。
 # 让应用侧知道权重仍在后台下载：模型加载时轮询等待，而不是把首查询竞态当错误抛出。
@@ -574,8 +738,71 @@ else
     fi
 fi
 
-_log "Streamlit 启动: http://0.0.0.0:${RAG_HTTP_PORT:-7860}"
-exec python -m streamlit run chatbot.py \
-    --server.address 0.0.0.0 \
-    --server.port "${RAG_HTTP_PORT:-7860}" \
-    --server.headless true
+# ── 5.1 Streamlit 监督循环：巡检 + 僵死/退出重启（只重启进程，不重新部署）────────
+# 旧版用 exec 把 Streamlit 变成 PID 1：它崩了 / 健康检查失败没人管（页面 502 或挂起，
+# 容器却"还在"），平台只能靠外部探针重拉 = 重新部署。现在主 shell 兼任 PID 1 监督者：
+#   · 后台起 Streamlit，stdout/stderr **不重定向**（平台日志照收，保留原有日志形态）；
+#   · 每 _watch_interval 秒 curl /_stcore/health，连续 _watch_fails 次失败 → kill -9；
+#   · 进程退出或被巡检杀 → 指数退避 5s→120s 后重启（公式/参数与 _supervise 同源）。
+# 首次拉起给 60s 就绪宽限（要 import torch / 加载配置），避免把还在冷启动的进程杀掉。
+_st_port="${RAG_HTTP_PORT:-7860}"
+_streamlit_start() {
+    python -m streamlit run chatbot.py \
+        --server.address 0.0.0.0 \
+        --server.port "${_st_port}" \
+        --server.headless true &
+    _st_pid=$!
+    _write_pid streamlit "${_st_pid}"
+}
+# 60s 就绪宽限：健康即返回 0；进程提前退出返回 1；60s 仍不健康返回 1（不杀，转入巡检）。
+_streamlit_ready() {
+    local _i
+    for _i in $(seq 1 60); do
+        curl -fsS -m 3 "$(_svc_health streamlit)" >/dev/null 2>&1 && return 0
+        _pid_alive "${_st_pid}" || return 1
+        sleep 1
+    done
+    return 1
+}
+# 首启实例（qdrant/ollama/infinity 由主脚本拉起）是本 shell 的子进程；被巡检 kill -9 后
+# 若不 wait 会变僵尸（_pid_alive 已排除 Z，但僵尸仍占 pid 槽）。监督循环每轮顺手收尸。
+_reap_initial_services() {
+    local _p
+    for _p in "${_qdrant_pid:-}" "${_ollama_pid:-}" "${_infinity_pid:-}"; do
+        [ -n "${_p}" ] || continue
+        _pid_alive "${_p}" || wait "${_p}" 2>/dev/null || true
+    done
+}
+_log "Streamlit 启动: http://0.0.0.0:${_st_port}（前台监督：巡检 ${_watch_interval}s / 连续 ${_watch_fails} 次失败重启）"
+_st_n=0
+while :; do
+    _streamlit_start
+    if ! _streamlit_ready && _pid_alive "${_st_pid}"; then
+        _log "⚠️ Streamlit 拉起后 60 秒未就绪（pid=${_st_pid}，进程在但健康检查失败），转入巡检"
+    fi
+    _st_fails=0
+    _st_t0="$(date +%s)"
+    while _pid_alive "${_st_pid}"; do
+        _reap_initial_services
+        if curl -fsS -m 3 "$(_svc_health streamlit)" >/dev/null 2>&1; then
+            _st_fails=0
+        else
+            _st_fails=$(( _st_fails + 1 ))
+            if [ "${_st_fails}" -ge "${_watch_fails}" ]; then
+                _log "🩺 streamlit 连续 ${_st_fails} 次健康检查失败（$(_svc_health streamlit)，间隔 ${_watch_interval}s）→ kill -9 pid=${_st_pid}，重启进程（不重新部署）"
+                kill -9 "${_st_pid}" 2>/dev/null || true
+                break
+            fi
+        fi
+        _sleep_int "${_watch_interval}"
+    done
+    wait "${_st_pid}" 2>/dev/null || true
+    _st_up=$(( $(date +%s) - _st_t0 ))
+    _st_n=$(( _st_n + 1 ))
+    _st_d="$(awk -v b="${RAG_SUPERVISE_BASE:-5}" -v n="${_st_n}" -v c="${RAG_SUPERVISE_CAP:-120}" \
+        'BEGIN{d=b*2^(n-1); if(d>c)d=c; printf "%d", d}')"
+    _st_jit=$(( RANDOM % 20 ))
+    _st_d=$(( _st_d + _st_d * _st_jit / 100 ))
+    _log "🔴 streamlit 退出/被巡检重启（存活 ${_st_up}s）→ 第 ${_st_n} 次拉起，退避 ${_st_d}s（min(${RAG_SUPERVISE_BASE:-5}·2^(n-1), ${RAG_SUPERVISE_CAP:-120})+抖动）"
+    _sleep_int "${_st_d}"
+done

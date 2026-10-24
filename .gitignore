@@ -7,20 +7,28 @@ venv/
 # ---- 模型（体积大，从 HuggingFace 重新下载）----
 models/
 
-# ---- 索引与缓存（可重建：process + index）----
+# ---- 索引产物与运行时缓存（可重建：process + index）----
+# 入仓的是少数固定产物（artifacts/chunks.json、chunks.meta.json、gen_tokenizer/），其余
+# 中间态（*.tmp.npz、.index.lock 等）一律忽略 —— 所以写"目录内白名单"而不是整目录忽略。
+# corpus/ 被历史 git add -f 入仓（公开快照部署要用），同目录新增的大文件默认忽略；
+# 已经 -f 入仓的文件不会被这里的规则影响，无需再改。
 storage/
-# 说明：storage 整体忽略，镜像所需部分用 git add -f 按路径入仓
-# （aliases/data.json、raft_state.json、集合目录含 wal/first-index）。
-# wal 的 open-*/closed-* 永不入仓 —— 与 .dockerignore 的排除保持一致（镜像里本来就没有），
-# 已实测：仅凭 first-index + segments 即可完整恢复（exact count=21255、别名可解析、green）。
-artifacts/
+artifacts/*
+!artifacts/chunks.json
+!artifacts/chunks.meta.json
+!artifacts/gen_tokenizer
+!artifacts/gen_tokenizer/**
+corpus/
 *.pkl
 
-# ---- 源文本（体积大，可重新获取）----
-corpus/
+# ---- 调研产物：GitHub 搜索结果（99KB，与代码无关）----
+gh1.json
 
 # ---- 本地缓存（infinity 模型影子视图等，可重建）----
 .cache/
+# 本地 Qdrant 原生存储与驱动等杂物（不入运行时产物清单，但同样永不入仓）
+qdrant_storage/
+chromedriver/
 
 # ---- 本地原生二进制（如 qdrant，本地起用，不入仓）----
 .bin/
@@ -37,9 +45,11 @@ debug_*.png
 # ---- 本地备份 ----
 bak/
 
-# ---- 密钥 ----
-.env
+# ---- 配置 ----
+# .env 不忽略：是发布仓库的公开配置（部署启用面/构建产物策略），本来就无凭据；
+# 凭据放 .streamlit/secrets.toml（严格忽略，*.bak 备份同样忽略）。
 .streamlit/secrets.toml
+.streamlit/secrets.toml.*
 
 # ---- IDE ----
 .idea/

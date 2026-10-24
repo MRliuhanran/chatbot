@@ -11,7 +11,8 @@ Falcon / Starcoder / GPT-2 系 等）。换 Ollama 模型只需重跑本工具�
 `pre` 未知或属于 llama.cpp 里的手写状态机家族（gemma4 / kimi-k2 等）时，退回 GPT-2 默认
 正则并**显式告警**，绝不静默产出错误切分。
 
-产物是派生数据、可从模型重放，不入库：`artifacts/gen_tokenizer/` 已 gitignore。
+产物是派生数据、可从模型重放；`artifacts/gen_tokenizer/` 在 .gitignore 里做了目录白名单
+（tokenizer.json 与来源 meta 随仓库发布，容器构建需要），不是整体忽略。
 
 用法：
   python tools/build_gen_tokenizer.py --model qwen3.5:4b-q4_K_M \
@@ -20,10 +21,12 @@ Falcon / Starcoder / GPT-2 系 等）。换 Ollama 模型只需重跑本工具�
   python tools/build_gen_tokenizer.py --model llama3.1:8b --pre llama-bpe   # 手动指定 pre
 """
 import argparse
+import hashlib
 import json
 import os
 import struct
 import sys
+import time
 
 FMT = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?",
        10: "Q", 11: "q", 12: "d"}
@@ -305,6 +308,34 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     tk.save(args.out)
     print(f"写出 {args.out}（{os.path.getsize(args.out)} 字节，往返自检 {len(SELF_CHECK)}/{len(SELF_CHECK)}）")
+
+    # 来源 meta：记录 tokenizer.json 是从哪个 GGUF 生成的。运行时据此校验"换模型后忘了
+    # 重跑本工具"的错配（文件名即 sha256 digest，不必重算 1.5GB 文件）。
+    _gguf_base = os.path.basename(path)
+    _digest = _gguf_base[len("sha256-"):] if _gguf_base.startswith("sha256-") else ""
+    if not _digest:
+        _h = hashlib.sha256()
+        with open(path, "rb") as _fh:
+            for _blk in iter(lambda: _fh.read(8 << 20), b""):
+                _h.update(_blk)
+        _digest = _h.hexdigest()
+    _meta_out = os.path.splitext(args.out)[0] + ".meta.json"
+    with open(_meta_out, "w", encoding="utf-8") as _mf:
+        json.dump({
+            "version": 1,
+            "tool": "tools/build_gen_tokenizer.py",
+            "model": args.model if not args.gguf else "",
+            "gguf": _gguf_base,
+            "gguf_sha256": _digest,
+            "pre": meta.get("tokenizer.ggml.pre"),
+            "pre_used": pre_used,
+            "tokens": n_tok,
+            "merges": n_merge,
+            "out": os.path.basename(args.out),
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }, _mf, ensure_ascii=False, indent=2)
+        _mf.write("\n")
+    print(f"写出来源 meta {_meta_out}（gguf_sha256={_digest[:12]}…）")
     print(f"启用：.env 设 RAG_GEN_TOKENIZER_PATH={args.out}")
 
 

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "tool": "tools/build_gen_tokenizer.py",
+  "model": "minicpm5-2b",
+  "gguf": "sha256-ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+  "gguf_sha256": "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+  "pre": "minicpm5",
+  "pre_used": "minicpm5",
+  "tokens": 130560,
+  "merges": 129794,
+  "out": "tokenizer.json",
+  "generated_at": "2026-10-24T17:41:58+0800"
+}

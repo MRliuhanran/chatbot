@@ -76,8 +76,8 @@ _ENV_FALSE = ("0", "false", "no", "off")
 def env_bool(name, default):
     """布尔配置：只认显式真/假集合，其余取值**报错**。
 
-    旧写法把 0/false/no/off 之外的一切都当真：RAG_EXCLUSIVE_MODELS=flase（拼错）、
-    =2、=禁用 都会静默取真，单例、缓存、别名这些开关于是"配了等于没配"，
+    旧写法把 0/false/no/off 之外的一切都当真：RAG_EMBED_CACHE=flase（拼错）、
+    =2、=禁用 都会静默取真，缓存、别名这些开关于是"配了等于没配"，
     且日志里看不出任何异常（失效原型：静默）。与 env_int/env_choice 一样具名报错。
     """
     raw = os.getenv(name)
@@ -209,6 +209,45 @@ def hw_report():
     """审计行：为什么是 N 路（与 hw_profile 的 [hw] 行同一意图，日志里要能一眼归因）。"""
     cores, mem, src = _hw_facts()
     return f"cores={cores} mem={str(mem) + 'MB' if mem else '未知(按内存紧张回退)'} 来源={src}"
+
+
+def _mem_available_mb():
+    """当前可开内存 MB，**取保守口径（宁可报小、绝不报大）**。
+
+    · 坑：Docker 默认不隔离 /proc/meminfo —— 容器里读到的常是**宿主机**的数（宿主可能
+      剩 12G，cgroup 限额 8G 却已被本容器用满）。单信它会误判"有余量"→ 水位豁免放行
+      → 检索与生成同驻 → cgroup OOM kill。因此这里同时读 cgroup 头寸
+      （memory.max - memory.current；v1 用 usage/limit），与宿主 MemAvailable 取 min。
+      报小的失真方向是安全的：current 把可回收的 file 页也算进占用 → 头寸偏小 → gate
+      倾向照卸，不会导向"误判有余量"的死亡方向。
+    · 探测不到（macOS 无 /proc 无 cgroup v2/v1 文件）返回 None —— 调用方必须按
+      "闸门不可用"跳过，而不是拿 None 当无穷大。
+    """
+    readings = []
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    readings.append(int(line.split()[1]) // 1024)
+                    break
+    except Exception:
+        pass
+    for _cur, _lim in (("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+                       ("/sys/fs/cgroup/memory.usage_in_bytes", "/sys/fs/cgroup/memory.limit_in_bytes")):
+        try:
+            with open(_cur, encoding="utf-8") as f1:
+                _u = int(f1.read().strip()) // 1024
+            with open(_lim, encoding="utf-8") as f2:
+                _raw = f2.read().strip()
+            if _raw == "max":
+                continue
+            _lim_kb = int(_raw) // 1024
+            if _lim_kb > (1 << 40):      # v1"未设限额"是一个天文数——按无限处理，不产头寸
+                continue
+            readings.append(max(0, _lim_kb - _u))
+        except Exception:
+            continue
+    return min(readings) if readings else None
 
 
 # 单路离线 worker 的常驻内存量级（解释器 + 库 + 一份工作集）；内存未知 → 只开 1 路（与
@@ -556,21 +595,6 @@ def _chat_options(temperature=None, num_ctx=None, num_predict=None):
     return opts
 
 
-def _keep_alive_value():
-    """Ollama 的 keep_alive：空=不发（用服务端默认）；纯数字=秒；"5m" 之类原样透传。
-
-    单例模式下由 RAG_EXCLUSIVE_MODELS 派生为 0（答完即卸），但也可以显式写
-    RAG_GEN_KEEP_ALIVE=30s 做"半常驻"。服务端 OLLAMA_KEEP_ALIVE 是**另一个**开关
-    （魔塔 entrypoint 默认 -1=永不卸），请求级字段会覆盖它。
-    """
-    if not GEN_KEEP_ALIVE:
-        return None
-    try:
-        return int(GEN_KEEP_ALIVE)
-    except ValueError:
-        return GEN_KEEP_ALIVE
-
-
 # GPU 优先/回落的进程内状态（RAG_GEN_NUM_GPU=auto）。回落是**一次性**的：一旦确认这台机器
 # 起不来 GPU，本进程内所有后续请求都不再尝试，避免每次问答都白等一次失败。
 GEN_AUTO_NUM_GPU = 999
@@ -628,13 +652,9 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
     try:
         # try 内发起请求：requests 缺失/连接失败要走 EVENT_ERROR，而不是从生成器里
         # 抛出去砸消费侧（requests 由 _ollama_session 惰性 import，失败同样落在这层）。
-        # keep_alive 是**请求级**字段（覆盖服务端的 OLLAMA_KEEP_ALIVE）：单例模式下置 0，
-        # 答完让 Ollama 立刻把权重还回去，下一轮检索才不会与生成模型同时驻留。
-        # 未设（GEN_KEEP_ALIVE 为空）时不发该字段，行为与改造前逐字节一致。
+        # 不发请求级 keep_alive：驻留/卸载交给 Ollama 服务端自身策略（上游默认 5m），
+        # 应用层不编排生成模型内存（2026-10-24 定稿：不做互斥/自适应）。
         payload = { "model": MODEL, "messages": messages, "stream": True, "think": use_think, "options": options, }
-        _ka = _keep_alive_value()
-        if _ka is not None:
-            payload["keep_alive"] = _ka
         r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=TIMEOUT, )
         if r.status_code != 200 and _gen_gpu_fallback(f"HTTP {r.status_code} {r.text[:160]!r}"):
             # auto 模式 + 本进程首次：去掉 num_gpu 重发一次。此刻**尚未产出任何 token**
@@ -680,76 +700,17 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
             r.close()
 
 
-# ── 单例协调：生成模型与检索模型的互斥驻留（RAG_EXCLUSIVE_MODELS）──
-def _ollama_loaded_models():
-    """Ollama 当前驻留的模型名（GET /api/ps）。失败抛异常，由调用方决定降级方式。"""
-    r = _ollama_session().get(f"{OLLAMA_BASE_URL}/api/ps", timeout=MODEL_HTTP_TIMEOUT)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code} {r.text[:200]}")
-    data = r.json() if r.text else {}
-    names = []
-    for item in (data or {}).get("models") or []:
-        name = item.get("name") or item.get("model") or ""
-        if name:
-            names.append(name)
-    return names
-
-
-def _model_name_matches(loaded, wanted):
-    """Ollama 的 /api/ps 名字可能带/不带 :latest（或别的 tag）：去掉 tag 后比较。"""
-    a = str(loaded).strip()
-    b = str(wanted).strip()
-    if a == b:
-        return True
-    return bool(a) and a.split(":")[0] == b.split(":")[0]
-
-
-def ensure_generation_unloaded(timeout=None):
-    """单例模式：确认生成模型已从 Ollama 卸出，必要时发一次 keep_alive=0。
-
-    必须在**检索之前**调用——否则检索模型与生成模型同时驻留，峰值回到"两者之和"。
-    超时只告警、不阻断：用户的问题不该因为一次卸载没完成而失败，但这条告警必须显式，
-    因为它意味着本轮内存峰值会超（失效原型：静默降级）。
-    """
-    if not EXCLUSIVE_MODELS:
-        return True
-    _timeout = float(MODEL_HTTP_TIMEOUT if timeout is None else timeout)
-    try:
-        loaded = _ollama_loaded_models()
-    except Exception as exc:
-        log(f"⚠️  单例：读取 Ollama /api/ps 失败，跳过生成模型卸载确认: {type(exc).__name__}: {exc}")
-        return False
-    if not any(_model_name_matches(n, MODEL) for n in loaded):
-        return True
-    log("♻️  单例：生成模型仍驻留，先发 keep_alive=0 让它卸载，再加载检索模型")
-    try:
-        # Ollama 的卸载惯例：不带 prompt 的一次请求 + keep_alive=0（模型已驻留，不会重新加载）
-        _ollama_session().post( f"{OLLAMA_BASE_URL}/api/generate", json={ "model": MODEL, "keep_alive": 0, }, timeout=_timeout, )
-    except Exception as exc:
-        log(f"⚠️  单例：发送卸载请求失败（继续轮询）: {type(exc).__name__}: {exc}")
-    # 轮询用 monotonic：同一文件里 _wait_for_weights 已是 monotonic，两处混用会让
-    # "超时"在系统时钟被调整（NTP/手动改时间）时表现不一致（time.time 会倒退或跳进）。
-    deadline = time.monotonic() + _timeout
-    while time.monotonic() < deadline:
-        try:
-            if not any(_model_name_matches(n, MODEL) for n in _ollama_loaded_models()):
-                return True
-        except Exception as exc:
-            # 读 /api/ps 失败 ≠ 已卸出：旧写法这里直接 return False 且**一个字都不打**，
-            # 与本文档"超时只告警、但这条告警必须显式"自相矛盾 —— 调用方看到的是
-            # "已释放"，实际峰值可能已是两者之和（失效原型：静默降级）。
-            log(f"⚠️  单例：轮询生成模型卸载状态失败，无法确认是否卸出，本轮按未卸出处理: {type(exc).__name__}: {exc}")
-            return False
-        time.sleep(0.5)
-    log(f"⚠️  单例：生成模型 {_timeout:.0f} 秒内未卸出（/api/ps 仍显示它），本轮将与检索模型同时驻留，内存峰值可能超限")
-    return False
+# 内存策略（2026-10-24 定稿）：应用层不做互斥驻留 / 自适应 / 压力闸。
+# 每个进程按自身策略使用内存：Ollama 由服务端 keep_alive（上游默认 5m）自行卸载；
+# 检索模型首次用到后在进程内常驻；Qdrant 自管。OOM 等进程异常由容器 entrypoint 的
+# 进程级巡检就地重启（不重新部署），详见 README §11.4。
 
 
 # ── 通用文本谓词 ──
 def _has_searchable_content(text):
     # 认 Unicode 字母与数字（CJK 的 Lo、数字的 Nd）；标点、符号、零宽等格式字符不算内容。
     # 数字必须算：年份/编号（"1998"、"300 强"、"3.5"）是合法提问，按"仅字母"拦会让它们
-    # 零检索，随后无拒答链路照常生成 —— 正是 AGENTS 点名的"检索为空却照常作答"。
+    # 零检索，随后无拒答链路照常生成 —— 正是 README §10 点名的"检索为空却照常作答"。
     # 不变量是"空查询与纯标点必拦"：纯数字既非空也非标点，不该被这道闸门吃掉。
     if not isinstance(text, str) or not text:
         return False
@@ -852,14 +813,16 @@ MODEL_HTTP_TIMEOUT = env_int_min("RAG_MODEL_HTTP_TIMEOUT", 60, 1)
 RERANK_BACKEND = env_choice("RAG_RERANK_BACKEND", "torch", ("torch", "http"))
 RERANK_URL = (os.getenv("RAG_RERANK_URL") or EMBED_URL).rstrip("/")
 RERANK_MODEL_NAME = (os.getenv("RAG_RERANK_MODEL_NAME") or "bge-reranker-v2-m3").strip() or "bge-reranker-v2-m3"
-# ── 单例（模型互斥驻留）+ 懒加载 ─────────────────────────────────────────────
-# 把峰值从"三者之和"压到"最大阶段"：检索阶段只驻留嵌入+重排，生成阶段只驻留 LLM。
-# RAG_PRELOAD=0 关掉启动预热（懒加载）；RAG_EXCLUSIVE_MODELS=1 打开互斥协调（每轮检索前
-# 确认生成模型已卸、检索完成后释放进程内检索模型）；RAG_GEN_KEEP_ALIVE 决定生成模型答完
-# 是否立刻卸载（0=即卸；空=不发该字段，用 Ollama 服务端默认）。**依赖 PyTorch 真把内存
-# 还给系统**——CPU 上缓存分配器会留着，故这是"8G 机器上跑最高配"的过渡手段，不是容量解。
-EXCLUSIVE_MODELS = env_bool("RAG_EXCLUSIVE_MODELS", False)
-GEN_KEEP_ALIVE = (os.getenv("RAG_GEN_KEEP_ALIVE") or ("0" if EXCLUSIVE_MODELS else "")).strip()
+# ── 驻留策略：不做应用层互斥/自适应（2026-10-24 定稿）──────────────────────────
+# 应用不再编排检索/生成模型的内存装卸：没有 gate（每轮强制卸载确认）、没有水位豁免、
+# 没有压力保险闸、请求也不带 keep_alive。每个进程按自身策略使用内存：
+#   · Ollama：按服务端 OLLAMA_KEEP_ALIVE 自身策略（上游默认 5m）决定生成模型驻留/卸载；
+#   · 检索：懒加载，首次用到后在进程内常驻（不再每轮 release）；
+#   · Qdrant：自身配置管理。
+# 内存不足的现实后果 = 容器内某进程被 OOM kill → entrypoint 进程级巡检发现并就地重启
+# （只重启进程，不重新部署）。这是明确选择的行为；不要在本文件里再加回互斥/自适应/闸门
+# （需求变更先改 README §11.4）。
+# RAG_PRELOAD=0 仍表示启动不预热（懒加载，进程自身行为，与编排无关）。
 # 生成模型的 GPU 层数（llama.cpp 的 -ngl，Ollama 暴露为 options.num_gpu）：
 #   空    = 不发该字段，由 llama.cpp 按**当时**可用显存自动分层（改造前的默认行为）
 #   0     = 全 CPU
@@ -908,6 +871,12 @@ EMBED_BATCH_SIZE = env_int_min("RAG_EMBED_BATCH_SIZE", 1, 1) if _BATCH_RAW else 
 # （已删除）SEMANTIC_EMBED_DEVICE：组件化后不再有"分块期嵌入设备"这一路，全仓无引用；
 # 索引/检索的设备选型仍由 INDEX_DEVICE（空=自动，见 get_device）与各后端决定。
 INDEX_DEVICE = os.getenv("INDEX_DEVICE", "")
+# index/sparse 的可开内存闸门（默认 0 = 不启用；魔塔 8G 档按 .env 显式开启）。阈值语义：
+# 嵌入阶段的实测峰值 ~2.2-3.0G（fp16 batch 16-32），若同机还有 serve/生成模型驻留就会
+# 顶穿 8G —— "重建与服务隔离"这条运维规则在这里用**可开内存**表达，而不是另起进程探测。
+# fail-closed 与 index 单例锁同款：门槛设了、读数低于它 = 明确报错退出；macOS 读不到
+# MemAvailable 时闸门跳过并显式说明（不静默放行成"检查过了"）。
+INDEX_MIN_FREE_MB = env_int_min("RAG_INDEX_MIN_FREE_MB", 0, 0)
 QDRANT_HOST = os.getenv("QDRANT_HOST") or os.getenv("RAG_QDRANT_HOST") or "localhost"
 QDRANT_PORT = env_int_any(6333, "QDRANT_PORT", "RAG_QDRANT_PORT")
 # docker-compose.yml 的 QDRANT__SERVICE__API_KEY 取的就是它：不接这条通路，一旦设置了
@@ -957,6 +926,32 @@ _RECORD_FIELDS = _RECORD_CORE_FIELDS | {SOURCE_FIELD}
 # （_source_filter）、比较器放行（_ALLOWED_CHUNK_FIELDS/_SOURCE_ALIASES）全部派生自它。
 # 旧写法是三份互不派生的字面量 —— 未来改一处漏两处，来源过滤会恒空命中且不报错（静默）。
 SOURCE_PAYLOAD_FIELDS = tuple(dict.fromkeys((SOURCE_FIELD, "source", "book")))
+
+# ── 单轮效益台账（可选诊断，默认关闭）──────────────────────────────────────
+# 每轮一行 JSON（固定字段、追加式），摘要工具 tools/turn_stats.py。默认不开：项目不做
+# 基准测量；需要排查某次/某档性能时临时把 RAG_TURN_STATS=1，看完即关。
+#   · prompt_tokens_est = 装配侧估算的整条 prompt token（message_tokens）
+#   · prompt_eval_count = 服务端实际 prefill 的 token 规模（Ollama done 事件给值）
+# 两者之比 ≈1 → 只有新增段被 prefill；≫1 → 整段重算。
+TURN_STATS_ENABLED = env_bool("RAG_TURN_STATS", False)
+TURN_STATS_FILE = (os.getenv("RAG_TURN_STATS_FILE") or "").strip() or os.path.join(_ARTIFACTS_DIR, "turns.jsonl")
+
+
+def record_turn_stats(fields: dict):
+    """追加一条单轮台账。写失败只告警不抛 —— 故障不能把台账升级成故障源（诊断路径
+    不许崩，与日志 handler 的兜底同一原则）。"""
+    if not TURN_STATS_ENABLED:
+        return
+    try:
+        parent = os.path.dirname(TURN_STATS_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        row = {"ts": round(time.time(), 3)}
+        row.update(fields)
+        with open(TURN_STATS_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        log(f"⚠️  单轮台账写入失败（不影响本轮）: {type(exc).__name__}: {exc}")
 
 
 def _source_of(record):
@@ -2388,6 +2383,23 @@ def build_index():
         VectorParams,
     )
     meta = verify_chunks_freshness()
+    # 内存闸门（RAG_INDEX_MIN_FREE_MB > 0 时启用）：嵌入阶段实测峰值 ~2.2-3.0G，与
+    # serve（进程内检索模型 ~2-3G）或生成模型（131072 档 KV 预留 ≈3G + 权重 1.6G）
+    # 同机并存就会顶穿 8G —— "重建与服务的隔离规则"在这里用可开内存表达，不检测进程。
+    # macOS 探测不到 MemAvailable：闸门跳过但显式说明（不冒充"检查过了"）。
+    _free_mb = _mem_available_mb()
+    if INDEX_MIN_FREE_MB > 0:
+        if _free_mb is None:
+            log(f"⚠️  index 内存闸门：本机读不到 MemAvailable（macOS/容器外），跳过检查（门槛 {INDEX_MIN_FREE_MB}MB 未生效）")
+        elif _free_mb < INDEX_MIN_FREE_MB:
+            raise RuntimeError(
+                f"可开内存 {_free_mb}MB < 门槛 {INDEX_MIN_FREE_MB}MB（RAG_INDEX_MIN_FREE_MB）："
+                f"大概率有 serve/生成模型同机驻留。按 README §11.4 的隔离规则："
+                f"先停生成/检索侧负载再跑 index；确要强行重建请临时把 "
+                f"RAG_INDEX_MIN_FREE_MB 调低后重试（后果自担）"
+            )
+        else:
+            log(f"index 内存闸门: 可开 {_free_mb}MB ≥ 门槛 {INDEX_MIN_FREE_MB}MB")
     with open(CHUNKS_JSON, encoding="utf-8") as f:
         all_chunks = json.load(f)
         # ★ 记录键集必须与当前契约一致：改 RAG_SOURCE_FIELD 后只跑 index（没跑 process）时，
@@ -3008,14 +3020,13 @@ if NUM_CTX <= GEN_INPUT_RESERVE:
 GEN_HISTORY_MAX_TOKENS = env_int_min("RAG_GEN_HISTORY_MAX_TOKENS", 0, 0)
 # 原值"……（已按上下文预算截断）"；按全裸 prompt 配置置空：截断无痕，空内容条照旧被整条丢弃。
 _TRUNCATION_MARK = ""
-# 生成侧精确计数。Ollama 不暴露分词接口（/api/tokenize 恒 404），但**它运行期用的就是
-# llama.cpp**——同一份 GGUF 用 llama-cpp-python 以 vocab_only 加载后分词，与生成端逐字节
-# 一致，且**不需要任何切分规则表**（无需照抄 llama.cpp 的 pre 正则、无需逐模型维护）。
-# 取用优先级：
-#   1) RAG_GEN_GGUF_PATH 指定的 GGUF；2) 按 MODEL 的 Ollama manifest 自动定位的 GGUF；
-#   3) RAG_GEN_TOKENIZER_PATH（tokenizer.json / HF 目录）——离线无 llama-cpp-python 时的回退；
-#   4) 保守估算："1 字=1 token"偏高、不越界但少用窗口。
-# 任一步失败只降级告警，绝不中断生成。
+# 生成侧精确计数。Ollama 不暴露分词接口（/api/tokenize 恒 404），因此直接用模型自带的
+# tokenizer 词表——这是"对应模型自己的方式"，与生成端同源、无需照抄任何切分规则：
+#   1) RAG_GEN_TOKENIZER_PATH 指定的 tokenizer.json / HF 目录（推荐；本项目 tokenizer.json
+#      由 tools/build_gen_tokenizer.py 从模型 GGUF 重建，词表/merges/切分规则均来自模型自身）；
+#   2) 兜底：按 MODEL 的 Ollama manifest 定位 GGUF，用 llama-cpp-python vocab_only 分词；
+#   3) 保守估算：1 字=1 token 偏高、不越界但少用窗口。
+# 任一级失败只降级，不中断生成；日志如实说明用了哪一级。
 GEN_TOKENIZER_PATH = os.getenv("RAG_GEN_TOKENIZER_PATH", "")
 # 显式指定生成模型的 GGUF；留空则按 MODEL 自动定位。
 GEN_GGUF_PATH = os.getenv("RAG_GEN_GGUF_PATH", "")
@@ -3092,11 +3103,47 @@ def _count_tokens(tok, text):
 
 
 def _load_gen_tokenizer_default():
-    """按优先级取生成侧 tokenizer：llama.cpp（GGUF）→ tokenizer.json/HF 目录 → None（估算）。
+    """按优先级取生成侧 tokenizer：模型自带 tokenizer.json → GGUF llama.cpp → None（估算）。
 
     每一级都"加载即验证"（编一次冒烟串）：编不了就当该级失败、降级到下一级，绝不让坏
-    tokenizer 挂上去导致每次调用静默出错。
+    tokenizer 挂上去导致每次调用静默出错。优先 tokenizer.json 是刻意的：它是从模型自身
+    GGUF 重建的标准分词件（tools/build_gen_tokenizer.py，可重放），与生成端同源，也不依赖
+    llama.cpp wheel 对新模型的支持程度。
     """
+    if GEN_TOKENIZER_PATH:
+        # 来源一致性校验（2026-10-24）：tokenizer.json 是派生数据；换模型后若忘记重跑
+        # tools/build_gen_tokenizer.py，这里仍会指向旧模型的词表 → token 预算错算。
+        # 用 meta 里记录的 GGUF sha256 与当前 MODEL 的 GGUF blob 比对（文件名即 digest，
+        # 不重算 1.5GB 文件），不一致就**不用**旧 tokenizer，退回 GGUF/估算（保守安全）。
+        _tok_ok = True
+        _meta_path = os.path.splitext(GEN_TOKENIZER_PATH)[0] + ".meta.json"
+        if os.path.isfile(GEN_TOKENIZER_PATH) and os.path.isfile(_meta_path):
+            try:
+                with open(_meta_path, encoding="utf-8") as fh:
+                    _tmeta = json.load(fh)
+                _want = str(_tmeta.get("gguf_sha256") or "")
+                _cur_gguf = GEN_GGUF_PATH
+                if not _cur_gguf:
+                    try:
+                        _cur_gguf = _find_ollama_gguf(MODEL)
+                    except Exception:
+                        _cur_gguf = ""
+                _cur = os.path.basename(_cur_gguf or "")
+                _cur = _cur[len("sha256-"):] if _cur.startswith("sha256-") else ""
+                if _want and _cur and _want != _cur:
+                    _tok_ok = False
+                    log(f"⚠️  tokenizer.json 与当前 MODEL 的 GGUF 不一致（meta={_want[:12]}… 当前={_cur[:12]}…）："
+                        f"为避免 token 预算错算，改用 GGUF/估算兜底；请重跑 tools/build_gen_tokenizer.py")
+            except Exception as exc:
+                log(f"ℹ️  tokenizer 来源 meta 读取失败（{_meta_path}），跳过一致性校验: {type(exc).__name__}: {exc}")
+        if _tok_ok:
+            try:
+                tok = _load_gen_tokenizer(GEN_TOKENIZER_PATH)
+                _count_tokens(tok, "冒烟")
+                log(f"✅ 生成 tokenizer：{GEN_TOKENIZER_PATH}（模型自带）")
+                return tok
+            except Exception as exc:
+                log(f"⚠️  tokenizer.json 加载失败（{GEN_TOKENIZER_PATH}），尝试 GGUF 兜底: {type(exc).__name__}: {exc}")
     gguf = GEN_GGUF_PATH
     if not gguf:
         try:
@@ -3110,14 +3157,8 @@ def _load_gen_tokenizer_default():
             log(f"✅ 生成 tokenizer：llama.cpp（GGUF={gguf}）")
             return tok
         except Exception as exc:
-            log(f"⚠️  llama.cpp 分词不可用（{gguf}），改用 tokenizer.json: {type(exc).__name__}: {exc}")
-    if GEN_TOKENIZER_PATH:
-        try:
-            tok = _load_gen_tokenizer(GEN_TOKENIZER_PATH)
-            _count_tokens(tok, "冒烟")
-            return tok
-        except Exception as exc:
-            log(f"⚠️  生成 tokenizer 加载失败（{GEN_TOKENIZER_PATH}），退回估算计数: {type(exc).__name__}: {exc}")
+            # 兜底失败是预期分支（wheel 对新 pre-tokenizer 支持滞后）：只降级、不打 ⚠️。
+            log(f"ℹ️  GGUF 分词兜底不可用（{type(exc).__name__}: {exc}），改用估算计数")
     return None
 
 
@@ -3278,7 +3319,7 @@ def build_generation_messages(system, history, query, max_history_tokens, contex
     if context:
         out.append({"role": "user", "content": context})
     out.append({"role": "user", "content": query})
-    # 硬上界不变量：整条 prompt 估算 token 恒 ≤ 输入上界（AGENTS 明文）。
+    # 硬上界不变量：整条 prompt 估算 token 恒 ≤ 输入上界（README §10 明文）。
     # raise 而非 assert：-O 下不失效；估算口径与装配同源，正常路径恒成立，越界即装配 bug。
     if cap is not None and message_tokens(out) > cap:
         raise RuntimeError(f"整条 prompt 估算 {message_tokens(out)} tok 超过输入上界 {cap}")
@@ -3334,7 +3375,11 @@ def plan_generation(results, history, query, num_ctx, use_context=True):
     gen["query_tokens"], gen["over_window"] = q_tokens, bool(over_window or gen["cap_trimmed"])
     if over_window:
         log("⚠️  本轮提问+资料超出输入窗口（历史已全部让位仍不足）：按 system→资料→提问 截到窗口内，提问只截前缀")
-    if message_tokens(gen["messages"]) > int(num_ctx) * 0.9:
+    # prompt 的 token 估算在这里**只算一次**并存进 stats：run_turn 的台账直接取用
+    # （prompt_tokens_est ↔ 服务端 prompt_eval_count，两者比值≈1 说明只有本轮增量被
+    # prefill；≈≫1 说明整段重算——README §11.4 的重载税台账就靠这一对）。
+    gen["prompt_tokens_est"] = message_tokens(gen["messages"])
+    if gen["prompt_tokens_est"] > int(num_ctx) * 0.9:
         log("ℹ️  输入占用窗口超过 90%：生成空间靠服务端上下文移位腾出（从最前面按 token 遗忘，先丢历史/资料前文）")
     return { "system": gen["system_text"], "context": gen["context_text"], "messages": gen["messages"], "stats": gen }
 
@@ -3444,48 +3489,6 @@ class RAGEngine:
                 self._rerank_tok = load_rerank_tokenizer_only()
                 self._rerank_tok_failed = self._rerank_tok is None
             return self._rerank_tok
-    def release_models(self):
-        """单例模式：释放进程内检索模型，把内存让给生成阶段。
-
-        http 后端下模型不在本进程，直接返回 False（没什么可放）。torch 后端丢引用 +
-        gc + 清 MPS/CUDA 缓存；**不保证内存真还给系统**（CPU 上缓存分配器会留着），
-        所以这是 8G 机器上跑最高配的过渡手段，不是容量解。
-        """
-        if EMBED_BACKEND == "http" and RERANK_BACKEND == "http":
-            return False
-        # 必须与**在途前向**互斥：旧写法只取 _model_init_lock 就把引用置 None，而查询
-        # 线程是"先取模型 → 再进推理锁"的两段式 —— 前向可能正拿着刚被清掉的那份跑：
-        # ①释放无效（对象仍被引用，内存不会还，日志却报"已释放"）②另一线程随即重载同一
-        # 模型 = 同模型双份驻留，8G 档"峰值 = max(检索, 生成) 而非两者之和"的前提被打穿。
-        # 先取推理锁（等在途前向结束）再取 init 锁清引用；两把锁的获取顺序在本类里
-        # 只有这一种（init → infer 的路径不存在），不会死锁。
-        with self._model_infer_lock:
-            with self._model_init_lock:
-                if self._embed is None and self._rerank is None:
-                    return False
-                self._embed = None
-                self._rerank = None
-        import gc
-        gc.collect()
-        # ★ CPU 上"释放"必须显式把空闲堆还给 OS：torch/glibc 默认只把内存退回自己的分配器，
-        #   RSS 只涨不落，单例于是名不副实（容器实测：检索模型释放后 python 仍占 ~1.9G，
-        #   生成模型一加载就叠加到 7.9G/8G）。malloc_trim(0) 把所有空闲堆页归还内核 ——
-        #   这是 CPU 容器上让单例真正生效的关键一步；macOS 无此符号（MPS 释放本就有效），跳过。
-        try:
-            import ctypes
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
-        try:
-            import torch
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as exc:
-            log(f"⚠️  释放检索模型后清理缓存失败（不影响正确性）: {type(exc).__name__}: {exc}")
-        log("♻️  单例：已释放进程内检索模型（嵌入/重排），内存让给生成阶段")
-        return True
     def _http_rerank(self, query, documents, top_k):
         """Cohere 风格 /rerank（infinity 等）：客户端做排序与截断，服务端只出分数。
 
@@ -3593,7 +3596,22 @@ class RAGEngine:
             )
         # fail-closed：与分块闸门同理由。词表指纹要读 Qdrant 里的词表点，失败≠暂缓——
         # 计算失败（词表损坏/点缺失）意味着稀疏通道状态未知，安静放行就是静默错配。
-        current = lexicon_fingerprint(self._get_client())
+        # 唯一的分寸在网络抖动（Qdrant 瞬断/超时）：状态未知≠已知不一致，拦截本轮再
+        # 等一轮比 503 报"词表不一致"更符合下游预期——与网络类暂缓口径保持一致。
+        try:
+            current = lexicon_fingerprint(self._get_client())
+        except Exception as exc:
+            _msg = str(exc).lower()
+            _net = (
+                isinstance(exc, (ConnectionError, TimeoutError))
+                or "connect" in _msg
+                or "timed out" in _msg
+                or "timeout" in _msg
+            )
+            if _net:
+                log(f"⚠️  词表指纹网络读取失败，暂缓一致性核对（下轮重试）：{type(exc).__name__}: {exc}")
+                return
+            raise
         if index_lexicon_id == current:
             self._lexicon_checked = True
             return
@@ -3700,12 +3718,11 @@ class RAGEngine:
                 tokenizer, model, device = self._get_embed()
                 # 前向与 rerank 共用同一把推理锁：加载/重排都已按它串行，唯独查询侧前向裸跑
                 # —— 多会话 Streamlit（每个浏览器标签一个脚本线程）下会真并发前向同一模型
-                # （MPS 上争抢命令缓冲，正是 AGENTS 点名的"永久阻塞"级风险）。先取模型再进锁，
+                # （MPS 上争抢命令缓冲，正是 README §10 点名的"永久阻塞"级风险）。先取模型再进锁，
                 # 避免与 _get_embed 内部的同一把锁重入死锁。
                 with self._inference_lock():
-                    # 取到推理锁后复核手里这份仍是当前引用：release_models 会在
-                    # "已取模型、未进锁"的窗口里清引用（见 release_models），不复核就会拿
-                    # 一个内存已交还给系统的对象跑前向，随后再加载第二份。
+                    # 取到推理锁后复核手里这份仍是当前引用：懒加载只在 init 锁内替换引用，
+                    # 两端之间存在检查-使用窗口；不复核就可能拿旧引用跑前向、随后再加载第二份。
                     if self._embed is None or self._embed[1] is not model:
                         tokenizer, model, device = self._get_embed()
                     # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
@@ -3785,9 +3802,8 @@ class RAGEngine:
         else:
             rr_tok, rr_model, rr_dev = self._get_rerank()
             with self._inference_lock():
-                # 复核：release_models 可能在"已取模型、未进锁"的窗口里把引用清掉，此刻
-                # 手里这份已是孤儿对象（内存正在回收）—— 继续用 = 释放无效 + 随后重载出
-                # 第二份同模型（双份驻留）。取到推理锁后按当前引用核对，不一致就重取。
+                # 复核：懒加载只在 init 锁内替换引用，两端之间存在检查-使用窗口；取到推理锁
+                # 后按当前引用核对，不一致就重取，避免拿旧引用跑前向 + 随后重载第二份。
                 if self._rerank is None or self._rerank[1] is not rr_model:
                     rr_tok, rr_model, rr_dev = self._get_rerank()
                 reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
@@ -3880,19 +3896,12 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     _raw_predict = int(NUM_PREDICT if num_predict is None else num_predict)
     request_predict = _raw_predict if _raw_predict > 0 else -1
     started = time.time()
-    # 单例（RAG_EXCLUSIVE_MODELS=1）：检索前先确认生成模型已卸，峰值才是 max(检索, 生成)
-    # 而不是两者之和。非单例下是空操作，行为与改造前逐字节一致。
-    # 返回值必须消费：False = 卸载确认没做成（/api/ps 读不到，或超时仍未卸出），本轮
-    # 检索与生成模型会同时驻留、峰值超限。既有取舍是**不阻断**本轮，所以只记日志；
-    # 旧写法直接丢掉返回值，这条告警在调用链上无处可查（失效原型：静默）。
-    if not ensure_generation_unloaded():
-        log("⚠️  单例：本轮未能确认生成模型已卸出，检索与生成模型可能同时驻留，内存峰值可能超限（不阻断本轮）")
+    # 本函数不再做内存编排（无 gate/卸载/release，2026-10-24 定稿）：
+    # 检索模型首次加载后常驻，生成模型驻留由 Ollama 服务端策略决定；进程异常由 entrypoint
+    # 的进程级巡检就地重启（README §11.4）。
     results = engine.hybrid_search(query, top_k=top_k, source=source)
     confidence = results_confidence(results)
     elapsed = time.time() - started
-    # 检索已完成、生成将开始：放掉进程内检索模型（http 后端下模型不在本进程，是 no-op）
-    if EXCLUSIVE_MODELS:
-        engine.release_models()
     plan = plan_generation(results, history, query, num_ctx, use_context=use_context)
     # 唯一事件契约：首事件恒为 RETRIEVAL，之后 thinking/delta/error/done；检索为空也照常生成。
     # 诊断只报**实际发出**的内容：gen（plan["stats"]）就是装配真正执行后统计出来的
@@ -3902,12 +3911,61 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     # 预算参数必须真的进请求（见 stream_chat 文档）：chat 可调用对象须接受这两个关键字。
     # **无重试、无长度/时间闸**：本轮生成原样转发，窗口（num_ctx）与上下文移位是唯一边界；
     # 空答 / done_reason=length / 报错照原样交给上层（空答不入历史、错误照常显式）。
+    _gen_t0 = time.time()
+    _done_info = None
+    _error_text = None
     for kind, delta in chat(plan["messages"], num_ctx=num_ctx, num_predict=request_predict):
         if kind == EVENT_DELTA:
             answer_chars += len(delta)
         elif kind == EVENT_DONE:
+            # done 的字段在台账里被消费前先快照（本函数要捕 done_reason/计数，转发的
+            # dict 会继续携带原字段，消费方无感知差异）
+            _done_info = {
+                "done_reason": (delta or {}).get("done_reason"),
+                "eval_count": (delta or {}).get("eval_count"),
+                "prompt_eval_count": (delta or {}).get("prompt_eval_count"),
+            }
             delta = { **delta, "answer_chars": answer_chars, "elapsed": elapsed, }
+        elif kind == EVENT_ERROR:
+            _error_text = str(delta)[:300]
         yield kind, delta
+    # ── 单轮台账（可选诊断）：done = 一次完整"检索→生成"循环；
+    # error = 失败轮；两者都不落 = 被 Stop 中断（上游 close，本轮已知许不完整，不记）──
+    _status = "done" if _done_info is not None else ("error" if _error_text else "stopped")
+    if _status != "stopped":
+        # prompt 估算由 plan_generation 算好存在 stats 里（整轮只算一次），这里直接取用
+        _prompt_tok_est = plan["stats"].get("prompt_tokens_est")
+        if _prompt_tok_est is None:
+            _prompt_tok_est = message_tokens(plan["messages"])
+        record_turn_stats({
+            "status": _status,
+            "num_ctx": num_ctx,
+            "request_predict": request_predict,
+            "history_turns": len(history or []),
+            "retrieval_elapsed": round(elapsed, 3),
+            "gen_elapsed": round(time.time() - _gen_t0, 3),
+            "prompt_tokens_est": _prompt_tok_est,
+            "history_tokens": plan["stats"].get("used_tokens"),
+            "context_tokens": plan["stats"].get("context_tokens"),
+            "query_tokens": plan["stats"].get("query_tokens"),
+            "over_window": bool(plan["stats"].get("over_window")),
+            "answer_chars": answer_chars,
+            "prompt_eval_count": (_done_info or {}).get("prompt_eval_count"),
+            "eval_count": (_done_info or {}).get("eval_count"),
+            "done_reason": (_done_info or {}).get("done_reason"),
+            "error": _error_text,
+        })
+        if _done_info is not None:
+            log(
+                "🧾 单轮台账: "
+                f"prompt_eval_count={_done_info.get('prompt_eval_count')} "
+                f"prompt_tokens_est={_prompt_tok_est} "
+                f"eval_count={_done_info.get('eval_count')} answer_chars={answer_chars} "
+                f"done_reason={_done_info.get('done_reason')!r} "
+                f"retrieval={elapsed:.1f}s"
+            )
+        else:
+            log(f"🧾 单轮台账: {_error_text}")
 
 
 def cmd_process(args=None):
@@ -3978,7 +4036,12 @@ def _pid_alive(pid, since=None):
         return True
     if since is not None:
         elapsed = _ps_etime_seconds(pid)
-        if elapsed is not None:
+        if elapsed is None:
+            # 观测工具缺席（精简容器无 ps）≠ 进程死了：按"活着"保守处理不会被误抢。
+            # 但要把判据缺席说出来——否则陈旧锁需人工清理时，用户不知道为何判不了。
+            log(f"⚠️  pid={pid} 的启动时长读取失败（ps 缺席或不可执行）："
+                "PID 复用判据不可用，按仍存活处理；确认无重建在跑后可手动删锁")
+        else:
             started = datetime.datetime.now() - datetime.timedelta(seconds=elapsed)
             if started > since:
                 log(f"⚠️  pid={pid} 的启动时刻（{started:%Y-%m-%d %H:%M:%S}）晚于锁写入时刻"
@@ -4104,7 +4167,8 @@ def _corpus_has_searchable_content():
             text = read_book_text(path)
         except Exception:
             continue
-        if text and text.strip():
+        # 去 BOM（\ufeff 不是 str.strip() 的字符集成员，必须显式剥）：与 docstring 同一口径
+        if text.lstrip("\ufeff").strip():
             return True
     return False
 
@@ -4416,7 +4480,15 @@ def run_streamlit():
     if st.session_state["collection_count"] == 0:
         # 同 _qdrant_gate：0 条不一定是"没建库"——corpus 空目录是清空语义的合法终态，
         # 让会话原样跑空知识库（检索零命中走纯对话兜底），语料非空才报错指路。
-        if _corpus_has_searchable_content():
+        # 语料全目录扫描跟随 collection_count 的 TTL 失效（B3 同款：TTL 内不重扫，防
+        # 每次 rerun 都 O(corpus)——用户放/删文档最多一个 TTL 后被识别）。
+        _corp = st.session_state.get("corpus_has_content")
+        _corp_ts = st.session_state.get("corpus_check_ts", 0)
+        if _corp is None or COLLECTION_COUNT_TTL_S <= 0 or _now - _corp_ts >= COLLECTION_COUNT_TTL_S:
+            _corp = _corpus_has_searchable_content()
+            st.session_state["corpus_has_content"] = _corp
+            st.session_state["corpus_check_ts"] = _now
+        if _corp:
             st.error("向量库为空，先跑：python chatbot.py process && python chatbot.py index")
             st.stop()
         st.info(
@@ -4472,10 +4544,6 @@ def _warm_engine(engine):
                 # 回落状态，首个真实问答就不必再白等一次失败。
                 _probe_options["num_gpu"] = _ng_probe
             _probe_payload = { "model": MODEL, "messages": [{"role": "user", "content": ""}], "stream": False, "think": False, "options": _probe_options, }
-            _ka = _keep_alive_value()
-            if _ka is not None:
-                # 单例模式下预热探针也必须答完即卸，否则"预热"本身就把生成模型常驻了
-                _probe_payload["keep_alive"] = _ka
             r = _ollama_session().post( API_URL, json=_probe_payload, timeout=TIMEOUT, )
             if r.status_code != 200:
                 _gen_gpu_fallback(f"预热 HTTP {r.status_code} {r.text[:160]!r}")

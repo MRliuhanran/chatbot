@@ -25,11 +25,11 @@ Streamlit），结果自检占住 7860 端口 85~240 秒，平台健康探针等
 
 退出码恒 0：自检失败只是告警，服务照常提供（首查询冷加载兜底）。
 """
+import json
 import os
 import subprocess
 import sys
 import time
-import json
 import urllib.request
 
 ENV_PATH = "/app/.env" if os.path.exists("/app/.env") else \
@@ -91,9 +91,8 @@ def _log(msg):
 def stage_generation(model, num_ctx, base_url):
     """A 段：最小生成探针（不导入 chatbot）。返回是否通过。
 
-    keep_alive=0：探针答完即卸，不把 ~5.2G 的 llama-server 常驻在 8G 容器里
-    （常驻会压缩真实查询「检索阶段 python + 生成阶段 llama」的余量）。这与业务单例
-    模式（RAG_GEN_KEEP_ALIVE=0）的取向一致，验证 KV 能分配、能出字即可。
+    不指定 keep_alive：驻留策略交给 Ollama 服务端自身（与业务侧一致，应用不做内存编排）。
+    探针只验证 KV 能分配、能出字。
     """
     url = base_url.rstrip("/") + "/api/chat"
     payload = {
@@ -101,7 +100,6 @@ def stage_generation(model, num_ctx, base_url):
         "messages": [{"role": "user", "content": "自检：请回复 ok"}],
         "stream": False,
         "think": False,
-        "keep_alive": 0,
         "options": {"num_ctx": num_ctx, "num_predict": 8},
     }
     req = urllib.request.Request(
@@ -142,8 +140,6 @@ def stage_full():
     _log(f"B 检索：命中 {len(results)} 个父块，{time.time() - t0:.1f}s")
     for item in results[:1]:
         _log(f"B Top1 来源={item.get('source')!r} rerank={item.get('rerank_score')}")
-    if chatbot.EXCLUSIVE_MODELS:
-        engine.release_models()
     plan = chatbot.plan_generation(results, [], QUERY, chatbot.NUM_CTX)
     stats = plan.get("stats") or {}
     _log(f"B 装配：context_docs_kept={stats.get('context_docs_kept')} "
