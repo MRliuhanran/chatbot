@@ -3088,7 +3088,16 @@ def _load_gen_tokenizer(path):
             from tokenizers import Tokenizer
             return Tokenizer.from_file(_tj)
         except Exception:
-            pass  # 旧版 tokenizers 读不了新格式时，走下面的 AutoTokenizer（若版本匹配）
+            pass  # 旧版 tokenizers 读不了新格式时，先试兼容副本，再走 AutoTokenizer
+    _tj_legacy = os.path.join(path, "tokenizer.legacy.json")
+    if os.path.isfile(_tj_legacy):
+        try:
+            from tokenizers import Tokenizer
+            tok = Tokenizer.from_file(_tj_legacy)
+            log("ℹ️  官方 tokenizer 与当前 tokenizers 版本不兼容，使用兼容派生副本（同词表，计数差 ~0.006%）")
+            return tok
+        except Exception:
+            pass
     last = None
     try:
         from transformers import AutoTokenizer

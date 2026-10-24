@@ -9,5 +9,7 @@
   },
   "tokenizer_sha256": "3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81",
   "note": "官方 tokenizer 文件（ModelScope 下载，未改字节）；换模型时下载对应官方 tokenizer 并更新本文件",
-  "generated_at": "2026-10-24T17:51:15+0800"
+  "generated_at": "2026-10-24T17:51:15+0800",
+  "legacy_file": "tokenizer.legacy.json",
+  "legacy_sha256": "34a233635a38647e968416593b48db4c856c2473f915d3d6b7a6872f5cf2f214"
 }

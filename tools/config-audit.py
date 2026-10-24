@@ -10,6 +10,8 @@
 退出码：0 = 一致；1 = 有漂移/旧键（deploy-check 据此 fail-closed）。
 """
 
+import hashlib
+import json
 import os
 import re
 import sys
@@ -104,6 +106,35 @@ def main():
                 problems.append(
                     f"模型键两源不一致：{k}  .env={env[k]!r}  tools/bake.env={bake[k]!r}"
                 )
+
+    # tokenizer 来源一致性：官方 tokenizer 文件必须与 meta 的模型名/哈希一致
+    tok_path = (env.get("RAG_GEN_TOKENIZER_PATH") or "").strip()
+    if tok_path:
+        base = tok_path if os.path.isabs(tok_path) else os.path.join(ROOT, tok_path)
+        if os.path.isdir(base):
+            meta_path = os.path.join(base, "tokenizer.meta.json")
+            tok_file = os.path.join(base, "tokenizer.json")
+        else:
+            meta_path = os.path.splitext(base)[0] + ".meta.json"
+            tok_file = base
+        if not os.path.isfile(meta_path):
+            problems.append(f"RAG_GEN_TOKENIZER_PATH 缺少来源 meta：{meta_path}")
+        else:
+            try:
+                with open(meta_path, encoding="utf-8") as fh:
+                    tmeta = json.load(fh)
+                m_model = str(tmeta.get("model") or "").strip().lower()
+                e_model = str(env.get("MODEL") or "").strip().lower()
+                if m_model and e_model and m_model != e_model:
+                    problems.append(f"tokenizer 与 MODEL 不一致：meta={m_model!r}  .env MODEL={e_model!r}")
+                want = str(tmeta.get("tokenizer_sha256") or "")
+                if want and os.path.isfile(tok_file):
+                    with open(tok_file, "rb") as fh:
+                        got = hashlib.sha256(fh.read()).hexdigest()
+                    if want != got:
+                        problems.append("tokenizer.json 哈希与 meta 不一致（文件被改/未同步）")
+            except Exception as exc:
+                problems.append(f"tokenizer meta 读取失败：{type(exc).__name__}: {exc}")
 
     print(f"配置审计：.env 生效键 {len(env)} 个；bake.env 生效键 {len(bake)} 个")
     if problems:

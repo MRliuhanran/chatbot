@@ -48,7 +48,7 @@ license: apache-2.0
 | `chatbot.py` | 业务代码单文件（约 4100 行），按依赖顺序分节，见第 3 节 |
 | `.env` | 配置覆盖层（代码默认值为唯一权威，见第 7 节） |
 | `corpus/` | 语料目录（默认 `RAG_DATA_DIR`，`*.txt`） |
-| `artifacts/` | 离线产物：`chunks.json` + `chunks.meta.json`（分块与切分指纹）、`docs/`（逐文档分块缓存）、`embeddings/`（稠密向量缓存）、`gen_tokenizer/`（生成模型**官方 tokenizer 文件**：tokenizer.json/config + meta） |
+| `artifacts/` | 离线产物：`chunks.json` + `chunks.meta.json`（分块与切分指纹）、`docs/`（逐文档分块缓存）、`embeddings/`（稠密向量缓存）、`gen_tokenizer/`（生成模型**官方 tokenizer 文件** + 旧版 tokenizers 兼容副本 tokenizer.legacy.json） |
 | `lexicon/` | 领域词表：`aliases.txt`（别名归一）、`stopwords.txt`，整表替换即可换领域 |
 | `models/` | 本地模型权重（嵌入、重排） |
 | `storage/`、`qdrant_config/` | Qdrant 数据与配置 |
