@@ -5,6 +5,10 @@ Ollama 不提供分词接口（/api/tokenize 404），本机又常无外网；GG
 merges。本工具**纯标准库**解析 GGUF 元数据，用 tokenizers 重建 GPT-2 式 BPE，产出可直接
 喂给 RAG_GEN_TOKENIZER_PATH 的 tokenizer.json。
 
+**定位：离线兜底工具**。主路径是模型官方的 tokenizer 文件（见 .env / README：可从
+ModelScope/HuggingFace 模型仓库直接下载 tokenizer.json + config）；只有模型没有可下载的
+官方 tokenizer 时，才用本工具从 GGUF 重建。
+
 切分规则**不再写死某一模型**：读 GGUF 的 `tokenizer.ggml.pre`，按 llama.cpp
 (src/llama-vocab.cpp 的 llm_tokenizer_bpe) 同款正则自动匹配（Qwen / Llama3 / DeepSeek /
 Falcon / Starcoder / GPT-2 系 等）。换 Ollama 模型只需重跑本工具，不必改代码。

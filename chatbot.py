@@ -3071,16 +3071,24 @@ class _LlamaCppTokenizer:
 
 
 def _load_gen_tokenizer(path):
-    """加载生成模型 tokenizer。两条官方来源都吃：
+    """加载生成模型 tokenizer（官方标准件优先，所有模型通用）：
 
-    - 文件（如 `tokenizer.json`，Qwen 仓库/GGUF 导出的标准件）→ 直接用 `tokenizers`；
-    - 目录（HF 下载目录）→ 先 transformers.AutoTokenizer，失败再退回目录里的 tokenizer.json。
+    - 文件（tokenizer.json）→ tokenizers.Tokenizer.from_file；
+    - 目录：先读目录里的 tokenizer.json（tokenizers，最轻、不依赖 transformers），
+      再退 transformers.AutoTokenizer（兼容 SentencePiece 等没有 tokenizer.json 的模型）。
 
-    都不需要模型权重，几个 MB 的文件即可；与 transformers 的完整依赖解耦。
+    两者都只读模型官方的分词文件，不做任何 GGUF/词表重建；与 transformers 的完整依赖解耦。
     """
     if os.path.isfile(path):
         from tokenizers import Tokenizer
         return Tokenizer.from_file(path)
+    _tj = os.path.join(path, "tokenizer.json")
+    if os.path.isfile(_tj):
+        try:
+            from tokenizers import Tokenizer
+            return Tokenizer.from_file(_tj)
+        except Exception:
+            pass  # 旧版 tokenizers 读不了新格式时，走下面的 AutoTokenizer（若版本匹配）
     last = None
     try:
         from transformers import AutoTokenizer
@@ -3089,7 +3097,7 @@ def _load_gen_tokenizer(path):
         last = exc
     try:
         from tokenizers import Tokenizer
-        return Tokenizer.from_file(os.path.join(path, "tokenizer.json"))
+        return Tokenizer.from_file(_tj)
     except Exception:
         raise last if last is not None else RuntimeError("tokenizer 加载失败")
 
@@ -3116,12 +3124,19 @@ def _load_gen_tokenizer_default():
         # 用 meta 里记录的 GGUF sha256 与当前 MODEL 的 GGUF blob 比对（文件名即 digest，
         # 不重算 1.5GB 文件），不一致就**不用**旧 tokenizer，退回 GGUF/估算（保守安全）。
         _tok_ok = True
-        _meta_path = os.path.splitext(GEN_TOKENIZER_PATH)[0] + ".meta.json"
-        if os.path.isfile(GEN_TOKENIZER_PATH) and os.path.isfile(_meta_path):
+        if os.path.isdir(GEN_TOKENIZER_PATH):
+            _meta_path = os.path.join(GEN_TOKENIZER_PATH, "tokenizer.meta.json")
+            _tok_file = os.path.join(GEN_TOKENIZER_PATH, "tokenizer.json")
+        else:
+            _meta_path = os.path.splitext(GEN_TOKENIZER_PATH)[0] + ".meta.json"
+            _tok_file = GEN_TOKENIZER_PATH
+        if os.path.isfile(_tok_file) and os.path.isfile(_meta_path):
             try:
                 with open(_meta_path, encoding="utf-8") as fh:
                     _tmeta = json.load(fh)
                 _want = str(_tmeta.get("gguf_sha256") or "")
+                _meta_model = str(_tmeta.get("model") or "").strip().lower()
+                _cur_model = str(MODEL or "").strip().lower()
                 _cur_gguf = GEN_GGUF_PATH
                 if not _cur_gguf:
                     try:
@@ -3130,10 +3145,23 @@ def _load_gen_tokenizer_default():
                         _cur_gguf = ""
                 _cur = os.path.basename(_cur_gguf or "")
                 _cur = _cur[len("sha256-"):] if _cur.startswith("sha256-") else ""
+                _bad_reason = ""
                 if _want and _cur and _want != _cur:
+                    _bad_reason = f"GGUF 不一致（meta={_want[:12]}… 当前={_cur[:12]}…）"
+                elif _meta_model and _cur_model and _meta_model != _cur_model:
+                    _bad_reason = f"模型名不一致（meta={_meta_model!r} 当前={_cur_model!r}）"
+                if _bad_reason:
                     _tok_ok = False
-                    log(f"⚠️  tokenizer.json 与当前 MODEL 的 GGUF 不一致（meta={_want[:12]}… 当前={_cur[:12]}…）："
-                        f"为避免 token 预算错算，改用 GGUF/估算兜底；请重跑 tools/build_gen_tokenizer.py")
+                    log(f"⚠️  tokenizer 与当前 MODEL 不匹配：{_bad_reason}；"
+                        f"为避免 token 预算错算，改用 GGUF/估算兜底；请更新 artifacts/gen_tokenizer/ 的官方 tokenizer")
+                _want_sha = str(_tmeta.get("tokenizer_sha256") or "")
+                if _tok_ok and _want_sha:
+                    import hashlib
+                    with open(_tok_file, "rb") as _fh:
+                        _got_sha = hashlib.sha256(_fh.read()).hexdigest()
+                    if _want_sha != _got_sha:
+                        _tok_ok = False
+                        log(f"⚠️  tokenizer.json 校验失败（meta={_want_sha[:12]}… 实际={_got_sha[:12]}…），改用 GGUF/估算兜底")
             except Exception as exc:
                 log(f"ℹ️  tokenizer 来源 meta 读取失败（{_meta_path}），跳过一致性校验: {type(exc).__name__}: {exc}")
         if _tok_ok:
@@ -3144,6 +3172,8 @@ def _load_gen_tokenizer_default():
                 return tok
             except Exception as exc:
                 log(f"⚠️  tokenizer.json 加载失败（{GEN_TOKENIZER_PATH}），尝试 GGUF 兜底: {type(exc).__name__}: {exc}")
+                log("   提示：官方 tokenizer.json 需要 tokenizers>=0.21.2（requirements.txt 已锁）；"
+                    "本地环境过旧时请先 pip install -r requirements.txt")
     gguf = GEN_GGUF_PATH
     if not gguf:
         try:

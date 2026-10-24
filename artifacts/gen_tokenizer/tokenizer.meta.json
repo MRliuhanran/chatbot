@@ -1,13 +1,13 @@
 {
-  "version": 1,
-  "tool": "tools/build_gen_tokenizer.py",
+  "version": 2,
+  "source": "modelscope:OpenBMB/MiniCPM5-2B@master",
   "model": "minicpm5-2b",
-  "gguf": "sha256-ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
-  "gguf_sha256": "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
-  "pre": "minicpm5",
-  "pre_used": "minicpm5",
-  "tokens": 130560,
-  "merges": 129794,
-  "out": "tokenizer.json",
-  "generated_at": "2026-10-24T17:41:58+0800"
+  "files": {
+    "tokenizer.json": "3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81",
+    "tokenizer_config.json": "e9b1064649e771d7a8e15637c68b2d2749724877ba3648bd74a4ece31c26303b",
+    "special_tokens_map.json": "82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db"
+  },
+  "tokenizer_sha256": "3e065a558a034185fe299917b398685c1facd0169a9eea1e629eb30c171fed81",
+  "note": "官方 tokenizer 文件（ModelScope 下载，未改字节）；换模型时下载对应官方 tokenizer 并更新本文件",
+  "generated_at": "2026-10-24T17:51:15+0800"
 }

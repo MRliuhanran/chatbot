@@ -48,7 +48,7 @@ license: apache-2.0
 | `chatbot.py` | 业务代码单文件（约 4100 行），按依赖顺序分节，见第 3 节 |
 | `.env` | 配置覆盖层（代码默认值为唯一权威，见第 7 节） |
 | `corpus/` | 语料目录（默认 `RAG_DATA_DIR`，`*.txt`） |
-| `artifacts/` | 离线产物：`chunks.json` + `chunks.meta.json`（分块与切分指纹）、`docs/`（逐文档分块缓存）、`embeddings/`（稠密向量缓存）、`gen_tokenizer/`（生成模型 tokenizer） |
+| `artifacts/` | 离线产物：`chunks.json` + `chunks.meta.json`（分块与切分指纹）、`docs/`（逐文档分块缓存）、`embeddings/`（稠密向量缓存）、`gen_tokenizer/`（生成模型**官方 tokenizer 文件**：tokenizer.json/config + meta） |
 | `lexicon/` | 领域词表：`aliases.txt`（别名归一）、`stopwords.txt`，整表替换即可换领域 |
 | `models/` | 本地模型权重（嵌入、重排） |
 | `storage/`、`qdrant_config/` | Qdrant 数据与配置 |
@@ -142,7 +142,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 | 分块 | `RAG_PARENT_MAX_TOKENS`(512)、`RAG_CHILD_MAX_TOKENS`(128)、`RAG_CHUNK_OVERLAP`(32) |
 | 检索 | `RAG_TOP_K`、`RAG_RERANK_TOP_K`、`RAG_RERANK_BATCH`、`RAG_RRF_SPARSE_WEIGHT` |
 | 检索模型后端 | `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND`（`torch`=进程内，`http`=infinity 服务）、`RAG_EMBED_URL`、`RAG_EMBED_MODEL_PATH`、`RAG_RERANK_MODEL_PATH` |
-| 生成 | `MODEL`、`RAG_NUM_CTX`、`RAG_NUM_PREDICT`(0=不限长)、`RAG_THINK`、`RAG_TEMPERATURE`(0=贪心)、`RAG_GEN_NUM_GPU`（`auto`=GPU 优先失败回落 CPU）、`OLLAMA_TIMEOUT` |
+| 生成 | `MODEL`、`RAG_NUM_CTX`、`RAG_NUM_PREDICT`(0=不限长)、`RAG_THINK`、`RAG_TEMPERATURE`(0=贪心)、`RAG_GEN_NUM_GPU`（`auto`=GPU 优先失败回落 CPU）、`RAG_GEN_TOKENIZER_PATH`（模型官方 tokenizer 目录/文件）、`OLLAMA_TIMEOUT` |
 | 运行态与巡检 | 应用不做内存编排（无互斥/自适应/请求级 keep_alive；§11.4）、`RAG_PRELOAD`（0=启动不预热）、`RAG_INDEX_MIN_FREE_MB`（离线重建内存闸门）、`RAG_TURN_STATS`（可选台账，默认 0）、entrypoint 进程级巡检（`RAG_WATCHDOG_INTERVAL`/`RAG_WATCHDOG_FAILS`） |
 | 索引与路径 | `RAG_COLLECTION_BASE`、`RAG_COLLECTION_ALIAS`、`RAG_ARTIFACTS_DIR`、`RAG_LEXICON_DIR` |
 
@@ -166,7 +166,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 | `eval_retrieval.py` | 检索基线对拍（来源命中率 / top-k 一致性） |
 | `rerank_parity.py` | 进程内重排与 `/v1/rerank` 分数比对 |
 | `prepare_infinity_view.py` | 为 infinity 生成模型影子视图（不动真实权重目录） |
-| `build_gen_tokenizer.py` | 从 GGUF 离线抽出生成模型 tokenizer |
+| `build_gen_tokenizer.py` | 从 GGUF 离线重建生成 tokenizer（仅模型没有官方 tokenizer 时的兜底；主路径是官方 tokenizer 文件） |
 | `turn_stats.py` | 可选单轮台账摘要（`turns.jsonl` → 检索/生成耗时 p50/p95、prefill 比值；默认关闭） |
 
 ## 10. 约束与不变量
