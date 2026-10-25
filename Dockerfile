@@ -8,6 +8,7 @@
 # 运行:
 #   docker run --rm -p 7860:7860 rag-chatbot:modelscope
 ARG PYTHON_VERSION=3.10
+ARG HF_ENDPOINT=https://hf-mirror.com
 
 # ── 直接复用官方镜像里的二进制，避免 RUN 下载/解压 ──
 FROM qdrant/qdrant:v1.19.1 AS qdrant
@@ -22,16 +23,21 @@ RUN ["pip","install","--no-cache-dir","cmake","ninja"]
 RUN ["pip","install","--no-cache-dir","--index-url","https://download.pytorch.org/whl/cpu","torch==2.7.1"]
 RUN ["pip","install","--no-cache-dir","-r","/tmp/requirements.txt"]
 
-# ── 资产 stage：与 pydeps 并行；同一份源码/模型/产物打进镜像 ──
-# 注意：ModelScope 构建前需确保 models/ 与 ollama_models/ 在构建上下文里
-#       （本地构建时 ollama_models 可从 ~/.ollama/models 复制）。
+# ── 检索模型 stage：不依赖 git 里是否有 models/，构建期从 HF 镜像下载 ──
+# 与 pydeps / assets 并行；产物目录与本地 models/ 同名，指纹保持一致。
+FROM python:${PYTHON_VERSION} AS fetchmodels
+ENV HF_ENDPOINT=${HF_ENDPOINT}
+RUN ["pip","install","--no-cache-dir","huggingface_hub==0.33.2"]
+RUN ["python","-c","from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-m3', local_dir='/models/bge-m3', local_dir_use_symlinks=False); snapshot_download(repo_id='BAAI/bge-reranker-v2-m3', local_dir='/models/bge-reranker-v2-m3', local_dir_use_symlinks=False)"]
+
+# ── 资产 stage：与 pydeps 并行；源码/产物/配置 ──
+# ollama_models 必须在构建上下文里（ModelScope 需 LFS/持久盘；本地可从 ~/.ollama/models 复制）。
 FROM scratch AS assets
 COPY .env /app/.env
 COPY corpus/ /app/corpus/
 COPY artifacts/ /app/artifacts/
 COPY lexicon/ /app/lexicon/
 COPY .streamlit/ /app/.streamlit/
-COPY models/ /app/models/
 COPY ollama_models/ /app/ollama_models/
 COPY qdrant_config/ /app/qdrant_config/
 COPY storage/ /app/storage/
@@ -47,11 +53,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     RAG_HTTP_PORT=7860 \
     OLLAMA_MODELS=/app/ollama_models
 WORKDIR /app
+RUN ["apt-get","update"]
+RUN ["apt-get","install","-y","--no-install-recommends","libunwind8"]
 COPY --from=pydeps /usr/local/lib/python3.10/site-packages/ /usr/local/lib/python3.10/site-packages/
 COPY --from=pydeps /usr/local/bin/ /usr/local/bin/
 COPY --from=qdrant /qdrant/qdrant /usr/local/bin/qdrant
 COPY --from=ollama /usr/bin/ollama /usr/local/bin/ollama
 COPY --from=ollama /usr/lib/ollama /usr/lib/ollama
+COPY --from=fetchmodels /models /app/models
 COPY --from=assets /app/ /app/
 COPY chatbot.py /app/chatbot.py
 EXPOSE 7860

@@ -39,7 +39,7 @@
 ## 2. 快速开始
 
 ~~~bash
-# 1) 起 Qdrant + Ollama + 应用（已在跑的复用）
+# 1) 起 Qdrant + Ollama + 应用（只复用本脚本启动的进程；外部实例会报错）
 ./start.sh start
 
 # 2) 首次或语料变化后：分块 + 建索引（需要 Qdrant 在跑）
@@ -51,6 +51,8 @@ open http://127.0.0.1:8501
 ~~~
 
 应用启动时校验索引与分块指纹；不一致会拒绝检索并提示重跑命令，这是有意的 fail-closed。
+
+> `start.sh` 的复用判据是“pid 文件 + 命令行匹配”，不是只看端口健康：外部/旧进程占着 8501/6333/11434 会被拒绝，避免假发布。
 
 ## 3. 常用命令
 
@@ -130,26 +132,37 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 ### 7.2 构建与运行
 
-构建前确认构建上下文里有与本地一致的三份资产：
+构建前只要求一份外部资产：**Ollama 模型**。检索模型由构建阶段从 HF 镜像下载，不依赖 git 里是否有 `models/`。
 
 | 资产 | 来源 |
 |---|---|
-| `models/` | 本地 `models/bge-m3`、`models/bge-reranker-v2-m3` |
-| `ollama_models/` | 从 `~/.ollama/models` 复制（ModelScope 构建前也要放进去） |
+| `ollama_models/` | 从 `~/.ollama/models` 复制到仓库（ModelScope 走 LFS/持久盘）；或运行时用 `-v` 挂载 |
 | `artifacts/` + `storage/` | 本地已建好的分块产物与 Qdrant 数据（保证指纹一致） |
+| `models/` | **不需要**进构建上下文：`fetchmodels` stage 构建期下载 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3` |
 
 ~~~bash
+# 方式 A：Ollama 模型已放在 ollama_models/ 构建上下文
 docker build -t rag-chatbot:modelscope .
 docker run --rm -p 7860:7860 rag-chatbot:modelscope
+
+# 方式 B：不把模型打进镜像，运行时挂载宿主机 Ollama 模型
+docker run --rm -p 7860:7860 \
+  -v "$HOME/.ollama/models:/app/ollama_models:ro" rag-chatbot:modelscope
 # 打开 http://127.0.0.1:7860
 ~~~
+
+> 检索模型由 `fetchmodels` stage 从 HF 镜像下载（默认 `HF_ENDPOINT=https://hf-mirror.com`）；
+> 网络受限时可用 `--build-arg HF_ENDPOINT=https://huggingface.co` 或改用可达镜像。
+> 容器启动时若 `OLLAMA_MODELS` 下没有任何 manifest，`chatbot.py all` 会直接退出并给出提示，
+> 不会让 Ollama 起来后问答 404。
 
 容器内 `chatbot.py all` 会：
 
 1. 并行启动 Qdrant 与 Ollama；
 2. 等 `/healthz` 与 `/api/version` 就绪；
 3. 启动 Streamlit（`0.0.0.0:7860`）；
-4. 任一子进程退出 → 2s 后就地重启；收到 SIGTERM 优雅终止。
+4. 任一子进程退出 → 指数退避后就地重启（最长 30s）；收到 SIGTERM 优雅终止。
+5. Qdrant/Ollama 120s 内不健康 → 容器直接退出（不启动半残应用）。
 
 ### 7.3 数据更新
 
@@ -165,14 +178,14 @@ docker exec -it <container> python chatbot.py stages
 
 ### 7.4 功能、性能、效果
 
-- **功能同源**：同一份 `chatbot.py`、`.env`、`models/`、`artifacts/`、`storage/`；没有 torch/http 或 CPU/GPU 的代码分叉。
+- **功能同源**：同一份 `chatbot.py`、`.env`、`artifacts/`、`storage/`；检索模型构建期下载同 HF 仓库，Ollama 模型由构建上下文/卷提供；没有 torch/http 或 CPU/GPU 的代码分叉。
 - **效果一致**：检索模型、重排模型、生成模型、切分/索引参数都相同，质量口径一致。
 - **性能不可能完全一致**：本地是 Metal/MPS，ModelScope 是 2vCPU 纯 CPU；重排、索引、首字延迟会明显慢于本机。这是硬件差异，不是代码差异。
 - 单容器 8G 档注意 `RAG_NUM_CTX`；OOM 时 `all` 会重启被杀的子进程（与本地 start.sh 的巡检语义一致）。
 
 ### 7.5 并行
 
-- **构建并行**：`pydeps`（依赖）与 `assets`（模型/语料/产物）两个 stage 互不依赖，BuildKit 默认并行；最后 `app` 合并。
+- **构建并行**：`pydeps`（依赖）、`fetchmodels`（检索模型下载）、`assets`（语料/产物）三个 stage 互不依赖，BuildKit 默认并行；最后 `app` 合并。
 - **运行并行**：`chatbot.py all` 先并行拉起 Qdrant 与 Ollama，健康后再启动 Streamlit。
 
 ## 8. 常见问题

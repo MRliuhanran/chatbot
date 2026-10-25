@@ -59,6 +59,18 @@ _running_pid() {
     printf '%s' "${_pid}"
 }
 
+# 只复用“本脚本启动的进程”：pid 文件活着 + 命令行匹配。健康端点本身不证明身份，
+# 否则别的服务/旧进程占着端口会被误当成发布成功（假发布）。
+_owned_pid() {
+    local _file="${1}" _marker="${2}" _pid _cmd
+    _pid="$(_running_pid "${_file}")" || return 1
+    _cmd="$(ps -ww -p "${_pid}" -o command= 2>/dev/null || true)"
+    case "${_cmd}" in
+        *"${_marker}"*) printf '%s' "${_pid}" ;;
+        *) return 1 ;;
+    esac
+}
+
 _wait_http() {
     local _url="${1}" _name="${2}" _pidfile="${3}" _logfile="${4}" _timeout="${5}" _i
     for _i in $(seq 1 "${_timeout}"); do
@@ -116,8 +128,11 @@ _check_backends() {
 
 _start_qdrant() {
     if _http_ok "${QDRANT_URL}/healthz"; then
-        _log "Qdrant 已在运行（复用）"
-        return 0
+        if _owned_pid "${QDRANT_PID}" "qdrant" >/dev/null; then
+            _log "Qdrant 已在运行（本脚本实例，复用）"
+            return 0
+        fi
+        _die "6333 上有健康服务，但不是本脚本启动的 Qdrant；先停止外部实例再 start"
     fi
     [ -x "${QDRANT_BIN}" ] || _die "缺少 Qdrant 可执行文件: ${QDRANT_BIN}（下载后放到 .bin/qdrant/qdrant，或设 QDRANT_BIN）"
     mkdir -p "${ROOT}/storage"
@@ -132,8 +147,11 @@ _start_qdrant() {
 
 _start_ollama() {
     if _http_ok "${OLLAMA_URL}/api/version"; then
-        _log "Ollama 已在运行（复用；改 .env 的 OLLAMA_* 后需 stop 再 start）"
-        return 0
+        if _owned_pid "${OLLAMA_PID}" "ollama serve" >/dev/null; then
+            _log "Ollama 已在运行（本脚本实例，复用；改 .env 的 OLLAMA_* 后需 stop 再 start）"
+            return 0
+        fi
+        _die "11434 上有健康服务，但不是本脚本启动的 Ollama；先停止外部实例再 start"
     fi
     command -v ollama >/dev/null 2>&1 || _die "PATH 里找不到 ollama"
     _log "启动 Ollama"
@@ -145,8 +163,11 @@ _start_ollama() {
 
 _start_app() {
     if _http_ok "${APP_URL}/_stcore/health"; then
-        _log "应用已在运行（复用；改代码/改 .env 后需 stop 再 start）"
-        return 0
+        if _owned_pid "${APP_PID}" "chatbot.py" >/dev/null; then
+            _log "应用已在运行（本脚本实例，复用；改代码/改 .env 后需 stop 再 start）"
+            return 0
+        fi
+        _die "${APP_PORT} 上有健康服务，但不是本脚本启动的 Streamlit；先停止外部实例再 start"
     fi
     [ -f "${ROOT}/chatbot.py" ] || _die "缺少 chatbot.py"
     _log "启动 Streamlit 应用"
@@ -182,19 +203,23 @@ _stop_all() {
 }
 
 _status_one() {
-    local _name="${1}" _url="${2}" _file="${3}" _pid
+    local _name="${1}" _url="${2}" _file="${3}" _marker="${4}" _pid
     if _http_ok "${_url}"; then
-        _pid="$(_running_pid "${_file}" || true)"
-        printf '✅ %-8s 健康  %s  pid=%s\n' "${_name}" "${_url}" "${_pid:-外部实例}"
+        _pid="$(_owned_pid "${_file}" "${_marker}" || true)"
+        if [ -n "${_pid}" ]; then
+            printf '✅ %-8s 健康  %s  本脚本 pid=%s\n' "${_name}" "${_url}" "${_pid}"
+        else
+            printf '⚠️  %-8s 健康  %s  外部实例（start 会拒绝复用）\n' "${_name}" "${_url}"
+        fi
     else
         printf '❌ %-8s 未响应 %s\n' "${_name}" "${_url}"
     fi
 }
 
 _status_all() {
-    _status_one "Qdrant" "${QDRANT_URL}/healthz" "${QDRANT_PID}"
-    _status_one "Ollama" "${OLLAMA_URL}/api/version" "${OLLAMA_PID}"
-    _status_one "应用" "${APP_URL}/_stcore/health" "${APP_PID}"
+    _status_one "Qdrant" "${QDRANT_URL}/healthz" "${QDRANT_PID}" "qdrant"
+    _status_one "Ollama" "${OLLAMA_URL}/api/version" "${OLLAMA_PID}" "ollama serve"
+    _status_one "应用" "${APP_URL}/_stcore/health" "${APP_PID}" "chatbot.py"
 }
 
 _detect_hw() {

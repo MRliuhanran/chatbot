@@ -17,3 +17,6 @@ artifacts/embeddings/
 artifacts/docs/
 artifacts/opencode-sessions/
 artifacts/turns.jsonl
+models/
+storage/**/wal/closed-*
+storage/**/wal/open-*

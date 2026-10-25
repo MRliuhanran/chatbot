@@ -148,28 +148,48 @@ def _probe_positive_int(name):
     return val if val > 0 else None
 
 
-def _hw_profile_module():
-    """按文件路径 import tools/hw_profile.py（不依赖包结构与 CWD）；失败返回 None。
+def _cgroup_facts():
+    """从 cgroup v2/v1 读取 CPU 配额与内存上限（容器内机器事实）。
 
-    **机器事实只此一处实现**：容器 entrypoint 与 tools/run_local.sh 走它导出的 HW_*；
-    裸跑 `python chatbot.py process|index|sparse`（不经过那两个入口）时环境里没有 HW_*，
-    这里直接取同一份 detect() —— 两条路径同一份实现，不会各探一套而分叉。
+    tools/hw_profile.py 已删除；这里保留最小实现，避免 Docker 容器把 2vCPU/8G
+    误判成 4 核/内存未知。探测失败返回 (None, None)，由 _hw_facts 走安全回退。
     """
-    import importlib.util
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "hw_profile.py")
+    cores = None
+    mem_mb = None
     try:
-        spec = importlib.util.spec_from_file_location("_rag_hw_profile", path)
-        if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
+        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as f:
+            quota, period = f.read().split()[:2]
+        if quota != "max" and int(period) > 0:
+            cores = max(1, (int(quota) + int(period) - 1) // int(period))
     except Exception:
-        return None
+        try:
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as f:
+                quota = int(f.read().strip())
+            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as f:
+                period = int(f.read().strip())
+            if quota > 0 and period > 0:
+                cores = max(1, (quota + period - 1) // period)
+        except Exception:
+            pass
+    try:
+        for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    raw = f.read().strip()
+            except OSError:
+                continue
+            if raw and raw != "max":
+                limit = int(raw)
+                if 0 < limit < (1 << 60):
+                    mem_mb = limit // (1024 * 1024)
+                    break
+    except Exception:
+        pass
+    return cores, mem_mb
 
 
 def _hw_facts():
-    """(核数, 内存MB, 来源串)。环境变量优先 → tools/hw_profile.detect() → 安全回退。"""
+    """(核数, 内存MB, 来源串)。环境变量优先 → cgroup → 线程族回退 → 安全回退。"""
     cached = _HW_PROBE.get("facts")
     if cached:
         return cached
@@ -181,19 +201,13 @@ def _hw_facts():
     if mem:
         src.append(f"HW_MEM_MB={mem}")
     if not cores or not mem:
-        facts: dict = {}
-        mod = _hw_profile_module()
-        if mod is not None:
-            try:
-                facts = mod.detect() or {}
-            except Exception:
-                facts = {}
-        if not cores and facts.get("cores"):
-            cores = int(facts["cores"])
-            src.append(f"hw_profile.detect()←{facts.get('src_cores', '?')}")
-        if not mem and facts.get("mem_mb"):
-            mem = int(facts["mem_mb"])
-            src.append(f"hw_profile.detect()←{facts.get('src_mem', '?')}")
+        cg_cores, cg_mem = _cgroup_facts()
+        if not cores and cg_cores:
+            cores = cg_cores
+            src.append(f"cgroup→{cg_cores}核")
+        if not mem and cg_mem:
+            mem = cg_mem
+            src.append(f"cgroup→{cg_mem}MB")
     if not cores:
         # 最后兜底：线程族也是"这台机器能用几个核"的另一份结论，直接沿用
         for name in ("HW_THREADS", "TORCH_NUM_THREADS", "OMP_NUM_THREADS"):
@@ -212,7 +226,7 @@ def hw_cores():
 
 
 def hw_mem_mb():
-    """可用内存（MB）；未知返回 None（调用方按"内存紧张"处理，与 hw_profile 同一回退）。"""
+    """可用内存（MB）；未知返回 None（调用方按"内存紧张"处理）。"""
     return _hw_facts()[1]
 
 
@@ -4374,24 +4388,19 @@ def _streamlit_pids():
     return [int(p) for p in out.split() if p.isdigit() and int(p) != os.getpid()]
 
 
-def _document_paths():
-    """corpus 文档清单：与 build_segments 同一选路（DATA_DIR × DOC_GLOB），目录缺失=空。"""
-    import glob as _glob
-    if not os.path.isdir(DATA_DIR):
-        return []
-    return sorted(
-        p for p in _glob.glob(os.path.join(DATA_DIR, DOC_GLOB), recursive=True)
-        if os.path.isfile(p)
-    )
-
-
 def _corpus_has_searchable_content():
     """corpus 是否至少有一份文档含可检索内容（去 BOM/空白后的纯标点不算，同 build_chunks）。
 
     与**查询谓词** _has_searchable_content(text)（拦纯标点查询，见 line 742 附近）名分明确：
     前者判语料、后者判单个查询字符串，导出的语义不同，必须两个名字。
     """
-    for path in _document_paths():
+    try:
+        paths = _document_paths()
+    except FileNotFoundError:
+        # 目录缺失不是"语料为空"：交给上层按"未构建/配置错误"报出来，
+        # 不能在这里把两者混成同一个"空语料"出口（否则会静默清库）。
+        return True
+    for path in paths:
         try:
             text = read_book_text(path)
         except Exception:
@@ -4485,6 +4494,16 @@ def _wait_http_ready(name, url, timeout):
     return False
 
 
+
+def _ollama_models_present(models_dir):
+    """Ollama 模型目录是否至少有一个 manifest（避免容器起来后生成 404 才发现）。"""
+    manifests = os.path.join(models_dir or "", "manifests")
+    for _root, _dirs, files in os.walk(manifests):
+        if files:
+            return True
+    return False
+
+
 def cmd_all(args=None):
     """单容器入口（ModelScope）：Qdrant + Ollama + Streamlit 三进程，带健康等待与自愈。
 
@@ -4505,6 +4524,10 @@ def cmd_all(args=None):
     env.setdefault("OLLAMA_MODELS", os.path.join(root, "ollama_models"))
     env.setdefault("QDRANT_HOST", "127.0.0.1")
     env.setdefault("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    if not _ollama_models_present(env.get("OLLAMA_MODELS", "")):
+        log("❌ [all] OLLAMA_MODELS 里没有任何模型 manifest："
+            "把 ~/.ollama/models 内容放进构建上下文 ollama_models/（或运行时挂载到 /app/ollama_models）")
+        return 1
 
     specs = {
         "qdrant": [qdrant_bin, "--config-path", os.path.join(root, "qdrant_config", "config.yaml")],
@@ -4532,19 +4555,43 @@ def cmd_all(args=None):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    spawn("qdrant")
-    spawn("ollama")
-    _wait_http_ready("qdrant", "http://127.0.0.1:6333/healthz", 120)
-    _wait_http_ready("ollama", "http://127.0.0.1:11434/api/version", 120)
-    spawn("app")
+    try:
+        spawn("qdrant")
+        spawn("ollama")
+    except OSError as exc:
+        log(f"❌ [all] 子进程启动失败: {type(exc).__name__}: {exc}")
+        return 1
 
+    qdrant_ok = _wait_http_ready("qdrant", "http://127.0.0.1:6333/healthz", 120)
+    ollama_ok = _wait_http_ready("ollama", "http://127.0.0.1:11434/api/version", 120)
+    if not (qdrant_ok and ollama_ok):
+        for process in children.values():
+            process.terminate()
+        log("❌ [all] 依赖未就绪，容器退出（交由平台重启）")
+        return 1
+
+    try:
+        spawn("app")
+    except OSError as exc:
+        log(f"❌ [all] 应用启动失败: {type(exc).__name__}: {exc}")
+        return 1
+
+    restarts: dict = {}
     while not stopping["value"]:
         for name, process in list(children.items()):
             code = process.poll()
             if code is not None:
-                log(f"⚠️  [all] {name} 退出（code={code}），2s 后就地重启")
-                time.sleep(2)
-                spawn(name)
+                attempt = restarts.get(name, 0) + 1
+                restarts[name] = attempt
+                delay = min(30, 2 ** min(attempt, 5))
+                log(f"⚠️  [all] {name} 退出（code={code}），{delay}s 后就地重启")
+                time.sleep(delay)
+                try:
+                    spawn(name)
+                except OSError as exc:
+                    log(f"❌ [all] {name} 重启失败: {type(exc).__name__}: {exc}")
+                    stopping["value"] = True
+                    break
         time.sleep(2)
 
     log("[all] 收到停止信号，终止子进程")
