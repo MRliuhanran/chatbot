@@ -1,16 +1,14 @@
 .git
 .venv
-models/
-storage/
-qdrant_storage/
-snapshots/
 .bin/
+chromedriver/
+snapshots/
+qdrant_storage/
 *.log
 *.pid
 __pycache__/
 *.pyc
 .streamlit/secrets.toml*
-.env
 start.sh
 README.md
 tools/
@@ -19,4 +17,3 @@ artifacts/embeddings/
 artifacts/docs/
 artifacts/opencode-sessions/
 artifacts/turns.jsonl
-qdrant_config/

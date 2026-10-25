@@ -4464,6 +4464,100 @@ def cmd_serve(args=None):
     os.execv(sys.executable, [ sys.executable, "-m", "streamlit", "run", __file__, "--server.address", "127.0.0.1", "--server.port", "8501", "--server.headless", "true", ])
 
 
+def _http_ready(url, timeout=1.0):
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 500
+    except Exception:
+        return False
+
+
+def _wait_http_ready(name, url, timeout):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _http_ready(url):
+            log(f"[all] {name} 就绪: {url}")
+            return True
+        time.sleep(1)
+    log(f"⚠️  [all] {name} {timeout}s 未就绪: {url}")
+    return False
+
+
+def cmd_all(args=None):
+    """单容器入口（ModelScope）：Qdrant + Ollama + Streamlit 三进程，带健康等待与自愈。
+
+    本地原生请用 start.sh；容器里没有 shell/entrypoint，由本命令直接 exec 三个子进程。
+    功能/配置/模型与本地同源：都读同一份 .env、同一份 models/ 与 artifacts/。
+    """
+    import signal
+    import subprocess
+    import time
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    env = os.environ.copy()
+    port = env.get("RAG_HTTP_PORT", "7860")
+    qdrant_bin = env.get("QDRANT_BIN", "/usr/local/bin/qdrant")
+    ollama_bin = env.get("OLLAMA_BIN", "/usr/local/bin/ollama")
+    env.setdefault("QDRANT__SERVICE__HOST", "127.0.0.1")
+    env.setdefault("QDRANT__STORAGE__STORAGE_PATH", os.path.join(root, "storage"))
+    env.setdefault("OLLAMA_MODELS", os.path.join(root, "ollama_models"))
+    env.setdefault("QDRANT_HOST", "127.0.0.1")
+    env.setdefault("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+
+    specs = {
+        "qdrant": [qdrant_bin, "--config-path", os.path.join(root, "qdrant_config", "config.yaml")],
+        "ollama": [ollama_bin, "serve"],
+        "app": [
+            sys.executable, "-m", "streamlit", "run", os.path.join(root, "chatbot.py"),
+            "--server.address", "0.0.0.0", "--server.port", port, "--server.headless", "true",
+        ],
+    }
+    for name in ("qdrant", "ollama"):
+        if not os.path.exists(specs[name][0]):
+            log(f"❌ [all] 缺少 {name} 可执行文件: {specs[name][0]}")
+            return 1
+
+    children: dict = {}
+    stopping = {"value": False}
+
+    def spawn(name):
+        log(f"[all] 启动 {name}: {' '.join(specs[name])}")
+        children[name] = subprocess.Popen(specs[name], cwd=root, env=env)
+
+    def stop(_signum, _frame):
+        stopping["value"] = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    spawn("qdrant")
+    spawn("ollama")
+    _wait_http_ready("qdrant", "http://127.0.0.1:6333/healthz", 120)
+    _wait_http_ready("ollama", "http://127.0.0.1:11434/api/version", 120)
+    spawn("app")
+
+    while not stopping["value"]:
+        for name, process in list(children.items()):
+            code = process.poll()
+            if code is not None:
+                log(f"⚠️  [all] {name} 退出（code={code}），2s 后就地重启")
+                time.sleep(2)
+                spawn(name)
+        time.sleep(2)
+
+    log("[all] 收到停止信号，终止子进程")
+    for process in children.values():
+        process.terminate()
+    for process in children.values():
+        try:
+            process.wait(timeout=10)
+        except Exception:
+            process.kill()
+    return 0
+
+
 # ── 交互入口：Streamlit 主界面 ──
 def _render_stored_message(msg):
     """历史消息渲染：思维链与正文同栏输出、不做任何区分（只有 RAG_THINK 开启时才会入历史）。"""
@@ -5590,7 +5684,7 @@ def cmd_stages(args=None):
 
 
 # ── 命令分发 ──
-COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
+COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "all": cmd_all, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "stages": cmd_stages, }
 
 
 def _build_parser():

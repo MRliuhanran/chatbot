@@ -2,18 +2,17 @@
 
 本仓库是一个**本机单用户**的 RAG 问答应用：对本地 `corpus/` 的 `*.txt` 做分块、建稠密 + BM25 稀疏索引，在线用双通道召回 → RRF → 重排 → 上下文预算装配，交给 Ollama 流式生成；前端是 Streamlit。
 
-代码与脚本按“一个 shell、一个 Python、一个 README”组织；Docker 部署只额外增加 Dockerfile / compose 配置：
+代码与脚本按“一个 shell、一个 Python、一个 README”组织；ModelScope 部署只额外增加**一个 Dockerfile**（不使用 compose）：
 
 | 文件 | 作用 |
 |---|---|
 | **chatbot.py** | 唯一 Python 文件：CLI + Streamlit + 全部业务逻辑 |
 | **start.sh** | 唯一 shell 文件：Qdrant / Ollama / 应用起停、日志、命令透传、.env 加载 |
 | **README.md** | 唯一 Markdown 文档 |
-| **Dockerfile** | 无 shell 的镜像构建（RUN 全 exec-form，无 entrypoint.sh） |
-| **docker-compose.yml** | qdrant / ollama / app 三容器并行启动 |
+| **Dockerfile** | 单容器 ModelScope 镜像（Qdrant + Ollama + Streamlit，无 shell、无 entrypoint.sh） |
 | `.env` | 配置覆盖层（代码默认值为唯一权威） |
 | `requirements.txt` | 运行时依赖（全量 `==` 锁定） |
-| `corpus/` `models/` `artifacts/` `storage/` `lexicon/` | 语料 / 模型 / 分块产物 / Qdrant 数据 / 词表 |
+| `corpus/` `models/` `ollama_models/` `artifacts/` `storage/` `lexicon/` | 语料 / 检索模型 / Ollama 模型 / 分块产物 / Qdrant 数据 / 词表 |
 | `qdrant_config/` `.streamlit/` | 本地 Qdrant 与应用配置 |
 
 > 支持两种运行方式：本机原生（`start.sh`）或 Docker Compose（`Dockerfile` + `docker-compose.yml`）。完整版（含 tools/ 辅助脚本与旧部署文件）保留在 git tag `backup/pre-minimal-20261025`。
@@ -115,51 +114,66 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 产物由指纹绑定：切分指纹、词表指纹、稠密缓存键。**不要改名/加装饰器/改空白**到 `chatbot.py` 中 `_CHUNKING_CODE_UNITS`、`_embed_code_fingerprint`、`lexicon_fingerprint` 列出的函数——`inspect.getsource` 变化会触发全量重建。
 
-## 7. Docker 部署（无 shell + 并行）
+## 7. ModelScope 部署：一个 Dockerfile（无 compose / 无 shell）
 
-### 7.1 Dockerfile 里没有 shell
+本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三个进程由 `chatbot.py all` 管理（源码里的进程管理器，不是 shell 脚本），不依赖 compose。
+
+### 7.1 Dockerfile 约束
 
 - 所有 `RUN` 都是 **exec form**：`RUN ["pip","install",...]`，不经过 `/bin/sh -c`；
-- 不 `COPY` 任何 shell 脚本；没有 `entrypoint.sh`；
-- 容器入口直接 exec Streamlit：`ENTRYPOINT ["python","-m","streamlit",...]`；
-- `HEALTHCHECK` 同样是 exec form（`python -c ...`）。
+- 不 COPY 任何 shell 脚本；没有 `entrypoint.sh`；
+- 唯一入口：`ENTRYPOINT ["python","chatbot.py","all"]`；
+- qdrant / ollama 二进制直接从官方镜像 COPY，不在 Dockerfile 里下载/解压；
+- `HEALTHCHECK` 也是 exec form（`python -c ...`）。
 
-> 说明：pip/apt 内部仍会执行各自脚本，但 Dockerfile 本身没有 shell 形式的命令行。
+> pip 等包管理器内部仍会执行自己的脚本，但 Dockerfile 本身没有 shell 形式的命令行。
 
-### 7.2 并行在哪里
+### 7.2 构建与运行
 
-- **BuildKit 并行 stage**：`pydeps`（依赖安装）与 `assets`（语料/产物/词表复制）互不依赖，默认并行构建；最后 `app` 合并两者。
-- **Compose 并行服务**：`qdrant` 与 `ollama` 同时启动并各自健康检查；`app` 等两者健康后启动。
-- 构建与启动都走 Docker 命令：
+构建前确认构建上下文里有与本地一致的三份资产：
 
-~~~bash
-# 并行拉取/构建/启动
-docker compose up -d --build
-docker compose ps
-docker compose logs -f app
-
-# 单独观察并行构建
-docker buildx build --progress=plain -t rag-chatbot:local .
-~~~
-
-### 7.3 首次/数据更新（全部 Docker 命令）
+| 资产 | 来源 |
+|---|---|
+| `models/` | 本地 `models/bge-m3`、`models/bge-reranker-v2-m3` |
+| `ollama_models/` | 从 `~/.ollama/models` 复制（ModelScope 构建前也要放进去） |
+| `artifacts/` + `storage/` | 本地已建好的分块产物与 Qdrant 数据（保证指纹一致） |
 
 ~~~bash
-docker compose up -d --build
-
-# 分块 + 建索引；artifacts 以 rw 卷挂载，结果直接落宿主
-docker compose run --rm --entrypoint python app chatbot.py process
-docker compose run --rm --entrypoint python app chatbot.py index
-
-# 自检
-docker compose run --rm --entrypoint python app chatbot.py stages
+docker build -t rag-chatbot:modelscope .
+docker run --rm -p 7860:7860 rag-chatbot:modelscope
+# 打开 http://127.0.0.1:7860
 ~~~
 
-- 卷挂载：`corpus:ro`、`artifacts:rw`、`lexicon:ro`、`models:ro`；Qdrant 数据在 `./storage`。
-- Ollama 模型挂宿主 `~/.ollama/models:ro`，请先在宿主机 `ollama pull <MODEL>`。
-- `.env` 通过 compose `env_file` 注入；`QDRANT_HOST` / `OLLAMA_BASE_URL` 由 compose 覆盖为服务名。
-- `.dockerignore` 排除了 `models/`、`storage/`、`artifacts/embeddings`、`artifacts/docs` 等，构建上下文只有源码与必要产物。
-- 当前 `.env` 是 `torch` 后端，容器内进程内推理，不需要 infinity。
+容器内 `chatbot.py all` 会：
+
+1. 并行启动 Qdrant 与 Ollama；
+2. 等 `/healthz` 与 `/api/version` 就绪；
+3. 启动 Streamlit（`0.0.0.0:7860`）；
+4. 任一子进程退出 → 2s 后就地重启；收到 SIGTERM 优雅终止。
+
+### 7.3 数据更新
+
+推荐与本地一致的路径：**本地 process/index → 重新 build 镜像 → 重新部署**，这样 `artifacts/` 与 `storage/` 始终同源。
+
+也可以进入运行中的容器执行（注意 8G 档内存，重建期间会与生成/检索争内存）：
+
+~~~bash
+docker exec -it <container> python chatbot.py process
+docker exec -it <container> python chatbot.py index
+docker exec -it <container> python chatbot.py stages
+~~~
+
+### 7.4 功能、性能、效果
+
+- **功能同源**：同一份 `chatbot.py`、`.env`、`models/`、`artifacts/`、`storage/`；没有 torch/http 或 CPU/GPU 的代码分叉。
+- **效果一致**：检索模型、重排模型、生成模型、切分/索引参数都相同，质量口径一致。
+- **性能不可能完全一致**：本地是 Metal/MPS，ModelScope 是 2vCPU 纯 CPU；重排、索引、首字延迟会明显慢于本机。这是硬件差异，不是代码差异。
+- 单容器 8G 档注意 `RAG_NUM_CTX`；OOM 时 `all` 会重启被杀的子进程（与本地 start.sh 的巡检语义一致）。
+
+### 7.5 并行
+
+- **构建并行**：`pydeps`（依赖）与 `assets`（模型/语料/产物）两个 stage 互不依赖，BuildKit 默认并行；最后 `app` 合并。
+- **运行并行**：`chatbot.py all` 先并行拉起 Qdrant 与 Ollama，健康后再启动 Streamlit。
 
 ## 8. 常见问题
 
