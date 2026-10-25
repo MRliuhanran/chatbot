@@ -1,0 +1,67 @@
+# ── Docker Compose：三容器并行启动 ─────────────────────────────────────
+# qdrant / ollama 独立启动并各自健康检查；app 等两者健康后启动。
+# 构建 app 时 BuildKit 会并行构建 Dockerfile 的 pydeps 与 assets 两个 stage。
+# 全部用 Docker 命令，不依赖 start.sh 或 entrypoint.sh。
+name: rag-chatbot
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.19.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - ./storage:/qdrant/storage
+      - ./qdrant_config/config.yaml:/qdrant/config/production.yaml:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  ollama:
+    image: ollama/ollama:0.34.4
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - "${HOME}/.ollama/models:/root/.ollama/models:ro"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rag-chatbot:local
+    restart: unless-stopped
+    init: true
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST: qdrant
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - ./models:/app/models:ro
+      - ./corpus:/app/corpus:ro
+      - ./artifacts:/app/artifacts
+      - ./lexicon:/app/lexicon:ro
+    ports:
+      - "127.0.0.1:7860:7860"
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/_stcore/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s

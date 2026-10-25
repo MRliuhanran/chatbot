@@ -2,19 +2,21 @@
 
 本仓库是一个**本机单用户**的 RAG 问答应用：对本地 `corpus/` 的 `*.txt` 做分块、建稠密 + BM25 稀疏索引，在线用双通道召回 → RRF → 重排 → 上下文预算装配，交给 Ollama 流式生成；前端是 Streamlit。
 
-按“一个 shell、一个 Python、一个 README”组织：
+代码与脚本按“一个 shell、一个 Python、一个 README”组织；Docker 部署只额外增加 Dockerfile / compose 配置：
 
 | 文件 | 作用 |
 |---|---|
 | **chatbot.py** | 唯一 Python 文件：CLI + Streamlit + 全部业务逻辑 |
 | **start.sh** | 唯一 shell 文件：Qdrant / Ollama / 应用起停、日志、命令透传、.env 加载 |
 | **README.md** | 唯一 Markdown 文档 |
+| **Dockerfile** | 无 shell 的镜像构建（RUN 全 exec-form，无 entrypoint.sh） |
+| **docker-compose.yml** | qdrant / ollama / app 三容器并行启动 |
 | `.env` | 配置覆盖层（代码默认值为唯一权威） |
 | `requirements.txt` | 运行时依赖（全量 `==` 锁定） |
 | `corpus/` `models/` `artifacts/` `storage/` `lexicon/` | 语料 / 模型 / 分块产物 / Qdrant 数据 / 词表 |
 | `qdrant_config/` `.streamlit/` | 本地 Qdrant 与应用配置 |
 
-> 本版本面向本机原生运行，不含 Docker/compose/远程部署脚本；完整版保留在 git tag `backup/pre-minimal-20261025`。
+> 支持两种运行方式：本机原生（`start.sh`）或 Docker Compose（`Dockerfile` + `docker-compose.yml`）。完整版（含 tools/ 辅助脚本与旧部署文件）保留在 git tag `backup/pre-minimal-20261025`。
 
 ## 1. 环境准备
 
@@ -113,7 +115,53 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 产物由指纹绑定：切分指纹、词表指纹、稠密缓存键。**不要改名/加装饰器/改空白**到 `chatbot.py` 中 `_CHUNKING_CODE_UNITS`、`_embed_code_fingerprint`、`lexicon_fingerprint` 列出的函数——`inspect.getsource` 变化会触发全量重建。
 
-## 7. 常见问题
+## 7. Docker 部署（无 shell + 并行）
+
+### 7.1 Dockerfile 里没有 shell
+
+- 所有 `RUN` 都是 **exec form**：`RUN ["pip","install",...]`，不经过 `/bin/sh -c`；
+- 不 `COPY` 任何 shell 脚本；没有 `entrypoint.sh`；
+- 容器入口直接 exec Streamlit：`ENTRYPOINT ["python","-m","streamlit",...]`；
+- `HEALTHCHECK` 同样是 exec form（`python -c ...`）。
+
+> 说明：pip/apt 内部仍会执行各自脚本，但 Dockerfile 本身没有 shell 形式的命令行。
+
+### 7.2 并行在哪里
+
+- **BuildKit 并行 stage**：`pydeps`（依赖安装）与 `assets`（语料/产物/词表复制）互不依赖，默认并行构建；最后 `app` 合并两者。
+- **Compose 并行服务**：`qdrant` 与 `ollama` 同时启动并各自健康检查；`app` 等两者健康后启动。
+- 构建与启动都走 Docker 命令：
+
+~~~bash
+# 并行拉取/构建/启动
+docker compose up -d --build
+docker compose ps
+docker compose logs -f app
+
+# 单独观察并行构建
+docker buildx build --progress=plain -t rag-chatbot:local .
+~~~
+
+### 7.3 首次/数据更新（全部 Docker 命令）
+
+~~~bash
+docker compose up -d --build
+
+# 分块 + 建索引；artifacts 以 rw 卷挂载，结果直接落宿主
+docker compose run --rm --entrypoint python app chatbot.py process
+docker compose run --rm --entrypoint python app chatbot.py index
+
+# 自检
+docker compose run --rm --entrypoint python app chatbot.py stages
+~~~
+
+- 卷挂载：`corpus:ro`、`artifacts:rw`、`lexicon:ro`、`models:ro`；Qdrant 数据在 `./storage`。
+- Ollama 模型挂宿主 `~/.ollama/models:ro`，请先在宿主机 `ollama pull <MODEL>`。
+- `.env` 通过 compose `env_file` 注入；`QDRANT_HOST` / `OLLAMA_BASE_URL` 由 compose 覆盖为服务名。
+- `.dockerignore` 排除了 `models/`、`storage/`、`artifacts/embeddings`、`artifacts/docs` 等，构建上下文只有源码与必要产物。
+- 当前 `.env` 是 `torch` 后端，容器内进程内推理，不需要 infinity。
+
+## 8. 常见问题
 
 | 现象 | 处理 |
 |---|---|
@@ -123,8 +171,9 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 | `index` 提示可开内存不足 | 先 `./start.sh stop` 再重建（8G 档尤其注意） |
 | 改代码/`.env` 不生效 | 本脚本会复用已在跑的进程，`./start.sh stop && ./start.sh start` |
 | 配了 `http` 检索后端但查询报错 | 本版本不内置 infinity，改回 `torch` 或自行启动外部服务 |
+| Docker 构建慢 | 首次要下载 torch 并编译 llama-cpp-python；之后 BuildKit 缓存命中会快很多 |
 
-## 8. 边界
+## 9. 边界
 
 - 单机、单用户；无多租户、无并发队列、无鉴权（默认登录门关闭）。
 - 语料仅支持 `*.txt`。
