@@ -543,6 +543,25 @@ GEN_SEED = env_int("RAG_GEN_SEED", -1)
 
 
 _OLLAMA_SESSION_TLS = threading.local()
+_MODEL_HTTP_TLS = threading.local()
+
+
+def _model_http_session():
+    """模型服务 HTTP 连接复用：线程本地 requests.Session。
+
+    与 _ollama_session 同一策略：不自己实现连接池，用 requests 自带适配器；
+    线程本地避免 requests.Session 跨线程共享内部状态；keep-alive 由库维护。
+    """
+    session = getattr(_MODEL_HTTP_TLS, "session", None)
+    if session is None:
+        import requests
+        from requests.adapters import HTTPAdapter
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=32)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _MODEL_HTTP_TLS.session = session
+    return session
 
 
 def _ollama_session():
@@ -2825,29 +2844,36 @@ def weighted_rrf(rankings, k=RRF_K, limit=None):
     return [(doc_id, score, resources[doc_id]) for doc_id, score in items]
 
 
+def _qdrant_dense_hits(client, collection, dense_query, limit, query_filter=None, with_payload=False):
+    return client.query_points( collection_name=collection, query=dense_query, using=DENSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
+
+
+def _qdrant_sparse_hits(client, collection, sparse_query, limit, query_filter=None, with_payload=False):
+    # 本地推理器（qdrant-client 的 ModelEmbedder）每客户端一份且内部无锁：带 Document 的
+    # 请求必须串行，否则并发时 pop(0) 竞争 -> IndexError，或两份 Document 互换（稀疏查询
+    # 拿另一路提问的文本去打分）。写入口早有这把锁，检索侧这条一直裸跑；失败又被
+    # tolerate_sparse_error 吞成"退化为纯稠密"、页面无提示（静默丢召回）。
+    with _QDRANT_INFERENCE_LOCK:
+        return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
+
+
+def _sparse_recall_note(exc, sparse_query):
+    term_count = len((sparse_query.text or '').split())
+    return f"稀疏通道召回失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；分词 {term_count} 个 term"
+
+
 def dual_channel_recall(client, collection, dense_query, sparse_query, limit, query_filter=None, with_payload=False, tolerate_sparse_error=False, use_dense=True, use_sparse=True):
     from concurrent.futures import ThreadPoolExecutor
     dense_hits = []
 
-    def _dense():
-        return client.query_points( collection_name=collection, query=dense_query, using=DENSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
-
     if not use_sparse:
-        return (_dense() if use_dense else []), [], ""
+        return (_qdrant_dense_hits(client, collection, dense_query, limit, query_filter, with_payload) if use_dense else []), [], ""
     sparse_hits = []
-
-    def _sparse():
-        # 本地推理器（qdrant-client 的 ModelEmbedder）每客户端一份且内部无锁：带 Document 的
-        # 请求必须串行，否则并发时 pop(0) 竞争 -> IndexError，或两份 Document 互换（稀疏查询
-        # 拿另一路提问的文本去打分）。写入口早有这把锁，检索侧这条一直裸跑；失败又被
-        # tolerate_sparse_error 吞成"退化为纯稠密"、页面无提示（静默丢召回）。
-        with _QDRANT_INFERENCE_LOCK:
-            return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
 
     # 双通道并发：两个 Qdrant 往返并行发，墙钟 = max(dense, sparse) 而非和。
     with ThreadPoolExecutor(max_workers=2) as pool:
-        future_dense = pool.submit(_dense) if use_dense else None
-        future_sparse = pool.submit(_sparse)
+        future_dense = pool.submit(_qdrant_dense_hits, client, collection, dense_query, limit, query_filter, with_payload) if use_dense else None
+        future_sparse = pool.submit(_qdrant_sparse_hits, client, collection, sparse_query, limit, query_filter, with_payload)
         if future_dense is not None:
             dense_hits = future_dense.result()
         try:
@@ -2855,9 +2881,7 @@ def dual_channel_recall(client, collection, dense_query, sparse_query, limit, qu
         except Exception as exc:
             if not tolerate_sparse_error:
                 raise
-            term_count = len((sparse_query.text or '').split())
-            note = f"稀疏通道召回失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；分词 {term_count} 个 term"
-            return dense_hits, [], note
+            return dense_hits, [], _sparse_recall_note(exc, sparse_query)
     return dense_hits, sparse_hits, ""
 
 
@@ -3579,9 +3603,8 @@ class RAGEngine:
         ranked = sorted(((i, s) for i, s in enumerate(scores) if s is not None), key=lambda p: (-p[1], p[0]))
         return ranked[:top_k]
     def _http_json(self, url, payload):
-        import requests
         t0 = time.time()
-        r = requests.post(url, json=payload, timeout=MODEL_HTTP_TIMEOUT)
+        r = _model_http_session().post(url, json=payload, timeout=MODEL_HTTP_TIMEOUT)
         if r.status_code != 200:
             raise RuntimeError(f"模型服务 {url} 返回 HTTP {r.status_code}: {r.text[:200]}")
         try:
@@ -3761,47 +3784,47 @@ class RAGEngine:
         # 失败不置位、每轮重试（见 _check_chunk_freshness/_check_lexicon_consistency）。
         self._gate_check_collection_fingerprint(client, collection)
         query_filter = self._source_filter(source)
-        # 稠密查询向量只在稠密通道权重非零时才计算：权重为 0 时通道整体退出，若这里
-        # 仍无条件加载并前向嵌入模型，模型目录缺失/损坏会让本可由稀疏通道
-        # 独立服务的检索整体失败，还会白白付一次冷加载。
-        dense_query = None
-        if RRF_DENSE_WEIGHT:
-            if EMBED_BACKEND == "http":
-                # 现成的 OpenAI 兼容嵌入服务（infinity 容器）：查询指令前缀由客户端拼好
-                # （infinity 不知道本仓库的 RAG_EMBED_QUERY_INSTRUCTION），与入库侧同一条
-                # 依赖路径映射到同一向量空间，查询侧设备自选（部署机 CPU fp32）。
-                dense_query = self._http_embed([query], is_query=True)[0]
-            else:
-                tokenizer, model, device = self._get_embed()
-                # 前向与 rerank 共用同一把推理锁：加载/重排都已按它串行，唯独查询侧前向裸跑
-                # —— 多会话 Streamlit（每个浏览器标签一个脚本线程）下会真并发前向同一模型
-                # （MPS 上争抢命令缓冲，正是 README §10 点名的"永久阻塞"级风险）。先取模型再进锁，
-                # 避免与 _get_embed 内部的同一把锁重入死锁。
-                with self._inference_lock():
-                    # 取到推理锁后复核手里这份仍是当前引用：懒加载只在 init 锁内替换引用，
-                    # 两端之间存在检查-使用窗口；不复核就可能拿旧引用跑前向、随后再加载第二份。
-                    if self._embed is None or self._embed[1] is not model:
-                        tokenizer, model, device = self._get_embed()
-                    # 查询与入库同精度（MPS 上 fp16）：量纲一致、计算与显存减半
-                    q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
-                dense_query = q_emb[0].tolist()
+        # 稀疏查询先编码：HTTP 嵌入是网络等待，稀疏 Qdrant 召回可在同一时间并发跑，
+        # 墙钟从"嵌入 + 双路召回"降到 max(嵌入+稠密, 稀疏)。torch 后端保持原路径。
         sparse_query = sparse_encode(query)
-        # 判空走 sparse_terms_of：sparse_query.text 里的零宽空格是占位哨兵，不是词
         _sparse_terms = sparse_terms_of(query)
         if steps is not None:
             steps[STEP_SPARSE_TERMS] = _sparse_terms
-        # 稀疏通道"存在但不产出"原来完全静默：query 是纯标点/空白时稀疏侧既不召回、也不
-        # 报错、也不留痕 → 结果看起来是正常双通道融合，实际是纯稠密。必须点名。
         if bool(RRF_SPARSE_WEIGHT) and not _sparse_terms:
             if RRF_DENSE_WEIGHT:
                 _degraded(steps, "稀疏通道：查询无可检索内容（纯标点/空白），本次退化为纯稠密检索")
             else:
                 _degraded(steps, "稀疏通道：查询无可检索内容（纯标点/空白），且稠密通道权重为 0，本次无可用召回")
-        # 无内容不发稀疏查询：哨兵会命中"同样是空内容"的入库文档（纯标点块），把垃圾召回
-        # 混进融合 —— 与上面"退化为纯稠密"的日志相反。通道开关与日志必须是同一个判据。
         _use_sparse = bool(RRF_SPARSE_WEIGHT) and bool(_sparse_terms)
-        # 两种检索：稠密 + 稀疏各召回一次，随后统一加权 RRF 融合。
-        dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, )
+        dense_query = None
+        dense_hits = []
+        sparse_hits = []
+        note = ""
+        if bool(RRF_DENSE_WEIGHT) and EMBED_BACKEND == "http" and _use_sparse:
+            # 并发：稀疏 Qdrant 查询与稠密嵌入（HTTP）同时进行；随后再查稠密。
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                sparse_future = pool.submit(
+                    _qdrant_sparse_hits, client, collection, sparse_query, RECALL_LIMIT, query_filter,
+                )
+                dense_query = self._http_embed([query], is_query=True)[0]
+                dense_hits = _qdrant_dense_hits(client, collection, dense_query, RECALL_LIMIT, query_filter)
+                try:
+                    sparse_hits = sparse_future.result()
+                except Exception as exc:
+                    note = _sparse_recall_note(exc, sparse_query)
+        else:
+            if RRF_DENSE_WEIGHT:
+                if EMBED_BACKEND == "http":
+                    dense_query = self._http_embed([query], is_query=True)[0]
+                else:
+                    tokenizer, model, device = self._get_embed()
+                    with self._inference_lock():
+                        if self._embed is None or self._embed[1] is not model:
+                            tokenizer, model, device = self._get_embed()
+                        q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
+                    dense_query = q_emb[0].tolist()
+            dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, )
         if note:
             _degraded(steps, note)
         rankings = channel_rankings(dense_hits, sparse_hits)
