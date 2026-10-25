@@ -210,7 +210,7 @@ _detect_hw() {
     fi
 }
 
-_usage() { sed -n '2,25p' "${ROOT}/start.sh"; }
+_usage() { sed -n '2,22p' "${ROOT}/start.sh"; }
 
 _load_dotenv
 _detect_hw
