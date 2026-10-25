@@ -4504,6 +4504,45 @@ def _ollama_models_present(models_dir):
     return False
 
 
+
+def _ollama_gguf(models_dir):
+    import glob
+    candidates = glob.glob(os.path.join(models_dir or "", "*.gguf"))
+    return candidates[0] if candidates else None
+
+
+def _ensure_ollama_model(env, ollama_bin):
+    """没有 manifest 但有 GGUF 时，在 Ollama 就绪后执行 ollama create（不是 shell）。"""
+    import subprocess
+    models_dir = env.get("OLLAMA_MODELS", "")
+    if _ollama_models_present(models_dir):
+        return True
+    gguf = _ollama_gguf(models_dir)
+    if not gguf:
+        return False
+    model = env.get("MODEL", "minicpm5-2b")
+    modelfile = os.path.join(models_dir, "Modelfile.chatbot")
+    try:
+        with open(modelfile, "w", encoding="utf-8") as f:
+            f.write(f"FROM {gguf}\n")
+    except OSError as exc:
+        log(f"❌ [all] 无法写 Modelfile: {type(exc).__name__}: {exc}")
+        return False
+    log(f"[all] ollama create {model} <- {os.path.basename(gguf)}")
+    try:
+        result = subprocess.run(
+            [ollama_bin, "create", model, "-f", modelfile],
+            env=env, capture_output=True, text=True, timeout=1800,
+        )
+    except Exception as exc:
+        log(f"❌ [all] ollama create 异常: {type(exc).__name__}: {exc}")
+        return False
+    if result.returncode != 0:
+        log(f"❌ [all] ollama create 失败: {(result.stderr or result.stdout)[-500:]}")
+        return False
+    return _ollama_models_present(models_dir)
+
+
 def cmd_all(args=None):
     """单容器入口（ModelScope）：Qdrant + Ollama + Streamlit 三进程，带健康等待与自愈。
 
@@ -4524,8 +4563,8 @@ def cmd_all(args=None):
     env.setdefault("OLLAMA_MODELS", os.path.join(root, "ollama_models"))
     env.setdefault("QDRANT_HOST", "127.0.0.1")
     env.setdefault("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    if not _ollama_models_present(env.get("OLLAMA_MODELS", "")):
-        log("❌ [all] OLLAMA_MODELS 里没有任何模型 manifest："
+    if not _ollama_models_present(env.get("OLLAMA_MODELS", "")) and not _ollama_gguf(env.get("OLLAMA_MODELS", "")):
+        log("❌ [all] OLLAMA_MODELS 里既没有模型 manifest 也没有 .gguf："
             "把 ~/.ollama/models 内容放进构建上下文 ollama_models/（或运行时挂载到 /app/ollama_models）")
         return 1
 
@@ -4568,6 +4607,12 @@ def cmd_all(args=None):
         for process in children.values():
             process.terminate()
         log("❌ [all] 依赖未就绪，容器退出（交由平台重启）")
+        return 1
+
+    if not _ensure_ollama_model(env, ollama_bin):
+        for process in children.values():
+            process.terminate()
+        log("❌ [all] Ollama 模型不可用，容器退出")
         return 1
 
     try:

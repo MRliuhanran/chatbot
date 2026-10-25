@@ -66,9 +66,14 @@ _owned_pid() {
     _pid="$(_running_pid "${_file}")" || return 1
     _cmd="$(ps -ww -p "${_pid}" -o command= 2>/dev/null || true)"
     case "${_cmd}" in
-        *"${_marker}"*) printf '%s' "${_pid}" ;;
-        *) return 1 ;;
+        *"${_marker}"*) printf '%s' "${_pid}"; return 0 ;;
     esac
+    # 某些沙箱/平台会拒绝 ps 读其它进程；退到 pgrep 精确匹配 pid。
+    if command -v pgrep >/dev/null 2>&1 && pgrep -f "${_marker}" 2>/dev/null | grep -qx "${_pid}"; then
+        printf '%s' "${_pid}"
+        return 0
+    fi
+    return 1
 }
 
 _wait_http() {

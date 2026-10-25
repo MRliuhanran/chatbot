@@ -9,6 +9,7 @@
 #   docker run --rm -p 7860:7860 rag-chatbot:modelscope
 ARG PYTHON_VERSION=3.10
 ARG HF_ENDPOINT=https://hf-mirror.com
+ARG OLLAMA_GGUF_URL=https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-gguf/resolve/master/MiniCPM5-2B-Q4_K_M.gguf
 
 # ── 直接复用官方镜像里的二进制，避免 RUN 下载/解压 ──
 FROM qdrant/qdrant:v1.19.1 AS qdrant
@@ -62,6 +63,8 @@ COPY --from=ollama /usr/bin/ollama /usr/local/bin/ollama
 COPY --from=ollama /usr/lib/ollama /usr/lib/ollama
 COPY --from=fetchmodels /models /app/models
 COPY --from=assets /app/ /app/
+# 生成模型：直接把官方 GGUF 放进 ollama_models；容器启动后由 all 执行 ollama create。
+ADD ${OLLAMA_GGUF_URL} /app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf
 COPY chatbot.py /app/chatbot.py
 EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 CMD ["python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/_stcore/health', timeout=3)"]
