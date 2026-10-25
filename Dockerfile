@@ -8,7 +8,6 @@
 # 运行:
 #   docker run --rm -p 7860:7860 rag-chatbot:modelscope
 ARG PYTHON_VERSION=3.10
-ARG HF_ENDPOINT=https://hf-mirror.com
 ARG OLLAMA_GGUF_URL=https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-gguf/resolve/master/MiniCPM5-2B-Q4_K_M.gguf
 
 # ── 直接复用官方镜像里的二进制，避免 RUN 下载/解压 ──
@@ -24,12 +23,27 @@ RUN ["pip","install","--no-cache-dir","cmake","ninja"]
 RUN ["pip","install","--no-cache-dir","--index-url","https://download.pytorch.org/whl/cpu","torch==2.7.1"]
 RUN ["pip","install","--no-cache-dir","-r","/tmp/requirements.txt"]
 
-# ── 检索模型 stage：不依赖 git 里是否有 models/，构建期从 HF 镜像下载 ──
-# 与 pydeps / assets 并行；产物目录与本地 models/ 同名，指纹保持一致。
-FROM python:${PYTHON_VERSION} AS fetchmodels
-ENV HF_ENDPOINT=${HF_ENDPOINT}
-RUN ["pip","install","--no-cache-dir","huggingface_hub==0.33.2"]
-RUN ["python","-c","from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-m3', local_dir='/models/bge-m3', local_dir_use_symlinks=False); snapshot_download(repo_id='BAAI/bge-reranker-v2-m3', local_dir='/models/bge-reranker-v2-m3', local_dir_use_symlinks=False)"]
+# ── 检索模型 stage：按本地同一批文件从 ModelScope 下载（指纹一致）──
+# 只取本地已存在的文件；不下载 README/configuration.json 等额外文件，避免
+# _model_content_fingerprint 与本地/已建索引不一致。与 pydeps / assets 并行。
+FROM scratch AS fetchmodels
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/colbert_linear.pt /models/bge-m3/colbert_linear.pt
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/config.json /models/bge-m3/config.json
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/config_sentence_transformers.json /models/bge-m3/config_sentence_transformers.json
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/modules.json /models/bge-m3/modules.json
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/pytorch_model.bin /models/bge-m3/pytorch_model.bin
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/sentence_bert_config.json /models/bge-m3/sentence_bert_config.json
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/sentencepiece.bpe.model /models/bge-m3/sentencepiece.bpe.model
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/sparse_linear.pt /models/bge-m3/sparse_linear.pt
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/special_tokens_map.json /models/bge-m3/special_tokens_map.json
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/tokenizer.json /models/bge-m3/tokenizer.json
+ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/tokenizer_config.json /models/bge-m3/tokenizer_config.json
+ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/config.json /models/bge-reranker-v2-m3/config.json
+ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/model.safetensors /models/bge-reranker-v2-m3/model.safetensors
+ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/sentencepiece.bpe.model /models/bge-reranker-v2-m3/sentencepiece.bpe.model
+ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/special_tokens_map.json /models/bge-reranker-v2-m3/special_tokens_map.json
+ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/tokenizer.json /models/bge-reranker-v2-m3/tokenizer.json
+ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/tokenizer_config.json /models/bge-reranker-v2-m3/tokenizer_config.json
 
 # ── 资产 stage：与 pydeps 并行；源码/产物/配置 ──
 # ollama_models 可选：留 .keep 也能构建；正式生成模型由下方 ADD GGUF + all 里的 ollama create 完成。
@@ -47,12 +61,7 @@ COPY storage/ /app/storage/
 FROM python:${PYTHON_VERSION} AS app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    RAG_DATA_DIR=corpus \
-    RAG_ARTIFACTS_DIR=./artifacts \
-    RAG_LEXICON_DIR=./lexicon \
-    RAG_HTTP_PORT=7860 \
-    OLLAMA_MODELS=/app/ollama_models
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
 RUN ["apt-get","update"]
 RUN ["apt-get","install","-y","--no-install-recommends","libunwind8"]

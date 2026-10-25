@@ -136,7 +136,7 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 | 资产 | 来源 |
 |---|---|
-| 检索模型 | `fetchmodels` stage 从 HF 镜像下载 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3` |
+| 检索模型 | `fetchmodels` stage 从 ModelScope 按与本地相同的文件清单下载 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3` |
 | 生成模型 | Dockerfile `ADD` 官方 GGUF（默认 MiniCPM5-2B-Q4_K_M），容器启动后 `chatbot.py all` 自动 `ollama create` |
 | `artifacts/` + `storage/` | 本地已建好的分块产物与 Qdrant 数据（保证指纹一致） |
 | `ollama_models/` | 可选：若想复用宿主机已有 Ollama 模型，用 `-v ~/.ollama/models:/app/ollama_models:ro` 挂载，则跳过 create |
@@ -151,8 +151,8 @@ docker run --rm -p 7860:7860 \
   -v "$HOME/.ollama/models:/app/ollama_models:ro" rag-chatbot:modelscope
 ~~~
 
-> 检索模型由 `fetchmodels` stage 从 HF 镜像下载（默认 `HF_ENDPOINT=https://hf-mirror.com`）；
-> 网络受限时可用 `--build-arg HF_ENDPOINT=https://huggingface.co`。
+> 检索模型由 `fetchmodels` stage 从 ModelScope 下载**与本地相同的文件清单**（不含 README/configuration.json 等额外文件），
+> 以保证 `_model_content_fingerprint` 与本地 `artifacts/`/`storage/` 完全一致。
 > 生成模型 GGUF 可用 `--build-arg OLLAMA_GGUF_URL=...` 替换；容器内 `all` 会先 `ollama create`
 > 再启动应用，模型不可用时直接退出，不会出现“Ollama 起来了但问答 404”。
 
@@ -179,7 +179,7 @@ docker exec -it <container> python chatbot.py stages
 
 ### 7.4 功能、性能、效果
 
-- **功能同源**：同一份 `chatbot.py`、`.env`、`artifacts/`、`storage/`；检索模型构建期下载同 HF 仓库，生成模型由同一 GGUF 自动创建；没有 torch/http 或 CPU/GPU 的代码分叉。
+- **功能同源**：同一份 `chatbot.py`、`.env`、`artifacts/`、`storage/`；检索模型构建期从 ModelScope 下载同文件清单，生成模型由同一 GGUF 自动创建；没有 torch/http 或 CPU/GPU 的代码分叉。
 - **效果一致**：检索模型、重排模型、生成模型、切分/索引参数都相同，质量口径一致。
 - **性能不可能完全一致**：本地是 Metal/MPS，ModelScope 是 2vCPU 纯 CPU；重排、索引、首字延迟会明显慢于本机。这是硬件差异，不是代码差异。
 - 单容器 8G 档注意 `RAG_NUM_CTX`；OOM 时 `all` 会重启被杀的子进程（与本地 start.sh 的巡检语义一致）。
