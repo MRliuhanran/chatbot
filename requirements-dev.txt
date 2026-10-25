@@ -1,5 +1,0 @@
-# 开发/测试依赖（与 requirements.txt 分离：运行时镜像与生产环境**不装**这些，
-# 那条"纯运行时"约定仍然成立）。版本 = 本地现役版本快照，升级流程同 requirements.txt：
-# 本地先 pip install -U 并跑通 tests/，再同步改这里的版本号。
-pytest==8.4.1
-mypy==2.4.0
