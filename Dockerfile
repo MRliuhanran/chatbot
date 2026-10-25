@@ -18,6 +18,7 @@ FROM ollama/ollama:0.34.4 AS ollama
 FROM python:${PYTHON_VERSION} AS pydeps
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     PIP_DEFAULT_TIMEOUT=120 \
     PIP_RETRIES=10 \
     CMAKE_ARGS="-DGGML_OPENMP=OFF"
