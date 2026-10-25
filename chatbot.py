@@ -1,3 +1,12 @@
+# ── 单文件分层架构：依赖方向（只允许向下）──
+# L1 配置/日志/硬件/运行态  →  L2 纯函数（domain）  →  L3 适配器（I/O/资源）
+#   →  L4 检索引擎（只依赖协议）  →  L5 编排（run_turn/CLI）  →  L6 Streamlit UI
+# 约定：
+#   · L2 纯函数不读全局配置、不碰 st/网络/磁盘；需要配置时显式传参。
+#   · L3 适配器独占 requests/qdrant_client/torch 的 IO 与生命周期。
+#   · L4 只依赖 L3 的 Protocol；L6 是唯一允许 import streamlit 的层。
+#   · 指纹单元（_CHUNKING_CODE_UNITS / _embed_code_fingerprint / lexicon_fingerprint
+#     列出的函数）源码禁改：改名/加装饰器/改空白都会让 inspect.getsource 变化 → 全量重建。
 # ── 基础设施：环境配置与日志 ──
 from __future__ import annotations
 
@@ -15,8 +24,10 @@ import traceback
 import unicodedata
 import warnings
 from collections import Counter, defaultdict
+from dataclasses import dataclass
+from functools import wraps
 from logging.handlers import RotatingFileHandler
-from typing import Any
+from typing import Any, Callable, Protocol, Sequence
 
 try:
     from dotenv import load_dotenv
@@ -500,6 +511,48 @@ def _streamlit_runtime_state():
     必须在 run_streamlit 里先于 engine 构建调用，让预热/首查询线程与脚本线程共用一份。"""
     import streamlit as st
     return st.cache_resource(show_spinner=False)(_state_ref)()
+
+# ── L1 值对象：运行时能力画像（全仓唯一设备判定入口）──
+# 业务代码只读字段，不再写 if device == "mps"/"cuda"；构造一次、处处复用。
+@dataclass(frozen=True)
+class RuntimeProfile:
+    device: str
+    dtype: str
+    amp: bool
+    embed_batch: int
+    threads: int
+
+
+def build_runtime_profile() -> RuntimeProfile:
+    """探测一次设备/精度/批大小；返回不可变画像。
+    注意：这里会 import torch（经 get_device），只应在需要推理的入口（预热/引擎/索引）调用；
+    CLI 的纯文件命令不应调用它，避免无谓的 torch 启动成本。
+    """
+    device = get_device()
+    use_fp16 = _float16_ok(device)
+    return RuntimeProfile(
+        device=device,
+        dtype="float16" if use_fp16 else "float32",
+        amp=use_fp16,
+        embed_batch=EMBED_BATCH_SIZE or embed_batch_size(device),
+        threads=hw_cores(),
+    )
+
+
+# ── L1 AOP：横切计时（只记录，不改返回值；阈值以下不刷日志）──
+def _timed(label: str, threshold_s: float = 2.0):
+    def decorator(fn: Callable) -> Callable:
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                elapsed = time.perf_counter() - started
+                if elapsed >= threshold_s:
+                    log(f"⏱  {label}: {elapsed:.1f}s")
+        return wrapper
+    return decorator
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 API_URL = f"{OLLAMA_BASE_URL}/api/chat"
 MODEL = os.getenv("MODEL", "qwen3.5:2b-q4_K_M")
@@ -3001,32 +3054,62 @@ def _context_meta_open_tag(i, r, source):
     return "<document " + " ".join(f"{k}={quoteattr(v)}" for k, v in attrs) + ">"
 
 
+# ── 表驱动：上下文资料格式（meta / labels / tags / plain 四种策略）──
+def _context_head(i, source):
+    return f"[{i}]" + (f"（{SOURCE_LABEL}：{source}）" if source else "")
+
+
+def _format_context_meta(i, r, source):
+    # 结构化档：一条资料 = 一个带属性 <document> 块，元数据与正文同处一个元素。
+    text = r.get("parent_text") or ""
+    return f"{_context_meta_open_tag(i, r, source)}\n{text}\n</document>"
+
+
+def _format_context_labels(i, r, source):
+    text = r.get("parent_text") or ""
+    return "\n".join(part for part in (_context_head(i, source), text) if part)
+
+
+def _format_context_tags(i, r, source):
+    text = r.get("parent_text") or ""
+    head = _context_head(i, source) if CONTEXT_LABELS else ""
+    body = "\n".join(part for part in (head, text) if part)
+    return f"<document>\n{body}\n</document>"
+
+
+def _format_context_plain(i, r, _source):
+    return r.get("parent_text") or ""
+
+
+_CONTEXT_FORMATTERS = {
+    "meta": _format_context_meta,
+    "labels": _format_context_labels,
+    "tags": _format_context_tags,
+    "plain": _format_context_plain,
+}
+
+
+def _context_formatter():
+    """按配置选一个 formatter：META 优先（接管 labels/tags），否则 tags > labels > plain。"""
+    if CONTEXT_META:
+        return _CONTEXT_FORMATTERS["meta"]
+    if CONTEXT_TAGS:
+        return _CONTEXT_FORMATTERS["tags"]
+    if CONTEXT_LABELS:
+        return _CONTEXT_FORMATTERS["labels"]
+    return _CONTEXT_FORMATTERS["plain"]
+
+
 def context_blocks(results):
     """按检索顺序返回每一条资料的独立块（与资料装配的拼接单元一致）。
 
     独立成块是为了让生成侧按**整条资料**从尾部让位：截掉哪几条，sources 就只报哪几条，
-    诊断不会比模型实际看到的多。
+    诊断不会比模型实际看到的多。格式由 _CONTEXT_FORMATTERS 表选择，不再在循环里堆 if。
     """
     if not results:
         return []
-    if not CONTEXT_LABELS and not CONTEXT_TAGS and not CONTEXT_META:
-        return [(r.get("parent_text") or "") for r in results]
-    blocks = []
-    for i, r in enumerate(results, 1):
-        source = _source_of(r)
-        text = r.get("parent_text") or ""
-        if CONTEXT_META:
-            # 结构化档：一条资料 = 一个带属性 <document> 块，元数据与正文同处一个元素。
-            block = f"{_context_meta_open_tag(i, r, source)}\n{text}\n</document>"
-        else:
-            head = ""
-            if CONTEXT_LABELS:
-                head = f"[{i}]" + (f"（{SOURCE_LABEL}：{source}）" if source else "")
-            block = "\n".join(part for part in (head, text) if part)
-            if CONTEXT_TAGS:
-                block = f"<document>\n{block}\n</document>"
-        blocks.append(block)
-    return blocks
+    formatter = _context_formatter()
+    return [formatter(i, r, _source_of(r)) for i, r in enumerate(results, 1)]
 
 
 def context_sources(results):
@@ -3499,7 +3582,85 @@ def _empty_search_result(steps):
     return ([], steps) if steps is not None else []
 
 
-# ── 检索引擎 ──
+# ── 适配器层（L3）：协议 + OOP 资源；引擎只依赖协议 ──
+class EmbeddingBackend(Protocol):
+    """查询向量接口：torch 进程内 / HTTP 服务两种实现，调用点单一。"""
+    def embed_query(self, query: str) -> list[float]: ...
+
+
+class RerankBackend(Protocol):
+    """重排接口：返回 ([(候选下标, 分数)], tokenizer_or_none)。"""
+    def rerank(self, query: str, texts: Sequence[str], top_k: int): ...
+
+
+class TorchEmbeddingBackend:
+    """进程内 torch 嵌入：复用引擎已有的懒加载与推理锁（模型只驻留一份）。"""
+
+    def __init__(self, engine: "RAGEngine"):
+        self._engine = engine
+
+    def embed_query(self, query: str) -> list[float]:
+        engine = self._engine
+        tokenizer, model, device = engine._get_embed()
+        # 与旧路径逐字同序：先取模型，再进推理锁，锁内复核引用，避免检查-使用窗口。
+        with engine._inference_lock():
+            if engine._embed is None or engine._embed[1] is not model:
+                tokenizer, model, device = engine._get_embed()
+            query_emb = embed([query], tokenizer, model, device, is_query=True,
+                              autocast=_float16_ok(device))
+        return query_emb[0].tolist()
+
+
+class HttpEmbeddingBackend:
+    """OpenAI 兼容嵌入服务（infinity 等）：查询指令前缀由客户端拼好。"""
+
+    def __init__(self, engine: "RAGEngine"):
+        self._engine = engine
+
+    def embed_query(self, query: str) -> list[float]:
+        return self._engine._http_embed([query], is_query=True)[0]
+
+
+class TorchRerankBackend:
+    """进程内重排：与查询侧稠密前向共用同一把推理锁。"""
+
+    def __init__(self, engine: "RAGEngine"):
+        self._engine = engine
+
+    @_timed("rerank", threshold_s=5.0)
+    def rerank(self, query: str, texts: Sequence[str], top_k: int):
+        engine = self._engine
+        rr_tok, rr_model, rr_dev = engine._get_rerank()
+        with engine._inference_lock():
+            if engine._rerank is None or engine._rerank[1] is not rr_model:
+                rr_tok, rr_model, rr_dev = engine._get_rerank()
+            reranked = rerank_indices(query, list(texts), rr_tok, rr_model, rr_dev, top_k=top_k)
+        return reranked, rr_tok
+
+
+class HttpRerankBackend:
+    """Cohere 风格 /rerank：服务端只出分数；tokenizer 仅供 trace 预算列。"""
+
+    def __init__(self, engine: "RAGEngine"):
+        self._engine = engine
+
+    def rerank(self, query: str, texts: Sequence[str], top_k: int):
+        engine = self._engine
+        rr_tok = engine._get_rerank_tokenizer_only()
+        return engine._http_rerank(query, list(texts), top_k=top_k), rr_tok
+
+
+class OllamaChatBackend:
+    """生成侧适配器：把流式事件协议收在一个对象里；换生成服务只换实现。"""
+
+    def stream(self, messages, *, num_ctx=None, num_predict=None):
+        return stream_chat(messages, num_ctx=num_ctx, num_predict=num_predict)
+
+
+_CHAT_BACKEND = OllamaChatBackend()
+
+
+# ── 检索引擎（L4：只依赖上面协议 + 纯函数）──
 class RAGEngine:
     def __init__(self, client=None, embed=None, rerank=None):
         self._embed = embed
@@ -3516,6 +3677,13 @@ class RAGEngine:
         # 查询侧前向/rerank 用推理锁串行（MPS 单模型不做真并行），加载持初始化锁。
         self._model_init_lock = threading.Lock()
         self._model_infer_lock = threading.Lock()
+        # L3 适配器：设备/后端差异只在这里选一次；下游 hybrid_search 只有一条路径。
+        self._embedding_backend: EmbeddingBackend = (
+            TorchEmbeddingBackend(self) if EMBED_BACKEND == "torch" else HttpEmbeddingBackend(self)
+        )
+        self._rerank_backend: RerankBackend = (
+            TorchRerankBackend(self) if RERANK_BACKEND == "torch" else HttpRerankBackend(self)
+        )
     @property
     def collection_name(self):
         return self._collection_name
@@ -3800,14 +3968,14 @@ class RAGEngine:
         dense_hits = []
         sparse_hits = []
         note = ""
-        if bool(RRF_DENSE_WEIGHT) and EMBED_BACKEND == "http" and _use_sparse:
-            # 并发：稀疏 Qdrant 查询与稠密嵌入（HTTP）同时进行；随后再查稠密。
+        # 单一编排路径：稠密向量由适配器产出，不看 torch/http；稀疏召回可在嵌入期间并发。
+        if bool(RRF_DENSE_WEIGHT) and _use_sparse:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=1) as pool:
                 sparse_future = pool.submit(
                     _qdrant_sparse_hits, client, collection, sparse_query, RECALL_LIMIT, query_filter,
                 )
-                dense_query = self._http_embed([query], is_query=True)[0]
+                dense_query = self._embedding_backend.embed_query(query)
                 dense_hits = _qdrant_dense_hits(client, collection, dense_query, RECALL_LIMIT, query_filter)
                 try:
                     sparse_hits = sparse_future.result()
@@ -3815,15 +3983,7 @@ class RAGEngine:
                     note = _sparse_recall_note(exc, sparse_query)
         else:
             if RRF_DENSE_WEIGHT:
-                if EMBED_BACKEND == "http":
-                    dense_query = self._http_embed([query], is_query=True)[0]
-                else:
-                    tokenizer, model, device = self._get_embed()
-                    with self._inference_lock():
-                        if self._embed is None or self._embed[1] is not model:
-                            tokenizer, model, device = self._get_embed()
-                        q_emb = embed([query], tokenizer, model, device, is_query=True, autocast=_float16_ok(device))
-                    dense_query = q_emb[0].tolist()
+                dense_query = self._embedding_backend.embed_query(query)
             dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, )
         if note:
             _degraded(steps, note)
@@ -3874,19 +4034,8 @@ class RAGEngine:
             log(f"⚠️  top_k={top_k} 超过候选池上限 {_pool}，最多返回 {_pool} 条（可调大 RAG_RERANK_TOP_K 或 RAG_RERANK_BUDGET_MS）")
         cand_texts = [rerank_text_for(c) for c in candidates]
         rr_k = min(top_k, len(candidates))
-        if RERANK_BACKEND == "http":
-            # 现成重排服务（与嵌入同一个 infinity 进程）：客户端排序、服务端只出分数。
-            # tokenizer 只为 trace 的 token 预算列，拿不到就整列留空（见 _get_rerank_tokenizer_only）。
-            rr_tok = self._get_rerank_tokenizer_only()
-            reranked = self._http_rerank(query, cand_texts, top_k=rr_k)
-        else:
-            rr_tok, rr_model, rr_dev = self._get_rerank()
-            with self._inference_lock():
-                # 复核：懒加载只在 init 锁内替换引用，两端之间存在检查-使用窗口；取到推理锁
-                # 后按当前引用核对，不一致就重取，避免拿旧引用跑前向 + 随后重载第二份。
-                if self._rerank is None or self._rerank[1] is not rr_model:
-                    rr_tok, rr_model, rr_dev = self._get_rerank()
-                reranked = rerank_indices(query, cand_texts, rr_tok, rr_model, rr_dev, top_k=rr_k)
+        # 单一编排路径：torch/http 差异在适配器内部；这里只拿 (排序结果, tokenizer)。
+        reranked, rr_tok = self._rerank_backend.rerank(query, cand_texts, rr_k)
         if steps is not None:
             rr_query_tokens = len(rr_tok.encode(query)) if rr_tok is not None else None
             # 使用 tokenizer 实际的特殊 token 数，而非硬编码
@@ -3967,7 +4116,7 @@ def first_retrieval(events):
 
 def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_context=None, num_ctx=None, num_predict=None, chat=None):
     source = source if source is not None else book
-    chat = chat or stream_chat
+    chat = chat or _CHAT_BACKEND.stream
     top_k = TOP_K if top_k is None else top_k
     use_context = RAG_USE_CONTEXT if use_context is None else use_context
     num_ctx = NUM_CTX if num_ctx is None else num_ctx
@@ -4327,22 +4476,47 @@ def _render_stored_message(msg):
             st.error(msg["error"])
 
 
+# ── 表驱动：生成失败 → 下一步动作（顺序即优先级；加一类错误只加一行数据）──
+def _is_missing_model(low: str) -> bool:
+    return "http 404" in low or ("not found" in low and "model" in low)
+
+
+def _is_oom(low: str) -> bool:
+    return "signal: killed" in low or "out of memory" in low
+
+
+def _is_http_500(low: str) -> bool:
+    return "http 500" in low
+
+
+def _is_connection(low: str) -> bool:
+    return "econnrefused" in low or "connection" in low or "timed out" in low
+
+
+_GEN_FAILURE_HINTS = (
+    (_is_missing_model,
+     "生成模型不在 Ollama 里：看运行日志的 [entrypoint] 拉取行（后台拉取期间问答都会失败，拉完自动恢复）"),
+    (_is_oom,
+     "生成进程被系统杀掉（内存超限）：看运行日志的 [entrypoint] [mem] 观测行，必要时调小 RAG_NUM_CTX"),
+    (_is_http_500,
+     "生成服务返回 500：模型未就绪或进程已被杀，看运行日志的 [entrypoint] 与 /tmp/ollama.log"),
+    (_is_connection,
+     "连不上生成服务：确认 ollama serve 已启动、OLLAMA_BASE_URL 可达"),
+)
+
+
 def _gen_failure_hint(gen_error):
     """按错误文本给下一步动作：本地与创空间共用同一套判据，只说该错误本身指向的事实。
 
     顺序即优先级：具体判据在前、泛化判据在后。旧顺序把 "connection" 排在 "http 500"
     之前，含 connection 字样的 500 会被误报成"连不上生成服务"；同时整表漏掉了 404 ——
     而 entrypoint 故意把模型拉取放后台，"模型不在本地"是冷启动期最可能的一类错误。
+    实现改为表驱动：新增一类错误只加 (predicate, hint) 一行。
     """
     low = (gen_error or "").lower()
-    if "http 404" in low or ("not found" in low and "model" in low):
-        return "生成模型不在 Ollama 里：看运行日志的 [entrypoint] 拉取行（后台拉取期间问答都会失败，拉完自动恢复）"
-    if "signal: killed" in low or "out of memory" in low:
-        return "生成进程被系统杀掉（内存超限）：看运行日志的 [entrypoint] [mem] 观测行，必要时调小 RAG_NUM_CTX"
-    if "http 500" in low:
-        return "生成服务返回 500：模型未就绪或进程已被杀，看运行日志的 [entrypoint] 与 /tmp/ollama.log"
-    if "econnrefused" in low or "connection" in low or "timed out" in low:
-        return "连不上生成服务：确认 ollama serve 已启动、OLLAMA_BASE_URL 可达"
+    for matches, hint in _GEN_FAILURE_HINTS:
+        if matches(low):
+            return hint
     return None
 
 
@@ -4597,6 +4771,10 @@ def _warm_engine(engine):
     """后台预热：词表、嵌入/重排模型、生成模型常驻 Ollama；失败仅告警（首查询冷加载兜底）。"""
     def _warm():
         try:
+            # L1 值对象只构造一次：把设备/精度/批大小/线程数打成一行，事后可归因。
+            _profile = build_runtime_profile()
+            log(f"[profile] device={_profile.device} dtype={_profile.dtype} amp={int(_profile.amp)} "
+                f"embed_batch={_profile.embed_batch} threads={_profile.threads}")
             # 词表仍要预热（别名归一是查询路径上的同步调用）；jieba 已随分词组件化整体移除
             load_lexicon()
             # 嵌入/重排模型按后端预热：torch=加载进本进程；http=探一发小请求，让独立模型
@@ -5269,6 +5447,23 @@ def cmd_verify_lexicon(args=None):
 
 
 # ── 工具：阶段状态与最小重跑指引 ──
+# ── 表驱动：阶段结论 -> 下一步动作（顺序即优先级）──
+_STAGE_NEXT_ACTIONS = (
+    (lambda stale, unknown: not stale and not unknown, "全部阶段新鲜，无需重跑。"),
+    (lambda stale, _unknown: "A" in stale, "最小重跑: python chatbot.py process && python chatbot.py index"),
+    (lambda stale, _unknown: "B" in stale or "D" in stale, "最小重跑: python chatbot.py index（稠密走缓存增量）"),
+    (lambda stale, _unknown: "C" in stale, "最小重跑: python chatbot.py sparse"),
+)
+
+
+def _stage_next_action(stale, unknown) -> str:
+    for matches, message in _STAGE_NEXT_ACTIONS:
+        if matches(stale, unknown):
+            return message
+    # stale 为空但有阶段没验过：绝不能落到"全部新鲜"。
+    return "有阶段未能完成验证（原因见上）→ 恢复后重跑: python chatbot.py stages"
+
+
 def cmd_stages(args=None):
     """逐阶段比对指纹，给出最小重跑命令。
     A 分块（语料/切分变 → process） B 稠密（换模型/新内容 → index 增量）
@@ -5388,17 +5583,7 @@ def cmd_stages(args=None):
         cd_unknown = True
 
     log("")
-    if not stale and not cd_unknown:
-        log("全部阶段新鲜，无需重跑。")
-    elif "A" in stale:
-        log("最小重跑: python chatbot.py process && python chatbot.py index")
-    elif "B" in stale or "D" in stale:
-        log("最小重跑: python chatbot.py index（稠密走缓存增量）")
-    elif "C" in stale:
-        log("最小重跑: python chatbot.py sparse")
-    else:
-        # stale 为空但有阶段没验过：绝不能落到上面的"全部新鲜"。
-        log("有阶段未能完成验证（原因见上）→ 恢复后重跑: python chatbot.py stages")
+    log(_stage_next_action(stale, cd_unknown))
     # 退出码与 lexicon/compare-chunks 对齐：有阶段过期或未验证 = 1，全新鲜才 0，
     # 自动化才能用退出码判断"要不要重跑"（以前恒 0，判据形同虚设）。
     return 1 if (stale or cd_unknown) else 0

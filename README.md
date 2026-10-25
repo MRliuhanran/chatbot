@@ -162,6 +162,7 @@ python chatbot.py serve             # Web 界面（先校验索引再启动 Stre
 |---|---|
 | `run_local.sh` / `run_qdrant.sh` | 本地组件一键起停（Qdrant 原生二进制版本与 `Dockerfile` 同源） |
 | `deploy-check.sh` | 发布前检查（lint、产物、索引连通、进程内冒烟检索） |
+| `architecture-check.py` | 单文件分层架构检查（章节顺序、顶层无 streamlit、检索单一路径、适配器齐全、切分指纹未漂移） |
 | `fetch_models.sh` | 按 `.env` 的模型路径查表下载权重（构建期/容器内） |
 | `eval_retrieval.py` | 检索基线对拍（来源命中率 / top-k 一致性） |
 | `rerank_parity.py` | 进程内重排与 `/v1/rerank` 分数比对 |
