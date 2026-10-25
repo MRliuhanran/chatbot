@@ -32,7 +32,7 @@ RUN ["pip","install","--no-cache-dir","huggingface_hub==0.33.2"]
 RUN ["python","-c","from huggingface_hub import snapshot_download; snapshot_download(repo_id='BAAI/bge-m3', local_dir='/models/bge-m3', local_dir_use_symlinks=False); snapshot_download(repo_id='BAAI/bge-reranker-v2-m3', local_dir='/models/bge-reranker-v2-m3', local_dir_use_symlinks=False)"]
 
 # ── 资产 stage：与 pydeps 并行；源码/产物/配置 ──
-# ollama_models 必须在构建上下文里（ModelScope 需 LFS/持久盘；本地可从 ~/.ollama/models 复制）。
+# ollama_models 可选：留 .keep 也能构建；正式生成模型由下方 ADD GGUF + all 里的 ollama create 完成。
 FROM scratch AS assets
 COPY .env /app/.env
 COPY corpus/ /app/corpus/

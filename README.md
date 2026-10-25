@@ -15,7 +15,7 @@
 | `corpus/` `models/` `ollama_models/` `artifacts/` `storage/` `lexicon/` | 语料 / 检索模型 / Ollama 模型 / 分块产物 / Qdrant 数据 / 词表 |
 | `qdrant_config/` `.streamlit/` | 本地 Qdrant 与应用配置 |
 
-> 支持两种运行方式：本机原生（`start.sh`）或 Docker Compose（`Dockerfile` + `docker-compose.yml`）。完整版（含 tools/ 辅助脚本与旧部署文件）保留在 git tag `backup/pre-minimal-20261025`。
+> 支持两种运行方式：本机原生（`start.sh`）或单容器 Docker（`Dockerfile`）。完整版（含 tools/ 辅助脚本与旧部署文件）保留在 git tag `backup/pre-minimal-20261025`。
 
 ## 1. 环境准备
 

@@ -4505,6 +4505,19 @@ def _ollama_models_present(models_dir):
 
 
 
+
+_OLLAMA_CHAT_TEMPLATE = (
+    "{{- if .Messages -}}\n"
+    "{{- range .Messages -}}\n"
+    "<|im_start|>{{ .Role }}\n"
+    "{{ .Content }}<|im_end|>\n"
+    "{{ end -}}\n"
+    "<|im_start|>assistant\n"
+    " thinking\n"
+    "{{ end -}}"
+)
+
+
 def _ollama_gguf(models_dir):
     import glob
     candidates = glob.glob(os.path.join(models_dir or "", "*.gguf"))
@@ -4524,7 +4537,12 @@ def _ensure_ollama_model(env, ollama_bin):
     modelfile = os.path.join(models_dir, "Modelfile.chatbot")
     try:
         with open(modelfile, "w", encoding="utf-8") as f:
-            f.write(f"FROM {gguf}\n")
+            f.write(
+                f"FROM {gguf}\n"
+                f'TEMPLATE """{_OLLAMA_CHAT_TEMPLATE}"""\n'
+                "PARAMETER stop <|im_end|>\n"
+                "PARAMETER stop </s>\n"
+            )
     except OSError as exc:
         log(f"❌ [all] 无法写 Modelfile: {type(exc).__name__}: {exc}")
         return False
