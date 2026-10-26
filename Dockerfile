@@ -63,6 +63,7 @@ COPY storage/ /app/storage/
 
 # ── 最终镜像：一个容器、一个入口、三个子进程由 chatbot.py all 管理 ──
 FROM python:${PYTHON_VERSION} AS app
+ARG OLLAMA_GGUF_URL=https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-gguf/resolve/master/MiniCPM5-2B-Q4_K_M.gguf
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -78,6 +79,7 @@ COPY --from=fetchmodels /models /app/models
 COPY --from=assets /app/ /app/
 # 生成模型：直接把官方 GGUF 放进 ollama_models；容器启动后由 all 执行 ollama create。
 ADD ${OLLAMA_GGUF_URL} /app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf
+RUN ["python","-c","import os,sys; p='/app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf'; n=os.path.getsize(p); print('GGUF bytes:', n); sys.exit(0 if n > 100000000 else 1)"]
 COPY chatbot.py /app/chatbot.py
 EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 CMD ["python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/_stcore/health', timeout=3)"]
