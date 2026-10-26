@@ -9,7 +9,6 @@ qdrant_storage/
 __pycache__/
 *.pyc
 .streamlit/secrets.toml*
-start.sh
 README.md
 tools/
 docs/

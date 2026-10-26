@@ -15,6 +15,7 @@
 #   ./start.sh stages            四阶段新鲜度检查
 #   ./start.sh lexicon           词表自检
 #   ./start.sh compare-chunks A [B]
+#   ./start.sh fetch-models [dest] 构建期下载模型（Docker 也复用本文件）
 #
 # 前置:
 #   · Python 3.10 + pip install -r requirements.txt
@@ -240,11 +241,104 @@ _detect_hw() {
     fi
 }
 
-_usage() { sed -n '2,22p' "${ROOT}/start.sh"; }
+
+# ── 构建期模型下载：唯一 shell 文件内完成，Docker 与本机共用 ────────────────
+# 替代 Dockerfile 的 17 个远程 ADD（远程 ADD 不走层缓存，每次部署重下 4GB）。
+_fetch_models() {
+    local _dest="${1:-/models}" _input _item _rel _url _size _file _dir _need=0 _got
+    local _bge="https://modelscope.cn/models/BAAI/bge-m3/resolve/master"
+    local _rr="https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master"
+    local _gguf_rel="_gguf/MiniCPM5-2B-Q4_K_M.gguf"
+    local _gguf_url="https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-gguf/resolve/master/MiniCPM5-2B-Q4_K_M.gguf"
+    local _entries=(
+        "bge-m3/colbert_linear.pt|${_bge}/colbert_linear.pt|2100674"
+        "bge-m3/config.json|${_bge}/config.json|687"
+        "bge-m3/config_sentence_transformers.json|${_bge}/config_sentence_transformers.json|123"
+        "bge-m3/modules.json|${_bge}/modules.json|349"
+        "bge-m3/pytorch_model.bin|${_bge}/pytorch_model.bin|2271145830"
+        "bge-m3/sentence_bert_config.json|${_bge}/sentence_bert_config.json|54"
+        "bge-m3/sentencepiece.bpe.model|${_bge}/sentencepiece.bpe.model|5069051"
+        "bge-m3/sparse_linear.pt|${_bge}/sparse_linear.pt|3516"
+        "bge-m3/special_tokens_map.json|${_bge}/special_tokens_map.json|964"
+        "bge-m3/tokenizer.json|${_bge}/tokenizer.json|17098108"
+        "bge-m3/tokenizer_config.json|${_bge}/tokenizer_config.json|444"
+        "bge-reranker-v2-m3/config.json|${_rr}/config.json|795"
+        "bge-reranker-v2-m3/model.safetensors|${_rr}/model.safetensors|2271071852"
+        "bge-reranker-v2-m3/sentencepiece.bpe.model|${_rr}/sentencepiece.bpe.model|5069051"
+        "bge-reranker-v2-m3/special_tokens_map.json|${_rr}/special_tokens_map.json|964"
+        "bge-reranker-v2-m3/tokenizer.json|${_rr}/tokenizer.json|17098273"
+        "bge-reranker-v2-m3/tokenizer_config.json|${_rr}/tokenizer_config.json|1173"
+    )
+    mkdir -p "${_dest}"
+    _input="$(mktemp "${TMPDIR:-/tmp}/rag-models.XXXXXX")"
+    for _item in "${_entries[@]}"; do
+        IFS='|' read -r _rel _url _size <<< "${_item}"
+        _file="${_dest}/${_rel}"
+        if [ -f "${_file}" ]; then
+            _got="$(wc -c < "${_file}" | tr -d '[:space:]')"
+            [ "${_got}" = "${_size}" ] && { _log "跳过已就绪: ${_rel}"; continue; }
+        fi
+        rm -f "${_file}"
+        _dir="${_dest}/$(dirname "${_rel}")"
+        mkdir -p "${_dir}"
+        printf '%s\n  dir=%s\n  out=%s\n' "${_url}" "${_dir}" "$(basename "${_rel}")" >> "${_input}"
+        _need=1
+    done
+    _file="${_dest}/${_gguf_rel}"
+    _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
+        rm -f "${_file}"
+        mkdir -p "$(dirname "${_file}")"
+        printf '%s\n  dir=%s\n  out=%s\n' "${_gguf_url}" "$(dirname "${_file}")" "$(basename "${_file}")" >> "${_input}"
+        _need=1
+    fi
+    if [ "${_need}" = 1 ]; then
+        if command -v aria2c >/dev/null 2>&1; then
+            _log "aria2 多连接下载模型"
+            aria2c -i "${_input}" \
+                --max-concurrent-downloads=8 --split=16 --max-connection-per-server=16 \
+                --min-split-size=1M --file-allocation=none --continue=true \
+                --allow-overwrite=true --auto-file-renaming=false \
+                --retry-wait=2 --max-tries=5 --console-log-level=warn || \
+                _log "⚠️ aria2 返回非零，继续做完整性校验"
+        else
+            _log "未找到 aria2c，使用 curl 顺序下载"
+            for _item in "${_entries[@]}"; do
+                IFS='|' read -r _rel _url _size <<< "${_item}"
+                _file="${_dest}/${_rel}"
+                _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+                [ "${_got}" = "${_size}" ] && continue
+                _log "curl 下载: ${_rel}"
+                curl -fL --http1.1 --connect-timeout 20 --max-time 1200 \
+                    --retry 5 --retry-delay 3 --retry-all-errors -o "${_file}" "${_url}" || _die "下载失败: ${_url}"
+            done
+            _file="${_dest}/${_gguf_rel}"
+            _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
+                curl -fL --http1.1 --connect-timeout 20 --max-time 1800 \
+                    --retry 5 --retry-delay 3 --retry-all-errors -o "${_file}" "${_gguf_url}" || _die "下载失败: ${_gguf_url}"
+            fi
+        fi
+    fi
+    rm -f "${_input}"
+    for _item in "${_entries[@]}"; do
+        IFS='|' read -r _rel _url _size <<< "${_item}"
+        _file="${_dest}/${_rel}"
+        _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+        [ "${_got}" = "${_size}" ] || _die "模型文件大小不符: ${_rel}（期望 ${_size}，实际 ${_got:-缺失}）"
+    done
+    _file="${_dest}/${_gguf_rel}"
+    _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+    [ -n "${_got}" ] && [ "${_got}" -gt 100000000 ] || _die "GGUF 文件缺失或过小: ${_gguf_rel}"
+    _log "模型下载完成: ${_dest}"
+}
+
+_usage() { sed -n '2,23p' "${ROOT}/start.sh"; }
 
 _load_dotenv
 _detect_hw
 case "${1:-start}" in
+    fetch-models) shift; _fetch_models "$@" ;;
     start)
         _check_backends
         _start_qdrant

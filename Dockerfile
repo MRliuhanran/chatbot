@@ -1,14 +1,13 @@
 # ── 单容器 ModelScope 镜像（无 compose、无 shell 脚本）──────────────────
 # 一个容器里跑 Qdrant + Ollama + Streamlit，入口是 chatbot.py 的 all 命令；
 # 与本地源码运行共用同一份 .env / models / artifacts / storage，功能与效果同源。
-# 所有 RUN 使用 exec form，不经过 /bin/sh；不 COPY 任何 shell 脚本。
+# 所有 RUN 使用 exec form；构建期模型下载复用仓库唯一的 start.sh（最终镜像不 COPY 它）。
 #
 # 构建:
 #   docker build -t rag-chatbot:modelscope .
 # 运行:
 #   docker run --rm -p 7860:7860 rag-chatbot:modelscope
 ARG PYTHON_VERSION=3.10
-ARG OLLAMA_GGUF_URL=https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-gguf/resolve/master/MiniCPM5-2B-Q4_K_M.gguf
 
 # ── 直接复用官方镜像里的二进制，避免 RUN 下载/解压 ──
 FROM qdrant/qdrant:v1.19.1 AS qdrant
@@ -28,30 +27,19 @@ COPY requirements.txt /tmp/requirements.txt
 RUN ["pip","install","--no-cache-dir","--index-url","https://download.pytorch.org/whl/cpu","torch==2.7.1"]
 RUN ["pip","install","--no-cache-dir","-r","/tmp/requirements.txt"]
 
-# ── 检索模型 stage：按本地同一批文件从 ModelScope 下载（指纹一致）──
-# 只取本地已存在的文件；不下载 README/configuration.json 等额外文件，避免
-# _model_content_fingerprint 与本地/已建索引不一致。与 pydeps / assets 并行。
-FROM scratch AS fetchmodels
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/colbert_linear.pt /models/bge-m3/colbert_linear.pt
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/config.json /models/bge-m3/config.json
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/config_sentence_transformers.json /models/bge-m3/config_sentence_transformers.json
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/modules.json /models/bge-m3/modules.json
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/pytorch_model.bin /models/bge-m3/pytorch_model.bin
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/sentence_bert_config.json /models/bge-m3/sentence_bert_config.json
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/sentencepiece.bpe.model /models/bge-m3/sentencepiece.bpe.model
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/sparse_linear.pt /models/bge-m3/sparse_linear.pt
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/special_tokens_map.json /models/bge-m3/special_tokens_map.json
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/tokenizer.json /models/bge-m3/tokenizer.json
-ADD https://modelscope.cn/models/BAAI/bge-m3/resolve/master/tokenizer_config.json /models/bge-m3/tokenizer_config.json
-ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/config.json /models/bge-reranker-v2-m3/config.json
-ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/model.safetensors /models/bge-reranker-v2-m3/model.safetensors
-ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/sentencepiece.bpe.model /models/bge-reranker-v2-m3/sentencepiece.bpe.model
-ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/special_tokens_map.json /models/bge-reranker-v2-m3/special_tokens_map.json
-ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/tokenizer.json /models/bge-reranker-v2-m3/tokenizer.json
-ADD https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master/tokenizer_config.json /models/bge-reranker-v2-m3/tokenizer_config.json
+# ── 检索模型 + GGUF stage：唯一 shell start.sh 构建期下载 ───────────────────
+# 为什么不在 Dockerfile 里写 17 个 ADD：远程 ADD 不走层缓存，每次部署重下 4GB；
+# 这里一个 RUN 可缓存，且下载逻辑并入本仓库唯一的 start.sh（Docker/本机共用）。
+FROM python:${PYTHON_VERSION} AS fetchmodels
+ARG MODELS_REV=2026-10-26
+ENV MODELS_REV=${MODELS_REV}
+COPY start.sh /tmp/start.sh
+RUN ["apt-get","update"]
+RUN ["apt-get","install","-y","--no-install-recommends","aria2","ca-certificates"]
+RUN ["bash","/tmp/start.sh","fetch-models","/models"]
 
 # ── 资产 stage：与 pydeps 并行；源码/产物/配置 ──
-# ollama_models 可选：留 .keep 也能构建；正式生成模型由下方 ADD GGUF + all 里的 ollama create 完成。
+# ollama_models 可选：留 .keep 也能构建；正式生成模型由 fetchmodels 下载，all 里执行 ollama create。
 FROM scratch AS assets
 COPY .env /app/.env
 COPY corpus/ /app/corpus/
@@ -64,7 +52,6 @@ COPY storage/ /app/storage/
 
 # ── 最终镜像：一个容器、一个入口、三个子进程由 chatbot.py all 管理 ──
 FROM python:${PYTHON_VERSION} AS app
-ARG OLLAMA_GGUF_URL=https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-gguf/resolve/master/MiniCPM5-2B-Q4_K_M.gguf
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -77,10 +64,11 @@ COPY --from=qdrant /qdrant/qdrant /usr/local/bin/qdrant
 COPY --from=ollama /usr/bin/ollama /usr/local/bin/ollama
 COPY --from=ollama /usr/lib/ollama /usr/local/lib/ollama
 RUN ["test","-x","/usr/local/lib/ollama/llama-server"]
-COPY --from=fetchmodels /models /app/models
+COPY --from=fetchmodels /models/bge-m3 /app/models/bge-m3
+COPY --from=fetchmodels /models/bge-reranker-v2-m3 /app/models/bge-reranker-v2-m3
 COPY --from=assets /app/ /app/
 # 生成模型：直接把官方 GGUF 放进 ollama_models；容器启动后由 all 执行 ollama create。
-ADD ${OLLAMA_GGUF_URL} /app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf
+COPY --from=fetchmodels /models/_gguf/MiniCPM5-2B-Q4_K_M.gguf /app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf
 RUN ["python","-c","import os,sys; p='/app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf'; n=os.path.getsize(p); print('GGUF bytes:', n); sys.exit(0 if n > 100000000 else 1)"]
 COPY chatbot.py /app/chatbot.py
 EXPOSE 7860

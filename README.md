@@ -9,7 +9,7 @@
 | **chatbot.py** | 唯一 Python 文件：CLI + Streamlit + 全部业务逻辑 |
 | **start.sh** | 唯一 shell 文件：Qdrant / Ollama / 应用起停、日志、命令透传、.env 加载 |
 | **README.md** | 唯一 Markdown 文档 |
-| **Dockerfile** | 单容器 ModelScope 镜像（Qdrant + Ollama + Streamlit，无 shell、无 entrypoint.sh） |
+| **Dockerfile** | 单容器 ModelScope 镜像（Qdrant + Ollama + Streamlit；构建期复用唯一 shell `start.sh fetch-models`，最终镜像不含 shell） |
 | `.env` | 配置覆盖层（代码默认值为唯一权威） |
 | `requirements.txt` | 运行时依赖（全量 `==` 锁定） |
 | `corpus/` `models/` `ollama_models/` `artifacts/` `storage/` `lexicon/` | 语料 / 检索模型 / Ollama 模型 / 分块产物 / Qdrant 数据 / 词表 |
