@@ -17,13 +17,14 @@ FROM ollama/ollama:0.34.4 AS ollama
 # ── 依赖 stage：完整 python 镜像自带编译工具，供 llama-cpp-python 编译 ──
 FROM python:${PYTHON_VERSION} AS pydeps
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
-    PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple \
+    PIP_EXTRA_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple \
     PIP_DEFAULT_TIMEOUT=120 \
     PIP_RETRIES=10 \
     CMAKE_ARGS="-DGGML_OPENMP=OFF"
+RUN ["apt-get","update"]
+RUN ["apt-get","install","-y","--no-install-recommends","cmake","ninja-build"]
 COPY requirements.txt /tmp/requirements.txt
-RUN ["pip","install","--no-cache-dir","cmake","ninja"]
 RUN ["pip","install","--no-cache-dir","--index-url","https://download.pytorch.org/whl/cpu","torch==2.7.1"]
 RUN ["pip","install","--no-cache-dir","-r","/tmp/requirements.txt"]
 
@@ -74,7 +75,8 @@ COPY --from=pydeps /usr/local/lib/python3.10/site-packages/ /usr/local/lib/pytho
 COPY --from=pydeps /usr/local/bin/ /usr/local/bin/
 COPY --from=qdrant /qdrant/qdrant /usr/local/bin/qdrant
 COPY --from=ollama /usr/bin/ollama /usr/local/bin/ollama
-COPY --from=ollama /usr/lib/ollama /usr/lib/ollama
+COPY --from=ollama /usr/lib/ollama /usr/local/lib/ollama
+RUN ["test","-x","/usr/local/lib/ollama/llama-server"]
 COPY --from=fetchmodels /models /app/models
 COPY --from=assets /app/ /app/
 # 生成模型：直接把官方 GGUF 放进 ollama_models；容器启动后由 all 执行 ollama create。
