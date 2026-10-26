@@ -3660,8 +3660,12 @@ class HttpRerankBackend:
 
     def rerank(self, query: str, texts: Sequence[str], top_k: int):
         engine = self._engine
-        rr_tok = engine._get_rerank_tokenizer_only()
-        return engine._http_rerank(query, list(texts), top_k=top_k), rr_tok
+        # 并行：重排 HTTP 与 tokenizer 首次加载/编码互不依赖，隐藏 tokenizer 加载时间。
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(engine._http_rerank, query, list(texts), top_k)
+            rr_tok = engine._get_rerank_tokenizer_only()
+            return future.result(), rr_tok
 
 
 class OllamaChatBackend:
