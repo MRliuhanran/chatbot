@@ -4812,6 +4812,18 @@ def _ensure_runtime_models(env, app_root):
     import subprocess
     base = _runtime_models_root()
     missing = [g for g in ("bge-m3", "bge-reranker-v2-m3", "gguf") if not _models_group_complete(base, g)]
+    # 老镜像时代（烤权重 + entrypoint symlink 落位）会在持久盘留下指向 /app/... 的
+    # symlink —— 容器重建后全部悬空；fetch-models 在这种 link 上 mkdir 会失败导致
+    # 启动死循环。缺组前先清掉 symlink 残留（真实目录不动，那个能直接复用）。
+    for g in missing:
+        p = os.path.join(base, "_gguf" if g == "gguf" else g)
+        if os.path.islink(p):
+            try:
+                os.unlink(p)
+                log(f"📦 [模型装载] 清理旧镜像残留 symlink: {p}")
+            except OSError as exc:
+                log(f"❌ [模型装载] 无法清理残留 symlink {p}: {exc.__class__.__name__}: {exc}")
+                return False
     if missing:
         log(f"📦 [模型装载] 根目录={base}；缺组: {','.join(missing)}"
             f"→ start.sh fetch-models 开拉（多连接+断点续传，进度直落日志）")
