@@ -39,10 +39,13 @@ load_dotenv()
 # 本地 Ollama/Qdrant 不走系统代理（否则 requests 可能被劫持而超时）。
 # 幂等：重复 import（reload/测试）时把历史已写入的 NO_PROXY 一并拼进来去重，
 # 不会因为再跑一次就把旧值再包一层。
-_proxy_parts = [p.strip() for p in os.environ.get("NO_PROXY", "").replace(",", " ").split()]
+# 两个变量都读：旧写法只读大写 NO_PROXY —— 用户只导出小写 no_proxy（urllib 同样尊重）
+# 时，旧值随后被双向覆盖 -> 对内网主机的绕过规则被静默清空、请求改走系统代理。
+_proxy_src = f"{os.environ.get('NO_PROXY', '')} {os.environ.get('no_proxy', '')}".replace(",", " ")
+_proxy_parts = [p.strip() for p in _proxy_src.split()]
 _loopback = ",".join(dict.fromkeys(p for p in _proxy_parts + ["127.0.0.1", "localhost", "::1"] if p))
 os.environ["NO_PROXY"] = os.environ["no_proxy"] = _loopback
-del _proxy_parts, _loopback
+del _proxy_src, _proxy_parts, _loopback
 warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum")
 
 
@@ -375,11 +378,14 @@ class _LockedRotatingFileHandler(RotatingFileHandler):
     fd 已脱离现行文件就重开，当前路径真实大小超限就按它轮转。
     """
 
-    def shouldRollover(self, record, msg):
+    def shouldRollover(self, record):
         """禁用基类 fd 位置轮转：BaseRotatingHandler.emit 的默认流程还会走一遍
         (stream.tell() + len(msg)) >= maxBytes —— fd 陈旧时这是**旧文件的偏移**，结论不可
         靠（实测：每条 emit 轮转两次、备份文件只剩目标交替）。轮转的唯一触发点交给
-        _rotate_if_current_is_full（按当前路径真实大小），本钩子恒 False。"""
+        _rotate_if_current_is_full（按当前路径真实大小），本钩子恒 False。
+        单参签名必须随标准库（RotatingFileHandler.emit 内部调 self.shouldRollover(record)）：
+        以前多出的 msg 形参让两条降级分支（无 fcntl / 锁文件打不开）在 super().emit 里一走
+        就 TypeError —— 异常又被基类 emit 的 handleError 吞掉，轮转静默失效。"""
         return False
 
     def emit(self, record):
@@ -704,8 +710,12 @@ def _gen_num_gpu_effective():
 
 
 def _gen_gpu_fallback(reason):
-    """auto 模式：把 num_gpu 永久降级为"不发该字段"。返回 True 表示这次真的落了一次
-    （调用方据此决定是否重发）；非 auto 或已经落过则返回 False。"""
+    """auto 模式：把 num_gpu 永久降级为"不发该字段"（进程内一次翻转，不再复位）。
+    返回 True 表示**本请求可以**用 CPU 配置重发一次 —— 首败线程翻转成功，或翻转已经
+   发生过（并发的第二个失败者：它的 ['fallback'] 已为 True 查到的是别人的翻转，但本
+    请求的失败同样源自同一个尚未回落的设备状态，也要给重试机会才不至于"并发首问必
+   有一问直接报错"）。非 auto 或非设备类失败返回 False。
+    """
     if GEN_NUM_GPU != "auto":
         return False
     # ★ 只认**设备类**失败：旧判据是"任何非 200"，于是容器冷启动时模型还在后台拉取的那个
@@ -717,10 +727,10 @@ def _gen_gpu_fallback(reason):
         log(f"⚠️  生成失败但不像设备问题（{reason}）：保持 num_gpu 不变，不做 GPU 回落")
         return False
     with _GEN_GPU_LOCK:
-        if _GEN_GPU_STATE["fallback"]:
-            return False
+        _was_first_fall = not _GEN_GPU_STATE["fallback"]
         _GEN_GPU_STATE["fallback"] = True
-    log(f"⚠️  生成侧 GPU 不可用（{reason}）→ RAG_GEN_NUM_GPU=auto 回落为 CPU，本进程内不再尝试 GPU")
+    if _was_first_fall:
+        log(f"⚠️  生成侧 GPU 不可用（{reason}）→ RAG_GEN_NUM_GPU=auto 回落为 CPU，本进程内不再尝试 GPU")
     return True
 
 
@@ -763,11 +773,14 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
             return
         _gen_started = time.monotonic()
         for line in r.iter_lines():
-            if not line:
-                continue
+            # 整轮硬上限检查必须在空行 continue **之前**：异常/恶意流若持续发空行而无任何
+            # 有效数据，读空闲超时（对"无数据"计数）时任一行都不再绕过 —— 旧顺序下本轮能
+            # 被纯空行挂到天荒地老（STREAM_READ_TIMEOUT 只断"完全没字节"，空行就是字节）。
             if TURN_TIMEOUT and (time.monotonic() - _gen_started) > TURN_TIMEOUT:
                 yield EVENT_ERROR, f"生成超时：本轮超过 {TURN_TIMEOUT:.0f}s（RAG_TURN_TIMEOUT）"
                 return
+            if not line:
+                continue
             chunk = json.loads(line)
             if chunk.get("error"):
                 # return 而不是 continue：本函数对外承诺「error 与 done 互斥」，消费侧
@@ -794,9 +807,16 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
                 yield EVENT_DONE, { "done_reason": chunk.get("done_reason"), "eval_count": chunk.get("eval_count"), "prompt_eval_count": chunk.get("prompt_eval_count"), }
     except Exception as exc:
         _ename = type(exc).__name__
-        if _ename in ("ReadTimeout", "Timeout", "ConnectionError", "ChunkedEncodingError"):
-            yield EVENT_ERROR, (f"生成超时/连接中断：等待超过 {STREAM_READ_TIMEOUT:.0f}s 无新数据"
-                               f"（{_ename}；可调 RAG_STREAM_READ_TIMEOUT / 看 ollama 日志）")
+        # 归因必须分开：ConnectionError 绝大多数是**连接建立失败/被重置**（Ollama 没起、
+        # 端口不通、服务重启瞬间 —— requests 的 (10, READ) 超时里 10s 就会抛），把它的
+        # 文案写成"等待超过读空闲超时无新数据"会指错方向（调大 RAG_STREAM_READ_TIMEOUT
+        # 毫无用处）。真正属于读空闲的只有 ReadTimeout。
+        if _ename in ("ReadTimeout", "Timeout"):
+            yield EVENT_ERROR, (f"生成超时：连接已建立但等待超过 {STREAM_READ_TIMEOUT:.0f}s 无新数据"
+                                f"（{_ename}；可调 RAG_STREAM_READ_TIMEOUT / 看 ollama 日志）")
+        elif _ename == "ConnectionError":
+            yield EVENT_ERROR, (f"生成失败：连不上 Ollama 或连接被重置（{_ename}: {exc}）"
+                                f"—— 先确认 ollama serve 在跑、OLLAMA_BASE_URL/NO_PROXY 正确，再看 ollama 日志")
         else:
             yield EVENT_ERROR, f"{_ename}: {exc}"
     finally:
@@ -1000,7 +1020,10 @@ COLLECTION_NAME = COLLECTION_BASE
 COLLECTION_ALIAS = os.getenv("RAG_COLLECTION_ALIAS", "rag_current")
 USE_COLLECTION_ALIAS = env_bool("RAG_USE_COLLECTION_ALIAS", True)
 EMBED_MODEL_PATH = os.getenv("RAG_EMBED_MODEL_PATH", "./models/bge-base-zh-v1.5")
-RERANK_MODEL_PATH = os.getenv("RAG_RERANK_MODEL_PATH", "./models/bge-reranker-base")
+# 与 http 后端的默认 RERANK_MODEL_NAME（bge-reranker-v2-m3）**必须同一个模型**：
+# torch 路径按 PATH 加载、http 路径按 NAME 请求，旧默认 torch=base/http=v2-m3 —— 未显式
+# 配置的部署里一切换后端重排结果就变、分数还不可比；耗时观测表也按 v2-m3 校准的。
+RERANK_MODEL_PATH = os.getenv("RAG_RERANK_MODEL_PATH", "./models/bge-reranker-v2-m3")
 # 创空间 entrypoint 把嵌入/重排权重下载放后台、并先启动服务：首查询会撞上下载窗口，
 # 旧行为直接抛"模型目录缺失或为空"。entrypoint 在真实下载时导出 RAG_WEIGHTS_BACKGROUND=1，
 # 加载侧据此轮询等待（RAG_MODEL_WAIT_SECS，默认 900s），下载明确失败才提前放弃；
@@ -1555,6 +1578,12 @@ def _sources_fingerprint(paths):
     return out
 
 
+class _DocGlobConfigError(FileNotFoundError):
+    """RAG_DOC_GLOB 写死成无通配符的文件名、且该文件不存在 —— 这是**配置错误**，
+    与"目录缺失"（环境污染，按未构建处理）语义不同：上层 gate 借此把"corpus 非空但没
+    建库"的误导（用户先重跑 process 而非先修 glob）阻断掉。"""
+
+
 def _document_paths():
     if not os.path.isdir(DATA_DIR):
         raise FileNotFoundError(f"找不到数据目录: {DATA_DIR}")
@@ -1564,10 +1593,11 @@ def _document_paths():
     )
     if not paths and not glob.has_magic(DOC_GLOB):
         # 区分两种"一个都没匹配"：glob 里**没有通配符**等于写死了文件名，匹配不到就是配置
-        # 指错了（保留 raise）；目录存在、通配符没命中则是**合法边界** —— 语料被清空，
+        # 指错了（保留 raise，且用专门子类 —— _corpus_has_searchable_content 需要钳住
+        # "配置错误 ≠ corpus 非空"）；目录存在、通配符没命中则是**合法边界** —— 语料被清空，
         # 必须返回空列表走 0 文档分支，否则空语料让 process/index 双双失败、知识库永远
         # 清不掉（旧写法一律 raise：把"清空"这个正常操作变成不可达状态）。
-        raise FileNotFoundError(
+        raise _DocGlobConfigError(
             f"{DATA_DIR} 中没有匹配 {DOC_GLOB!r} 的文档"
             f"（该 glob 不含通配符，等于指定了单个文件名 —— 检查 RAG_DOC_GLOB 与 RAG_DATA_DIR）"
         )
@@ -1611,7 +1641,11 @@ def _doc_cache_path(source_name):
 
 
 def _load_doc_chunks(source_name, sha, fingerprint):
-    """单文档分块缓存：内容 sha 与切分指纹一致才复用；否则重算（增删改增量的关键）。"""
+    """单文档分块缓存：内容 sha 与切分指纹一致才复用；否则重算（增删改增量的关键）。
+    这里的 fingerprint 是**分块配置指纹**（config_fp，与文档集无关），不是语料级全局
+    指纹 —— 后者把全部文档并在一起，任何一篇变化都会让所有未变文档失配（见 build_chunks
+    的 jobs 注释）。判定用的是 OR：sha 或 fingerprints 任一失配都重算；历史缓存里存全局
+    指纹 → 升级后首轮全 miss 一次性重算，此后恢复增量命中。"""
     path = _doc_cache_path(source_name)
     if not os.path.exists(path):
         return None
@@ -1790,8 +1824,15 @@ def build_chunks():
     total = len(paths)
     # 逐文档兜底语义不变：单篇坏数据/异常只跳过自己，末尾因 failures 短路返回、不覆盖
     # chunks.json —— 残缺产物一旦入库，索引就会静默少文档。
+    # per-doc 缓存判据用「分块配置指纹 + 本文档 sha」，**不是**语料级全局 fingerprint：
+    # 全局值把全部文档的 sha 并在一起（_chunking_fingerprint），任何一篇增/删/改都会
+    # 让所有未变文档的缓存判据失配 → 名义上的"增量"在每次语料变化时都退化为全库重算
+    # （997 篇全部过 tokenizer 重分块），per-doc sha 比对同时沦为死代码。config_fp 只
+    # 描述"切分规则/组件版本变过没有"，与文档集无关；索引 payload 的 chunk_fingerprint
+    # 仍用全局值（防止改语料不重跑 index 的旧指纹误导检索，两处用途分开）。
+    # 升级后旧 doc-cache 里存的是全局指纹 → 首轮全 miss 一次性重算，之后永久增量命中。
     jobs = [
-        (i, filepath, name_of[filepath], sources_now[os.path.relpath(filepath, DATA_DIR)], fingerprint, total)
+        (i, filepath, name_of[filepath], sources_now[os.path.relpath(filepath, DATA_DIR)], config_fp, total)
         for i, filepath in enumerate(paths)
     ]
     workers = min(total, offline_workers()) if total else 1
@@ -1960,14 +2001,23 @@ def parse_aliases(path):
     if not os.path.exists(path):
         problems.append("文件不存在：%s" % path)
         return groups, problems
-    with open(path, encoding="utf-8") as fh:
-        for lineno, raw in enumerate(fh, 1):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            file_lines = fh.readlines()
+    except UnicodeDecodeError as exc:
+        # 文件存在但不是合法 UTF-8（GBK/坏字节导出表）：与"文件缺失"同属"词表不可用"——
+        # 按空词表降级 + 告警（别名归一跳过），绝不能把解码异常沿途上抛让首查询/预热
+        # 直接崩。校验器（lexicon 命令）的 problems 输出会显示根因；这里以 problems
+        # 而非 raise 传达，与 _load_doc_chunks 的"坏档→告警→按重算降级"同一口径。
+        problems.append(f"文件不是合法 UTF-8，词表按不可用继续（请以 UTF-8 重存）: {path}（{type(exc).__name__}: {exc}）")
+        return groups, problems
+    for lineno, raw in enumerate(file_lines, 1):
             body = raw.split("#", 1)[0]
             if not body.strip():
                 continue
-            if raw.rstrip("\n").endswith("\t"):
+            if raw.rstrip("\r\n").endswith("\t"):
                 problems.append("第 %d 行：行尾有多余 TAB（空字段）" % lineno)
-            fields = body.rstrip("\n").split("\t")
+            fields = body.rstrip("\r\n").split("\t")
             fields = [f.strip() for f in fields]
             if any(f == "" for f in fields):
                 problems.append("第 %d 行：存在空字段 %r" % (lineno, fields))
@@ -2006,8 +2056,14 @@ def parse_stopwords(path):
     if not os.path.exists(path):
         problems.append("文件不存在：%s" % path)
         return words, problems
-    with open(path, encoding="utf-8") as fh:
-        for lineno, raw in enumerate(fh, 1):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            file_lines = fh.readlines()
+    except UnicodeDecodeError as exc:
+        # 同 parse_aliases：坏编码词表按"不可用"降级 + 告警，不上抛。
+        problems.append(f"文件不是合法 UTF-8，词表按不可用继续（请以 UTF-8 重存）: {path}（{type(exc).__name__}: {exc}）")
+        return words, problems
+    for lineno, raw in enumerate(file_lines, 1):
             word = raw.split("#", 1)[0].strip()
             if not word:
                 continue
@@ -2645,228 +2701,263 @@ def build_index():
     if device == "mps":
         _mps_empty_cache()
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
-    alias_ok = USE_COLLECTION_ALIAS
-    if alias_ok:
-        try:
-            client.get_aliases()
-        except Exception as exc:
-            log(f"    ⚠️  Qdrant 不支持集合别名，回退为 delete+create 全量重建: {exc}")
-            alias_ok = False
-    # 旧集合名不再在这里占位：别名分支用 prev_alias_target（本轮之前的目标），
-    # 非别名分支的目标集合就是 COLLECTION_NAME 本身。
-    target_collection = f"{COLLECTION_NAME}__{build_id[:8]}" if alias_ok else COLLECTION_NAME
-    if not alias_ok:
-        try:
-            client.delete_collection(collection_name=target_collection)
-        except Exception:
-            pass
-    log(f"写入 Qdrant (稠密+稀疏混合) → 集合 {target_collection}")
-    client.create_collection( collection_name=target_collection, vectors_config={ DENSE_VECTOR_NAME: VectorParams( size=dense_dim, distance=Distance.COSINE, ) }, sparse_vectors_config={ SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF) }, )
-    for field, schema in ( (SOURCE_FIELD, PayloadSchemaType.KEYWORD), ("parent_id", PayloadSchemaType.KEYWORD), ):
-        try:
-            client.create_payload_index( collection_name=target_collection, field_name=field, field_schema=schema )
-        except Exception as exc:
-            log(f"    ⚠️  payload 索引 {field} 创建失败（过滤会退化为扫描）: {exc}")
-    write_failures: list = []
-    batch_starts = list(range(0, total, WRITE_BATCH))
-    batch_sizes = {i: min(i + WRITE_BATCH, total) - i for i in batch_starts}
-
-    # 线程本地客户端：ModelEmbedder 每客户端一份，per-worker 客户端 = per-worker 推理器，
-    # 于是本地推理不需要跨线程互斥（见上方注释）。只用公开 API，不碰 qdrant-client 私有成员；
-    # 客户端随 worker 线程存活到本次 index 结束（进程退出即回收）。
-    _worker_state = threading.local()
-
-    def _worker_client():
-        c = getattr(_worker_state, "client", None)
-        if c is None:
-            c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
-            _worker_state.client = c
-        return c
-
-    _write_times: list = []   # 每批的 (构造, 往返) 秒数：并发度就是按这两个数派生的（见下）
-
-    def _write_batch(i):
-        # 批次内任何异常（点构造 / 稀疏 Document 拆包 / MemoryError / KeyboardInterrupt…）
-        # 都必须转成错误串交回调用方：从 fut.result() 抛出会**跳过整段 write_failures 收尾**
-        # （不删孤儿集合、不报"谁在服务"、连集合名都不留 —— 失效原型：自崩）。
-        try:
-            _t_construct = time.perf_counter()
-            batch_chunks = all_chunks[i:i + WRITE_BATCH]
-            batch_embeddings = embeddings[i:i + WRITE_BATCH]
-            points = []
-            for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
-                # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
-                points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))  # type: ignore[union-attr]
-            _t_http = time.perf_counter()
-            _err = _upsert_batch_with_retry(_worker_client(), target_collection, points)
-            _write_times.append((_t_http - _t_construct, time.perf_counter() - _t_http))
-            return i, _err
-        except BaseException as exc:  # noqa: BLE001 - 见上：必须转成错误串，不能越过收尾
-            return i, f"{type(exc).__name__}: {exc}"
-
-    # 各批彼此独立（point id 由 batch 起始下标决定，与写入先后无关），故并发发往 Qdrant：
-    # 墙钟 ≈ 批次往返 × 批数 ÷ 并发度，而非逐批之和。**每 worker 一个客户端**是这里的
-    # 并发前提：qdrant-client 的 ModelEmbedder（Document 的本地拆包器）是每客户端一份且
-    # 内部无锁的，共用一份客户端时多线程会互相 drain _embed_storage（IndexError / 422），
-    # 旧修法用一把模块锁把整次 upsert（含 HTTP 往返）串行化 —— 4 路写批于是退化成 1 路，
-    # 与"并发发往 Qdrant"这句注释相反。分开客户端后每份推理器只被自己的线程使用，
-    # 本地推理天然串行，HTTP 往返真正并发。
-    max_workers = INDEX_WRITE_WORKERS or qdrant_write_workers(len(batch_starts))
-    log(
-        f"  Qdrant 写批并发: {max_workers} 路（{len(batch_starts)} 批 × {WRITE_BATCH} 点；"
-        f"Little: 目标 {QDRANT_TARGET_PPS} 点/秒 × 实测单批 {QDRANT_BATCH_RTT_S}s ÷ {WRITE_BATCH} 点/批；{hw_report()}）"
-    )
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    _write_t0 = time.time()
-    done_points = 0
-    completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_write_batch, i) for i in batch_starts]
-        for fut in as_completed(futures):
-            i, err = fut.result()
-            completed += 1
-            done_points += batch_sizes[i]
-            if err:
-                write_failures.append((i, err))
-                log(f"    ⚠️  写入批次 [{i}, {min(i + WRITE_BATCH, total)}) 失败，其余批继续: {err}")
-            if completed % 5 == 0 or completed == len(batch_starts):
-                log(f"  Qdrant 写入进度: {min(done_points, total)}/{total}")
-    _write_wall = time.time() - _write_t0
-    if done_points:
-        log(f"  写批墙钟: {_write_wall:.1f}s / {done_points} 点（{done_points / max(_write_wall, 1e-9):.0f} 点/秒，{max_workers} 路并发）")
-    if _write_times:
-        # 分解：构造 = 纯 Python（emb.tolist + PointStruct + 服务端 Document 包装），往返 = HTTP。
-        # 两者之比正是"要几路并发"的依据 —— 构造被 GIL 串行，只有往返能真正重叠。
-        _c_avg = sum(c for c, _h in _write_times) / len(_write_times)
-        _h_avg = sum(h for _c2, h in _write_times) / len(_write_times)
-        log(f"  写批分解: 单批构造 {_c_avg:.2f}s + 往返 {_h_avg:.2f}s（并发 {max_workers} 路）")
-    write_failures.sort()
-    if write_failures:
-        # 半截集合是本次失败留下的孤儿：别名没切、检索不读它，而下一次 index 会用新的
-        # build_id 另起集合 —— 不清理就永久占盘，且当次失败日志里连名字都不留（直到某次
-        # 成功运行的 stragglers 扫描才被发现）。能删就删，删不掉给出手动回收命令。
-        orphan_hint = ""
+    try:
+        alias_ok = USE_COLLECTION_ALIAS
         if alias_ok:
             try:
+                client.get_aliases()
+            except Exception as exc:
+                log(f"    ⚠️  Qdrant 不支持集合别名，回退为 delete+create 全量重建: {exc}")
+                alias_ok = False
+        # 旧集合名不再在这里占位：别名分支用 prev_alias_target（本轮之前的目标），
+        # 非别名分支的目标集合就是 COLLECTION_NAME 本身。
+        target_collection = f"{COLLECTION_NAME}__{build_id[:8]}" if alias_ok else COLLECTION_NAME
+        if not alias_ok:
+            try:
                 client.delete_collection(collection_name=target_collection)
-                log(f"  已清理未完成的集合 {target_collection}（未切别名，重跑 index 会新建）")
-            except Exception as cleanup_exc:
-                orphan_hint = f"；孤儿集合 {target_collection} 需手动回收: curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{target_collection}（{type(cleanup_exc).__name__}: {cleanup_exc}）"
-        # 两种模式下"谁在服务"是相反的：别名模式旧集合还在并继续服务；非别名模式
-        # 上面已把旧集合删掉，残缺的目标集合就是当前服务集合 —— 报错必须说清。
-        serving = (
-            f"集合 {target_collection} 未切别名，旧集合继续服务"
-            if alias_ok
-            else f"集合 {target_collection} 是非别名模式的服务集合（旧集合已在写入前删除），当前点数残缺，检索会吃到不完整结果"
-        )
-        raise RuntimeError(
-            f"{len(write_failures)} 批写入失败（批次起始 {[fi for fi, _ in write_failures][:5]}）："
-            f"{serving}；"
-            f"失败示例 {write_failures[0][1]}{orphan_hint}。网络/Qdrant 恢复后重跑 index（稠密走缓存增量）。"
-        )
-    info = client.get_collection(collection_name=target_collection)
-    # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages 事后发现。
-    # 非别名路径下旧集合若没删掉（delete_collection 失败/集合不存在时报错被吞），写入只覆盖
-    # id 0..total-1，旧点会以 id >= total 残留。**它们不是"检索不到"**：检索是做向量搜索、
-    # 没有任何 id 过滤，残留点会被正常召回并返回陈旧正文（旧文案把方向说反了）。
-    # 所以这里不是报错了事，而是**按实现清理**：先删 id >= total 的残留点，再复核点数。
-    written = client.count(collection_name=target_collection, exact=True).count
-    log(f"  Qdrant 写入完成: {written} 条")
-    if written != total:
-        residual = []
-        offset = None
-        while True:
-            pts, offset = client.scroll( collection_name=target_collection, limit=WRITE_BATCH, offset=offset, with_payload=False, with_vectors=False )
-            residual.extend(p.id for p in pts if isinstance(p.id, int) and p.id >= total)
-            if offset is None:
-                break
-        if residual:
-            client.delete(collection_name=target_collection, points_selector=residual)
-            written = client.count(collection_name=target_collection, exact=True).count
-            log(f"  已清理 {len(residual)} 个 id >= {total} 的残留点（旧集合未删净），复核点数: {written}")
-    if written != total:
-        raise RuntimeError(
-            f"集合 {target_collection} 点数 {written} != 分块记录数 {total}："
-            "残留点（id >= 分块记录数）会被检索正常召回并返回陈旧正文（检索不做 id 过滤）；"
-            "清理后仍不一致，请删掉该集合后重跑 index，或启用 RAG_USE_COLLECTION_ALIAS"
-        )
-    coll_dense_size = next(iter(info.config.params.vectors.values())).size  # type: ignore[union-attr]
-    # 显式 raise 而非 assert（-O 会剥离 assert，维度错配就静默放行了）
-    if coll_dense_size != dense_dim:
-        raise RuntimeError(f"集合稠密维度 {coll_dense_size} 与本次编码维度 {dense_dim} 不一致（集合名 {target_collection}）")
-    log(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} (size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")  # type: ignore[union-attr]
-    log("  索引构建完成: 稠密向量 + 稀疏向量（Qdrant 内置 BM25，分词在服务端 multilingual）")
-    if alias_ok:
-        # 别名切换存在竞态窗口：get_aliases 到 update_collection_aliases 间其他进程可能修改别名。
-        # 采用重试 + 验证策略：只重试一次（共 2 次尝试），每次切换后验证别名确实指向新集合。
-        # 但 DeleteAlias + CreateAlias 是**两个非事务操作**：Delete 成功而 Create 失败（重试
-        # 耗尽）会把别名删空 —— 检索端下一个请求全线挂，而旧文案写的是"检索端仍指向旧集合"，
-        # 方向正好相反（失效原型：状态 + 报错指错方向）。故：①失败分支按"本轮之前的目标"
-        # 先发一次恢复性 CreateAlias（失败仅告警）；②文案按 client.get_aliases() 的**实际**
-        # 结果组织；③成功路径用"本轮之前的目标"删旧集合 —— 重试后循环内变量可能已变成
-        # 本次的 target（切成功但读回旧缓存），那时真正的旧集合就永远不会被删。
-        prev_alias_target = None   # 本轮之前别名指向的集合，只在第一次尝试前读一次
-        switched = False
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                current_target = next(
-                    (a.collection_name for a in client.get_aliases().aliases if a.alias_name == COLLECTION_ALIAS),
-                    None,
-                )
-                if attempt == 0:
-                    prev_alias_target = current_target
-                # 空别名冷启动不能对不存在的 alias 提交 Delete（部分 Qdrant 版本整批失败）；有旧别名才删，Create 恒提交。
-                ops: list = []
-                if current_target is not None:
-                    ops.append(DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION_ALIAS)))
-                ops.append(CreateAliasOperation(create_alias=CreateAlias(collection_name=target_collection, alias_name=COLLECTION_ALIAS)))
-                client.update_collection_aliases(change_aliases_operations=ops)
-                # 验证别名切换成功
-                aliases_after = client.get_aliases().aliases
-                new_target = next((a.collection_name for a in aliases_after if a.alias_name == COLLECTION_ALIAS), None)
-                if new_target == target_collection:
-                    switched = True
-                    log(f"  别名已切换: {COLLECTION_ALIAS} → {target_collection}" + (f"（原 {prev_alias_target}）" if prev_alias_target else "（冷启动，无旧别名）"))
-                    break
-                log(f"  ⚠️  别名切换验证失败（尝试 {attempt + 1}/{max_retries}）：别名指向 {new_target}，期望 {target_collection}")
             except Exception as exc:
-                log(f"  ⚠️  别名切换异常（尝试 {attempt + 1}/{max_retries}）：{exc}")
-        if not switched:
-            actual = _current_alias_target(client)
-            if actual is None and prev_alias_target:
-                # 别名此刻可能是被本轮 DeleteAlias 删掉的：先把它指回旧集合，别让检索裸奔。
+                # 只放行"本来就不存在"（首次建库的合法情形）。其它失败（超时/闪断/busy）不能
+                # 静默吞掉：下一步 create_collection 会以同名冲突裸崩、发生在 write_failures
+                # 收尾**之前** —— 不删孤儿集合、不报"谁在服务"，报错方向还被指反。这里先说
+                # 真实根因、再重试一次，都失败就带上下文退出。
+                _not_present = ("not found" in str(exc).lower()
+                                or getattr(exc, "status_code", None) == 404)
+                if _not_present:
+                    log(f"    （旧集合 {target_collection} 不存在：首次建库，略过删除）")
+                else:
+                    log(f"⚠️  delete_collection({target_collection}) 失败（非'不存在'）: {type(exc).__name__}: {exc}；2s 后重试一次")
+                    time.sleep(2)
+                    try:
+                        client.delete_collection(collection_name=target_collection)
+                    except Exception as exc2:
+                        raise RuntimeError(
+                            f"重建前的旧集合 {target_collection} 删除失败（{type(exc2).__name__}: {exc2}；已重试一次）"
+                            f"—— 旧集合仍在时同名 create 必然冲突，先手动清理："
+                            f"curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{target_collection}"
+                        ) from exc2
+        log(f"写入 Qdrant (稠密+稀疏混合) → 集合 {target_collection}")
+        client.create_collection( collection_name=target_collection, vectors_config={ DENSE_VECTOR_NAME: VectorParams( size=dense_dim, distance=Distance.COSINE, ) }, sparse_vectors_config={ SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF) }, )
+        for field, schema in ( (SOURCE_FIELD, PayloadSchemaType.KEYWORD), ("parent_id", PayloadSchemaType.KEYWORD), ):
+            try:
+                client.create_payload_index( collection_name=target_collection, field_name=field, field_schema=schema )
+            except Exception as exc:
+                log(f"    ⚠️  payload 索引 {field} 创建失败（过滤会退化为扫描）: {exc}")
+        write_failures: list = []
+        batch_starts = list(range(0, total, WRITE_BATCH))
+        batch_sizes = {i: min(i + WRITE_BATCH, total) - i for i in batch_starts}
+
+        # 线程本地客户端：ModelEmbedder 每客户端一份，per-worker 客户端 = per-worker 推理器，
+        # 于是本地推理不需要跨线程互斥（见上方注释）。只用公开 API，不碰 qdrant-client 私有成员；
+        # 客户端随 worker 线程存活到本次 index 结束 —— 池关闭后由 _worker_clients 统一 close
+        # （长期驻留进程里反复 build_index 若失败路径泄 client，每轮挂一堆不 close 的连接池）。
+        _worker_state = threading.local()
+        _worker_clients: list = []
+        _worker_clients_lock = threading.Lock()
+
+        def _worker_client():
+            c = getattr(_worker_state, "client", None)
+            if c is None:
+                c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+                with _worker_clients_lock:
+                    _worker_clients.append(c)
+                _worker_state.client = c
+            return c
+
+        _write_times: list = []   # 每批的 (构造, 往返) 秒数：并发度就是按这两个数派生的（见下）
+
+        def _write_batch(i):
+            # 批次内任何异常（点构造 / 稀疏 Document 拆包 / MemoryError / KeyboardInterrupt…）
+            # 都必须转成错误串交回调用方：从 fut.result() 抛出会**跳过整段 write_failures 收尾**
+            # （不删孤儿集合、不报"谁在服务"、连集合名都不留 —— 失效原型：自崩）。
+            try:
+                _t_construct = time.perf_counter()
+                batch_chunks = all_chunks[i:i + WRITE_BATCH]
+                batch_embeddings = embeddings[i:i + WRITE_BATCH]
+                points = []
+                for j, (chunk, emb) in enumerate(zip(batch_chunks, batch_embeddings)):
+                    # 稀疏与稠密取同一份文本（_index_text），不让两条通道描述不同内容
+                    points.append(PointStruct( id=i + j, vector={ DENSE_VECTOR_NAME: emb.tolist(), SPARSE_VECTOR_NAME: sparse_encode(_index_text(chunk)), }, payload=chunk_payload(chunk, build_id, lexicon_id, chunk_fingerprint), ))  # type: ignore[union-attr]
+                _t_http = time.perf_counter()
+                _err = _upsert_batch_with_retry(_worker_client(), target_collection, points)
+                _write_times.append((_t_http - _t_construct, time.perf_counter() - _t_http))
+                return i, _err
+            except BaseException as exc:  # noqa: BLE001 - 见上：必须转成错误串，不能越过收尾
+                return i, f"{type(exc).__name__}: {exc}"
+
+        # 各批彼此独立（point id 由 batch 起始下标决定，与写入先后无关），故并发发往 Qdrant：
+        # 墙钟 ≈ 批次往返 × 批数 ÷ 并发度，而非逐批之和。**每 worker 一个客户端**是这里的
+        # 并发前提：qdrant-client 的 ModelEmbedder（Document 的本地拆包器）是每客户端一份且
+        # 内部无锁的，共用一份客户端时多线程会互相 drain _embed_storage（IndexError / 422），
+        # 旧修法用一把模块锁把整次 upsert（含 HTTP 往返）串行化 —— 4 路写批于是退化成 1 路，
+        # 与"并发发往 Qdrant"这句注释相反。分开客户端后每份推理器只被自己的线程使用，
+        # 本地推理天然串行，HTTP 往返真正并发。
+        max_workers = INDEX_WRITE_WORKERS or qdrant_write_workers(len(batch_starts))
+        log(
+            f"  Qdrant 写批并发: {max_workers} 路（{len(batch_starts)} 批 × {WRITE_BATCH} 点；"
+            f"Little: 目标 {QDRANT_TARGET_PPS} 点/秒 × 实测单批 {QDRANT_BATCH_RTT_S}s ÷ {WRITE_BATCH} 点/批；{hw_report()}）"
+        )
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        _write_t0 = time.time()
+        done_points = 0
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_write_batch, i) for i in batch_starts]
+            for fut in as_completed(futures):
+                i, err = fut.result()
+                completed += 1
+                done_points += batch_sizes[i]
+                if err:
+                    write_failures.append((i, err))
+                    log(f"    ⚠️  写入批次 [{i}, {min(i + WRITE_BATCH, total)}) 失败，其余批继续: {err}")
+                if completed % 5 == 0 or completed == len(batch_starts):
+                    log(f"  Qdrant 写入进度: {min(done_points, total)}/{total}")
+        # 池已关闭 → worker 线程全部结束；逐个 close 它们的客户端（不等 GC）。
+        for _wc in list(_worker_clients):
+            try:
+                _wc.close()
+            except Exception:
+                pass
+        _write_wall = time.time() - _write_t0
+        if done_points:
+            log(f"  写批墙钟: {_write_wall:.1f}s / {done_points} 点（{done_points / max(_write_wall, 1e-9):.0f} 点/秒，{max_workers} 路并发）")
+        if _write_times:
+            # 分解：构造 = 纯 Python（emb.tolist + PointStruct + 服务端 Document 包装），往返 = HTTP。
+            # 两者之比正是"要几路并发"的依据 —— 构造被 GIL 串行，只有往返能真正重叠。
+            _c_avg = sum(c for c, _h in _write_times) / len(_write_times)
+            _h_avg = sum(h for _c2, h in _write_times) / len(_write_times)
+            log(f"  写批分解: 单批构造 {_c_avg:.2f}s + 往返 {_h_avg:.2f}s（并发 {max_workers} 路）")
+        write_failures.sort()
+        if write_failures:
+            # 半截集合是本次失败留下的孤儿：别名没切、检索不读它，而下一次 index 会用新的
+            # build_id 另起集合 —— 不清理就永久占盘，且当次失败日志里连名字都不留（直到某次
+            # 成功运行的 stragglers 扫描才被发现）。能删就删，删不掉给出手动回收命令。
+            orphan_hint = ""
+            if alias_ok:
                 try:
-                    client.update_collection_aliases(change_aliases_operations=[CreateAliasOperation(create_alias=CreateAlias(collection_name=prev_alias_target, alias_name=COLLECTION_ALIAS))])
-                    actual = prev_alias_target
-                    log(f"  ♻️  别名已恢复到 {prev_alias_target}（本轮切换失败，先保证检索端有可用集合）")
-                except Exception as exc:
-                    log(f"  ⚠️  恢复别名到 {prev_alias_target} 失败: {type(exc).__name__}: {exc}")
-                    actual = _current_alias_target(client)
-            raise RuntimeError(
-                f"别名切换失败：新集合 {target_collection} 已建好；别名 {COLLECTION_ALIAS} 实际指向 "
-                f"{actual if actual else '（不存在 —— 检索端当前不可用，需人工恢复）'}。"
-                f"修好后重跑 index（稠密走缓存增量），或直接用 Qdrant 别名 API 指回可用集合。"
+                    client.delete_collection(collection_name=target_collection)
+                    log(f"  已清理未完成的集合 {target_collection}（未切别名，重跑 index 会新建）")
+                except Exception as cleanup_exc:
+                    orphan_hint = f"；孤儿集合 {target_collection} 需手动回收: curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{target_collection}（{type(cleanup_exc).__name__}: {cleanup_exc}）"
+            # 两种模式下"谁在服务"是相反的：别名模式旧集合还在并继续服务；非别名模式
+            # 上面已把旧集合删掉，残缺的目标集合就是当前服务集合 —— 报错必须说清。
+            serving = (
+                f"集合 {target_collection} 未切别名，旧集合继续服务"
+                if alias_ok
+                else f"集合 {target_collection} 是非别名模式的服务集合（旧集合已在写入前删除），当前点数残缺，检索会吃到不完整结果"
             )
-        if prev_alias_target and prev_alias_target != target_collection:
+            raise RuntimeError(
+                f"{len(write_failures)} 批写入失败（批次起始 {[fi for fi, _ in write_failures][:5]}）："
+                f"{serving}；"
+                f"失败示例 {write_failures[0][1]}{orphan_hint}。网络/Qdrant 恢复后重跑 index（稠密走缓存增量）。"
+            )
+        info = client.get_collection(collection_name=target_collection)
+        # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages 事后发现。
+        # 非别名路径下旧集合若没删掉（delete_collection 失败/集合不存在时报错被吞），写入只覆盖
+        # id 0..total-1，旧点会以 id >= total 残留。**它们不是"检索不到"**：检索是做向量搜索、
+        # 没有任何 id 过滤，残留点会被正常召回并返回陈旧正文（旧文案把方向说反了）。
+        # 所以这里不是报错了事，而是**按实现清理**：先删 id >= total 的残留点，再复核点数。
+        written = client.count(collection_name=target_collection, exact=True).count
+        log(f"  Qdrant 写入完成: {written} 条")
+        if written != total:
+            residual = []
+            offset = None
+            while True:
+                pts, offset = client.scroll( collection_name=target_collection, limit=WRITE_BATCH, offset=offset, with_payload=False, with_vectors=False )
+                residual.extend(p.id for p in pts if isinstance(p.id, int) and p.id >= total)
+                if offset is None:
+                    break
+            if residual:
+                client.delete(collection_name=target_collection, points_selector=residual)
+                written = client.count(collection_name=target_collection, exact=True).count
+                log(f"  已清理 {len(residual)} 个 id >= {total} 的残留点（旧集合未删净），复核点数: {written}")
+        if written != total:
+            raise RuntimeError(
+                f"集合 {target_collection} 点数 {written} != 分块记录数 {total}："
+                "残留点（id >= 分块记录数）会被检索正常召回并返回陈旧正文（检索不做 id 过滤）；"
+                "清理后仍不一致，请删掉该集合后重跑 index，或启用 RAG_USE_COLLECTION_ALIAS"
+            )
+        coll_dense_size = next(iter(info.config.params.vectors.values())).size  # type: ignore[union-attr]
+        # 显式 raise 而非 assert（-O 会剥离 assert，维度错配就静默放行了）
+        if coll_dense_size != dense_dim:
+            raise RuntimeError(f"集合稠密维度 {coll_dense_size} 与本次编码维度 {dense_dim} 不一致（集合名 {target_collection}）")
+        log(f"  集合向量空间: 稠密 {list(info.config.params.vectors.keys())} (size={coll_dense_size}) + 稀疏 {list(info.config.params.sparse_vectors.keys())}")  # type: ignore[union-attr]
+        log("  索引构建完成: 稠密向量 + 稀疏向量（Qdrant 内置 BM25，分词在服务端 multilingual）")
+        if alias_ok:
+            # 别名切换存在竞态窗口：get_aliases 到 update_collection_aliases 间其他进程可能修改别名。
+            # 采用重试 + 验证策略：只重试一次（共 2 次尝试），每次切换后验证别名确实指向新集合。
+            # 但 DeleteAlias + CreateAlias 是**两个非事务操作**：Delete 成功而 Create 失败（重试
+            # 耗尽）会把别名删空 —— 检索端下一个请求全线挂，而旧文案写的是"检索端仍指向旧集合"，
+            # 方向正好相反（失效原型：状态 + 报错指错方向）。故：①失败分支按"本轮之前的目标"
+            # 先发一次恢复性 CreateAlias（失败仅告警）；②文案按 client.get_aliases() 的**实际**
+            # 结果组织；③成功路径用"本轮之前的目标"删旧集合 —— 重试后循环内变量可能已变成
+            # 本次的 target（切成功但读回旧缓存），那时真正的旧集合就永远不会被删。
+            prev_alias_target = None   # 本轮之前别名指向的集合，只在第一次尝试前读一次
+            switched = False
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    current_target = next(
+                        (a.collection_name for a in client.get_aliases().aliases if a.alias_name == COLLECTION_ALIAS),
+                        None,
+                    )
+                    if attempt == 0:
+                        prev_alias_target = current_target
+                    # 空别名冷启动不能对不存在的 alias 提交 Delete（部分 Qdrant 版本整批失败）；有旧别名才删，Create 恒提交。
+                    ops: list = []
+                    if current_target is not None:
+                        ops.append(DeleteAliasOperation(delete_alias=DeleteAlias(alias_name=COLLECTION_ALIAS)))
+                    ops.append(CreateAliasOperation(create_alias=CreateAlias(collection_name=target_collection, alias_name=COLLECTION_ALIAS)))
+                    client.update_collection_aliases(change_aliases_operations=ops)
+                    # 验证别名切换成功
+                    aliases_after = client.get_aliases().aliases
+                    new_target = next((a.collection_name for a in aliases_after if a.alias_name == COLLECTION_ALIAS), None)
+                    if new_target == target_collection:
+                        switched = True
+                        log(f"  别名已切换: {COLLECTION_ALIAS} → {target_collection}" + (f"（原 {prev_alias_target}）" if prev_alias_target else "（冷启动，无旧别名）"))
+                        break
+                    log(f"  ⚠️  别名切换验证失败（尝试 {attempt + 1}/{max_retries}）：别名指向 {new_target}，期望 {target_collection}")
+                except Exception as exc:
+                    log(f"  ⚠️  别名切换异常（尝试 {attempt + 1}/{max_retries}）：{exc}")
+            if not switched:
+                actual = _current_alias_target(client)
+                if actual is None and prev_alias_target:
+                    # 别名此刻可能是被本轮 DeleteAlias 删掉的：先把它指回旧集合，别让检索裸奔。
+                    try:
+                        client.update_collection_aliases(change_aliases_operations=[CreateAliasOperation(create_alias=CreateAlias(collection_name=prev_alias_target, alias_name=COLLECTION_ALIAS))])
+                        actual = prev_alias_target
+                        log(f"  ♻️  别名已恢复到 {prev_alias_target}（本轮切换失败，先保证检索端有可用集合）")
+                    except Exception as exc:
+                        log(f"  ⚠️  恢复别名到 {prev_alias_target} 失败: {type(exc).__name__}: {exc}")
+                        actual = _current_alias_target(client)
+                raise RuntimeError(
+                    f"别名切换失败：新集合 {target_collection} 已建好；别名 {COLLECTION_ALIAS} 实际指向 "
+                    f"{actual if actual else '（不存在 —— 检索端当前不可用，需人工恢复）'}。"
+                    f"修好后重跑 index（稠密走缓存增量），或直接用 Qdrant 别名 API 指回可用集合。"
+                )
+            if prev_alias_target and prev_alias_target != target_collection:
+                try:
+                    client.delete_collection(collection_name=prev_alias_target)
+                    log(f"  旧集合已清理: {prev_alias_target}")
+                except Exception as exc:
+                    log(f"    ⚠️  旧集合 {prev_alias_target} 删除失败（仅占磁盘，检索不受影响）: {exc}")
             try:
-                client.delete_collection(collection_name=prev_alias_target)
-                log(f"  旧集合已清理: {prev_alias_target}")
-            except Exception as exc:
-                log(f"    ⚠️  旧集合 {prev_alias_target} 删除失败（仅占磁盘，检索不受影响）: {exc}")
+                stragglers = [ x.name for x in client.get_collections().collections if x.name != target_collection and x.name.split("__")[0] == COLLECTION_NAME ]
+            except Exception:
+                stragglers = []
+            if stragglers:
+                log(f"  ⚠️  检测到 {len(stragglers)} 个同名前缀历史集合（检索已不读）: {stragglers}")
+                log("     确认新索引可用后可回收磁盘（保留仅占空间）：")
+                for name in stragglers:
+                    log(f"       curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{name}")
+        else:
+            log(f"  ⚠️  未使用别名：检索端读 {COLLECTION_NAME}，重建期间该集合会短暂不可用")
+        log(f"  索引建造标识: {build_id}")
+        log(f"总耗时: {time.time() - t0:.1f} 秒")
+    finally:
         try:
-            stragglers = [ x.name for x in client.get_collections().collections if x.name != target_collection and x.name.split("__")[0] == COLLECTION_NAME ]
+            client.close()
         except Exception:
-            stragglers = []
-        if stragglers:
-            log(f"  ⚠️  检测到 {len(stragglers)} 个同名前缀历史集合（检索已不读）: {stragglers}")
-            log("     确认新索引可用后可回收磁盘（保留仅占空间）：")
-            for name in stragglers:
-                log(f"       curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{name}")
-    else:
-        log(f"  ⚠️  未使用别名：检索端读 {COLLECTION_NAME}，重建期间该集合会短暂不可用")
-    log(f"  索引建造标识: {build_id}")
-    log(f"总耗时: {time.time() - t0:.1f} 秒")
+            pass
 
 
 # ── 检索原语 ──
@@ -2884,7 +2975,10 @@ def rerank_indices(query, documents, tokenizer, model, device, top_k=TOP_K, batc
         with torch.no_grad():
             logits = model(**inputs).logits.squeeze(-1)
         all_scores.extend(logits.float().cpu().numpy().tolist())
-    order = np.argsort(all_scores)[::-1]
+    # 稳定排序 + 与 http 后端一致的 tie-break（分数并列时按原下标升序，见 _http_rerank 的
+    # sorted(-score, index)）：np.argsort 默认 quicksort 不稳定，并列表在 rr_k 边界两侧时
+    # torch/http 两后端会把**不同**条目送进 top_k —— 切后端静默改变结果。
+    order = np.argsort(-np.asarray(all_scores), kind="stable")
     ranked = [(int(i), float(all_scores[i])) for i in order]
     return ranked[:top_k]
 
@@ -3002,7 +3096,11 @@ def results_confidence(results):
     return confidence_signal( [r.get("rerank_score") for r in results], [_source_of(r) for r in results], )
 
 
-def resolve_collection_name(client):
+def resolve_collection_name(client, *, strict=False):
+    """别名 → 本次该用的集合名。strict=True 时**禁止降级**：调用方是 sparse 这类原地写
+    路径 —— get_aliases 瞬时故障降级成"直读物理名"后，若本轮间别名已指向重建后的新
+    集合，update_vectors 会打在旧集合上产生混合态（与 INDEX_LOCK 注释描述的失效原型
+    一致）。写路径拿不到目标就该立刻失败，而不是按猜测继续写。"""
     if not USE_COLLECTION_ALIAS:
         return COLLECTION_NAME
     state = _state_ref()
@@ -3015,6 +3113,12 @@ def resolve_collection_name(client):
     try:
         aliases = client.get_aliases().aliases
     except Exception as exc:
+        if strict:
+            raise RuntimeError(
+                f"别名 {COLLECTION_ALIAS} 目标读取失败（{type(exc).__name__}: {exc}）——"
+                "sparse 是原地写路径（update_vectors + 指纹回写都要落在别名目标上），"
+                "别名目标未知时禁止按猜测的物理集合名继续。恢复 Qdrant 后重跑。"
+            ) from None
         state.alias_degraded = True
         log(f"⚠️  读取集合别名失败，回退直接访问 {COLLECTION_NAME}: {exc}")
         return COLLECTION_NAME
@@ -3023,6 +3127,11 @@ def resolve_collection_name(client):
         state.alias_resolved["name"] = COLLECTION_ALIAS
         state.alias_degraded = False
         return COLLECTION_ALIAS
+    if strict:
+        raise RuntimeError(
+            f"别名 {COLLECTION_ALIAS} 不存在，物理名 {COLLECTION_NAME} 不一定是检索目标"
+            "—— sparse 是原地写路径，禁止在目标未知时按猜测继续（先跑 index 重建别名）。"
+        )
     state.alias_degraded = True
     return COLLECTION_NAME
 
@@ -3294,7 +3403,15 @@ def _load_gen_tokenizer_default():
                 _cur = os.path.basename(_cur_gguf or "")
                 _cur = _cur[len("sha256-"):] if _cur.startswith("sha256-") else ""
                 _bad_reason = ""
-                if _want and _cur and _want != _cur:
+                if _want and not _cur:
+                    # fail-closed：meta 记了 GGUF 指纹却定位不到当前 blob —— 当前 MODEL 不在
+                    # registry.ollama.ai 命名空间（HF 拉取）、OLLAMA_MODELS_DIR 配错、或
+                    # GEN_GGUF_PATH 是不带 sha256- 前缀的文件名。校验**无法完成**就视作没通过
+                    # （用户已确认取舍：彻底保守）——函数头承诺的"无法判断 → 退回 GGUF/估算"
+                    # 不再被静默改判"通过"（sha 数字只在大概率场景中被模型名校验兜住）。
+                    _bad_reason = (f"GGUF 指纹无从校验（meta 记录 {_want[:12]}…；当前 blob 未定位，"
+                                   f"GEN_GGUF_PATH={GEN_GGUF_PATH or '未配置'}，ollama manifest 未命中 sha256- 前缀文件名）")
+                elif _want and _cur and _want != _cur:
                     _bad_reason = f"GGUF 不一致（meta={_want[:12]}… 当前={_cur[:12]}…）"
                 elif _meta_model and _cur_model and _meta_model != _cur_model:
                     _bad_reason = f"模型名不一致（meta={_meta_model!r} 当前={_cur_model!r}）"
@@ -3660,12 +3777,15 @@ class HttpRerankBackend:
 
     def rerank(self, query: str, texts: Sequence[str], top_k: int):
         engine = self._engine
-        # 并行：重排 HTTP 与 tokenizer 首次加载/编码互不依赖，隐藏 tokenizer 加载时间。
+        # 并行：tokenizer 首次加载/编码进一次性工作线程，rerank HTTP 留在**调用线程**发出
+        # —— 连接复用靠线程本地 Session（_model_http_session）：HTTP 若放去新建线程，每次
+        # 都是一池子里的一次性 Session（keep-alive 架空 + 从不 close，socket 靠 GC 兜底）。
+        # 改为并行"tokenizer"这一侧，http 往返仍在本线程，池容器的连接被整轮复用。
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(engine._http_rerank, query, list(texts), top_k)
-            rr_tok = engine._get_rerank_tokenizer_only()
-            return future.result(), rr_tok
+            future = pool.submit(engine._get_rerank_tokenizer_only)
+            rr = engine._http_rerank(query, list(texts), top_k)
+            return rr, future.result()
 
 
 class OllamaChatBackend:
@@ -4056,11 +4176,17 @@ class RAGEngine:
         reranked, rr_tok = self._rerank_backend.rerank(query, cand_texts, rr_k)
         if steps is not None:
             rr_query_tokens = len(rr_tok.encode(query)) if rr_tok is not None else None
-            # 使用 tokenizer 实际的特殊 token 数，而非硬编码
+            # 使用 tokenizer 实际的特殊 token 数，而非硬编码。**两个口径都要**：
+            #   encode(query) 已含句自身 special（[CLS]/[SEP]，单句 = pair=False 个）；
+            #   真实约束是 q_text + pair_specials(CLS+SEP+SEP=3) + doc_text ≤ max_length，
+            #   doc_text 预算 = M − (query_tokens − 单句 specials) − pair specials。
+            # 旧写法直接 M − query_tokens − pair_specials = 真值再减单句 specials —— 当把
+            # query 自身 special 算了第二遍，“被截断”列在还没截断时就会提前 ~2 token 假阳性。
+            single_specials = rr_tok.num_special_tokens_to_add(pair=False) if rr_tok is not None else None
             special_tokens = rr_tok.num_special_tokens_to_add(pair=True) if rr_tok is not None else None
             rr_doc_budget = None
             if rr_query_tokens is not None and special_tokens is not None:
-                rr_doc_budget = max(0, RERANK_MAX_LENGTH - rr_query_tokens - special_tokens)
+                rr_doc_budget = max(0, RERANK_MAX_LENGTH - (rr_query_tokens - single_specials) - special_tokens)
             rr_rows = []
             for idx, score in reranked:
                 text = cand_texts[idx]
@@ -4072,7 +4198,7 @@ class RAGEngine:
                 row["送入上限"] = rr_doc_budget
                 # http 重排且本地没有 tokenizer 时这两列无从计算：写 None（明确"未知"），
                 # 不写 False —— 那会读成"没被截断"，是另一种静默。
-                row["被截断"] = (full_tokens > rr_doc_budget) if (full_tokens is not None and rr_doc_budget is not None) else None
+                row["被截断"] = ((full_tokens - single_specials) > rr_doc_budget) if (full_tokens is not None and rr_doc_budget is not None) else None
                 rr_rows.append(row)
             steps[STEP_RERANK] = rr_rows
         output = []
@@ -4106,6 +4232,11 @@ def drain_events(events, on_thinking=None, on_delta=None, on_error=None):
     done = {}
     for kind, payload in events:
         if kind == EVENT_DONE:
+            # 契约上一次流只有一个 done；重复出现 = 生产方违约（真实历史形态：错误后
+            # 服务端又补 {"done":true}）。对词表外 kind 本函数显式抛错 —— 重复 done 同属
+            # "契约分叉被兜底吞掉"，至少要告警，否则 failure 后的补发 done 会把失败轮
+            # 伪装成正常结尾、last-wins 还静默覆盖。
+            log("⚠️  事件流出现重复 done（生产方违约：此前值被覆盖，done_reason 等字段以最新的为准）")
             done = payload
             continue
         bucket = acc.get(kind)
@@ -4274,6 +4405,8 @@ def _pid_alive(pid, since=None):
     PID 复用补充判据（since = 锁的写入时刻）：这个 pid 的进程启动时间晚于锁写入时刻，
     说明它是冒名顶替的新进程（旧持有者已死、pid 被复用），锁视作陈旧。不引入该判据时，
     容器内一次异常退出后若 pid 恰被新进程复用，index 会被永久判"有人在跑"。
+    复用判定带 ~3s 的舍入安全边际（etime 向下取整 + 时间戳截秒 + 取样偏晚三个方向的
+    误差叠加），误差窗口内按"活持有者"处理 —— 误抢活锁比多一轮竞争严重得多。
     """
     try:
         os.kill(pid, 0)
@@ -4289,9 +4422,15 @@ def _pid_alive(pid, since=None):
             log(f"⚠️  pid={pid} 的启动时长读取失败（ps 缺席或不可执行）："
                 "PID 复用判据不可用，按仍存活处理；确认无重建在跑后可手动删锁")
         else:
-            started = datetime.datetime.now() - datetime.timedelta(seconds=elapsed)
-            if started > since:
-                log(f"⚠️  pid={pid} 的启动时刻（{started:%Y-%m-%d %H:%M:%S}）晚于锁写入时刻"
+            # PID 复用判定必须吃进三重舍入误差（见 docstring）：etime 向下取整（started
+            # 真值可能比计算的**晚**1s）、锁时间戳 timespec 截到秒（写锁真值最多比 since
+            # **晚**1s）、now 取样晚于读 ps（+1s 级）。按下界比较：即使把 started 往早
+            # 修正 3s 也仍晚于锁写入才判复用 —— 误差窗口内的不确定一律按"活持有者"处理
+            # （抢活锁 = 本锁要防的最坏方向，宁可再多等一轮回竞争）。
+            started_lb = datetime.datetime.now() - datetime.timedelta(seconds=elapsed + 3)
+            if started_lb > since:
+                started = datetime.datetime.now() - datetime.timedelta(seconds=elapsed)
+                log(f"⚠️  pid={pid} 的启动时刻（{started:%Y-%m-%d %H:%M:%S}，含 ≤3s 舍入误差）晚于锁写入时刻"
                     f"（{since:%Y-%m-%d %H:%M:%S}）—— 判定为 PID 复用，锁视作陈旧")
                 return False
     return True
@@ -4330,9 +4469,28 @@ def acquire_index_lock():
                     f"确认对方已结束后重跑；确实没有别的 index/sparse 在跑时删锁: rm -f {INDEX_LOCK_FILE}"
                 ) from None
             log(f"⚠️  发现陈旧 index 锁（内容 {holder or '空'}）：持有进程已不存在，自动接管 {INDEX_LOCK_FILE}")
+            # 复核-再删（TOCTOU）：从读到 stale 内容到真正删除之间，另一接管者可能已删旧锁、
+            # 建成自己的新锁 —— 无复核地连删会让两个进程都"自认持锁"并发重建（正是本锁
+            # 防的最坏失效：写坏同一份稠密缓存、sparse 写到被删集合）。只删「同一 inode 且
+            # 内容仍是刚才读到的」这份；其余情形退出本轮重新 open 竞争（下轮 FileExists
+            # 分支再加判定）。
             try:
+                _stamp = os.stat(INDEX_LOCK_FILE)
+                with open(INDEX_LOCK_FILE, encoding="utf-8") as _f:
+                    _holder_now = _f.read().strip()
+                if _holder_now != holder or os.stat(INDEX_LOCK_FILE).st_ino != _stamp.st_ino:
+                    log("⚠️  陈旧锁在复核时已被其他接管者改动（内容/inode 变化）：退出本轮，重开锁竞争")
+                    time.sleep(0.05)
+                    continue
                 os.remove(INDEX_LOCK_FILE)
+            except FileNotFoundError:
+                # 锁在"读到 stale"之后被另一接管者删走（它即将重建）：不报错终止 ——
+                # 重开 open 竞争才正确（下一轮要么 FileExistsError 按活锁处理，要么本进程
+                # 成功 O_EXCL 建锁）。以前 FileNotFoundError 落进 OSError 分支引导用户
+                # "手动清理" —— 删的极可能是对方的活锁，随后第三个进程并发重建。
+                continue
             except OSError as exc:
+                # 只有"真删不掉"（权限/只读盘）才需要人工清理 —— 与"已被别人动过"区分。
                 raise RuntimeError(f"陈旧锁 {INDEX_LOCK_FILE} 删除失败（{type(exc).__name__}: {exc}），请手动清理后重跑") from None
             continue
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -4342,12 +4500,18 @@ def acquire_index_lock():
 
 
 def release_index_lock():
-    """释放锁。**只删自己持有的那份**（防误删接管者的锁）；失败只告警，不影响重建结果。"""
+    """释放锁。**只删自己持有的那份**（防误删接管者的锁）；失败只告警，不影响重建结果。
+    锁文件内容为空/损坏（写锁进程磁盘满截断、或接管者正在写的空窗）时不删 —— 空窗里
+    顺手 os.remove 会删掉刚接管进程尚未写入的锁，第三个进程 == 并发重建。空锁由陈旧
+    接管路径清理（holder 解析为空 pid → 判 stale → 复核后删），或人工。"""
     try:
         with open(INDEX_LOCK_FILE, encoding="utf-8") as f:
             parts = f.read().strip().split()
         if parts and parts[0].isdigit() and int(parts[0]) != os.getpid():
             log(f"⚠️  index 锁 {INDEX_LOCK_FILE} 现在属于 pid={parts[0]}，不由本进程删除")
+            return
+        if not parts:
+            log(f"⚠️  index 锁 {INDEX_LOCK_FILE} 内容为空/损坏（可能是别的接管者正写锁）：不删，由接管者或人工清理")
             return
         os.remove(INDEX_LOCK_FILE)
     except FileNotFoundError:
@@ -4384,12 +4548,34 @@ def _port_in_use(port):
 
 
 def _streamlit_pids():
+    """本项目的 streamlit 进程：先按宽模式抓候选，再按**本文件绝对路径**逐 pid 核对命令行。
+    纯 `streamlit run .*chatbot\.py` 模式会把其他项目里同名 chatbot.py 的实例认作本项目
+    （serve 直接退 0、"重启提示"的 pkill 把对方杀掉）。无法读到命令行（精简容器无 ps）时
+    放弃核对、退回宽模式结果（保守：自家重启提示别误伤）。"""
+    import re
     import subprocess
     try:
         out = subprocess.run(["pgrep", "-f", r"streamlit run .*chatbot\.py"], capture_output=True, text=True, timeout=5).stdout
+        candidates = [int(p) for p in out.split() if p.isdigit() and int(p) != os.getpid()]
     except (OSError, subprocess.SubprocessError):
         return []
-    return [int(p) for p in out.split() if p.isdigit() and int(p) != os.getpid()]
+    mine = os.path.abspath(__file__)
+    result = []
+    for pid in candidates:
+        try:
+            cmdline = subprocess.run(
+                ["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            cmdline = ""
+        if not cmdline:
+            result.append(pid)   # 核对手段缺席：按原宽模式行为放行
+        elif re.search(rf"streamlit run\s+(\"|')?({re.escape(mine)}|{re.escape(os.path.basename(mine))}(\s|\"|'|$))", cmdline):
+            # 绝对路径命中，或相对路径 `streamlit run chatbot.py`（相对启动无法反查目录，
+            # 保守放行 —— 只影响提示语，不再随意 pkill）。
+            result.append(pid)
+    return result
 
 
 def _corpus_has_searchable_content():
@@ -4400,6 +4586,11 @@ def _corpus_has_searchable_content():
     """
     try:
         paths = _document_paths()
+    except _DocGlobConfigError:
+        # glob 配错（写死文件名且不存在）≠ "corpus 非空"：return True 会让 gate 报
+        # "corpus 非空但从未构建、先跑 process"，用户照做要到 process 内部才看见根因。
+        # 让配置错误原样上抛，由命令级兜底给出含检查 RAG_DOC_GLOB/DATA_DIR 的准确提示。
+        raise
     except FileNotFoundError:
         # 目录缺失不是"语料为空"：交给上层按"未构建/配置错误"报出来，
         # 不能在这里把两者混成同一个"空语料"出口（否则会静默清库）。
@@ -4478,10 +4669,17 @@ def cmd_serve(args=None):
 
 
 def _http_ready(url, timeout=1.0):
+    import urllib.error
     import urllib.request
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return 200 <= response.status < 500
+    except urllib.error.HTTPError as exc:
+        # urlopen 对 ≥400 **抛 HTTPError 而非返回 response**（控制流到不了上面的区间比较）：
+        # 旧写法里 "4xx 也算就绪" 的分支是死代码，4xx 一律被 except 吞成 False —— 端点
+        # 对探针配了鉴权/返回 403-404 会让 cmd_all 空等 120s 后误判"依赖未就绪"重启容器。
+        # 能拿到 code 就说明服务在应答：4xx 按就绪（保留原区间意图），5xx 仍未就绪。
+        return exc.code < 500
     except Exception:
         return False
 
@@ -4616,6 +4814,14 @@ def cmd_all(args=None):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    def _sleep_splittable(total):
+        # 信号 handler 只置标志，PEP 475 之后 time.sleep 会把剩余时长**睡完** —— 停止信号
+        # 落进重启退避的 time.sleep(delay)（最长 30s）时，主循环迟迟不响应，容器 GRACE 期
+        # 内 terminate 都没发出就 SIGKILL（qdrant WAL/flush 风险）。切短步长轮询标志。
+        _end = time.time() + total
+        while time.time() < _end and not stopping["value"]:
+            time.sleep(min(0.5, max(0.0, _end - time.time())))
+
     try:
         spawn("qdrant")
         spawn("ollama")
@@ -4652,14 +4858,14 @@ def cmd_all(args=None):
                 restarts[name] = attempt
                 delay = min(30, 2 ** min(attempt, 5))
                 log(f"⚠️  [all] {name} 退出（code={code}），{delay}s 后就地重启")
-                time.sleep(delay)
+                _sleep_splittable(delay)
                 try:
                     spawn(name)
                 except OSError as exc:
                     log(f"❌ [all] {name} 重启失败: {type(exc).__name__}: {exc}")
                     stopping["value"] = True
                     break
-        time.sleep(2)
+        _sleep_splittable(2)
 
     log("[all] 收到停止信号，终止子进程")
     for process in children.values():
@@ -4908,7 +5114,17 @@ def run_streamlit():
     # ── 登录门：RAG_LOGIN_ENABLED=1 且 secrets.toml 有 [auth] 才启用 ──
     # 两个条件都满足才启用：开关（仓库侧，.env 可改）与 [auth]（运行期是否存在，
     # 取决于平台是否注入 OAUTH_*）。本地无配置自动跳过。
-    _auth = LOGIN_ENABLED and hasattr(st.user, "is_logged_in")   # 有 [auth] 才为 True，无需裸表达式（避免被 magic 渲染）
+    # ★ 判据换成"secrets 里有没有 auth 配置"：st.user.is_logged_in 是 Streamlit ≥1.43 上
+    #   **恒存在**的 property（未配置 auth 时取 False），hasattr 恒 True 每区分不出"配了
+    #   [auth]"与"没配"—— 旧写法在本地无 [auth] 的部署里把应用整个堵在登录门后，点登录
+    #   还会让 st.login 抛 StreamlitAPIException（提供方根本不存在）。
+    def _auth_configured():
+        try:
+            return bool(st.secrets.get("auth"))
+        except Exception:
+            return False   # 无 secrets 文件/加载失败 = 未配置 auth
+
+    _auth = LOGIN_ENABLED and _auth_configured()   # 布尔组合不裸渲染（避免被 magic 画出来）
     if _auth and not st.user.is_logged_in:
         _, c, _ = st.columns([2, 1, 2])
         with c:
@@ -4963,11 +5179,22 @@ def run_streamlit():
         _render_stored_message(msg)
     # 思维链有无只看 RAG_THINK 配置：开启时思考与正文同行输出（前后端均不区分）。
     if prompt := st.chat_input("", submit_mode="stop"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        with st.chat_message("assistant"):
-            _run_assistant_turn(engine, prompt, st.session_state.messages[:-1])
+        # 孤儿 user 兜底：入队之后、进入 _run_assistant_turn 内部回滚接管之前，Stop/重跑
+        # 异常可落在**任意渲染节点**（st.markdown / 进入 with 块），没有任何代码弹出这条
+        # user —— 永久留在历史里，下一轮被当历史重发、同题被答两遍（症状原文见
+        # _run_assistant_turn 的回滚注释）。用对象身份复核让来 pop：只会弹出"本函数 append
+        # 的那条且尚未被 inner 处理"（inner 已回滚时 messages 末尾不再是同一对象，不会二次弹）。
+        _user_msg = {"role": "user", "content": prompt}
+        try:
+            st.session_state.messages.append(_user_msg)
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            with st.chat_message("assistant"):
+                _run_assistant_turn(engine, prompt, st.session_state.messages[:-1])
+        except BaseException:
+            if st.session_state.messages and st.session_state.messages[-1] is _user_msg:
+                st.session_state.messages.pop()
+            raise
 
 
 # ── 检索引擎单例与预热（Streamlit 与任何进程内调用共用）──
@@ -5199,7 +5426,10 @@ def _sparse_rebuild():
     from qdrant_client import QdrantClient, models
     # 批量重建会话较长：客户端给普通查询 2 倍超时，逐页 scroll 沿用 QDRANT_TIMEOUT。
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
-    COLL = resolve_collection_name(client)
+    # strict：sparse 是**原地写**（update_vectors/set_payload 全部落在"该写的那份集合"上）。
+    # 非严格版在 get_aliases 瞬时失败时会静默降级为直读物理名 —— 若本轮间别名已指向重建
+    # 后的新集合，这轮 sparse 会写偏、留混合态；锁注释里的失效原型照抄。写不了就别写。
+    COLL = resolve_collection_name(client, strict=True)
     info = client.get_collection(COLL)
     total = info.points_count
     log(f"集合 {COLL}: {total} 条（Qdrant 内置 BM25，分词在服务端，options={bm25_options()}）")
@@ -5219,10 +5449,16 @@ def _sparse_rebuild():
             timeout=QDRANT_TIMEOUT,
         )
     except Exception as exc:
-        # 服务端把空 token 拒收（400/422/empty 类报错）同样符合契约：断言的是"不会算出稀疏向量"
+        # 服务端把空 token 拒收（400/422/empty 类报错）同样符合契约：断言的是"不会算出稀疏向量"。
+        # 匹配必须**词边界锚定**：裸子串 "400" 会命中 "timeout after 4000 ms"、点 id、随机
+        # 数字 —— 真故障被误判"契约通过"，哨兵形同虚设（它存在的意义就是写盘前 fail-fast
+        # 拦坏词表）。再叠一道否定排除：报文里含连接/断言类字样的不是拒收。
+        import re as _re
         _msg = str(exc)
         _low = _msg.lower()
-        if "empty" in _low or "400" in _msg or "422" in _msg:
+        _contract = bool(_re.search(r"\b(?:400|416|422)\b", _msg)) or "empty" in _low
+        _noise = bool(_re.search(r"timed?\s*out|connect|refused|unauthor|forbidden|permission|tls|ssl|not\s*found", _low))
+        if _contract and not _noise:
             log("  哨兵自检通过: 空短语被服务端拒收/0 命中（符合契约，不落库）")
         else:
             log(f"  ⚠️  哨兵自检无法执行（{type(exc).__name__}: {exc}），校验跳过——不拦截重建")
@@ -5438,7 +5674,7 @@ def cmd_verify_lexicon(args=None):
         if not quiet:
             log(*a)
     problems, warnings = [], []
-    log("RAG 词表校验（%s + %s）" % (alias_path, stop_path))
+    out("RAG 词表校验（%s + %s）" % (alias_path, stop_path))   # -q 语义 = 只报问题：标题也是正常明细
     docs = load_documents()
     total_chars = sum(len(t) for _, t in docs)
     out("数据：%d 个文档，合计 %d 字符" % (len(docs), total_chars))
@@ -5655,19 +5891,25 @@ def cmd_verify_lexicon(args=None):
 
 
 # ── 工具：阶段状态与最小重跑指引 ──
-# ── 表驱动：阶段结论 -> 下一步动作（顺序即优先级）──
+def _unknown_suffix(unknown) -> str:
+    """存在未验证阶段时给最小重跑指引补一句：未验证 ≠ 通过，先恢复再重跑全套判据。
+    旧表把 stale 与 unknown 混排后只看 stale —— 退出码两者同权（有效判据），指引却丢弃。"""
+    return "" if not unknown else "；另有未验证阶段（并非通过，先恢复再跑: python chatbot.py stages）"
+
+
+# ── 表驱动：阶段结论 -> 下一步动作（顺序即优先级；消息可为 (stale, unknown) -> str 以组合动态后缀）──
 _STAGE_NEXT_ACTIONS = (
-    (lambda stale, unknown: not stale and not unknown, "全部阶段新鲜，无需重跑。"),
-    (lambda stale, _unknown: "A" in stale, "最小重跑: python chatbot.py process && python chatbot.py index"),
-    (lambda stale, _unknown: "B" in stale or "D" in stale, "最小重跑: python chatbot.py index（稠密走缓存增量）"),
-    (lambda stale, _unknown: "C" in stale, "最小重跑: python chatbot.py sparse"),
+    (lambda stale, unknown: not stale and not unknown, lambda stale, unknown: "全部阶段新鲜，无需重跑。"),
+    (lambda stale, unknown: "A" in stale, lambda stale, unknown: "最小重跑: python chatbot.py process && python chatbot.py index" + _unknown_suffix(unknown)),
+    (lambda stale, unknown: "B" in stale or "D" in stale, lambda stale, unknown: "最小重跑: python chatbot.py index（稠密走缓存增量）" + _unknown_suffix(unknown)),
+    (lambda stale, unknown: "C" in stale, lambda stale, unknown: "最小重跑: python chatbot.py sparse" + _unknown_suffix(unknown)),
 )
 
 
 def _stage_next_action(stale, unknown) -> str:
     for matches, message in _STAGE_NEXT_ACTIONS:
         if matches(stale, unknown):
-            return message
+            return message(stale, unknown) if callable(message) else message
     # stale 为空但有阶段没验过：绝不能落到"全部新鲜"。
     return "有阶段未能完成验证（原因见上）→ 恢复后重跑: python chatbot.py stages"
 
