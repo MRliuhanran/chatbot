@@ -4763,11 +4763,114 @@ def _ensure_ollama_model(env, ollama_bin):
     return _ollama_models_present(models_dir)
 
 
+# ── 容器启动期模型装载（2026-10-27 部署瘦身：镜像不再烤 4.9G 权重） ──
+def _runtime_models_root():
+    """运行期模型装载根目录：显式 env > 魔搭持久盘 > 应用目录（退化语义与烤镜像一致）。
+
+    持久盘优先是为了"冷启动只痛一次"：首启把权重下到 /mnt/workspace/models，此后
+    容器重建零下载命中；没有持久盘的环境退化到 ./models，每次启动都当冷启动处理
+    （fetch-models 逐文件按字节尺寸幂等跳过，不会重复下载）。
+    """
+    explicit = (os.getenv("RAG_RUNTIME_MODELS_DIR") or "").strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    if os.path.isdir("/mnt/workspace"):
+        return "/mnt/workspace/models"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+
+def _models_group_complete(base, group):
+    """组级"大概率就绪"判定：只锚定每组**最大的**那个文件（bge-m3=pytorch_model.bin、
+    reranker=model.safetensors、gguf=任意 >100MB 的 .gguf）——大文件是组内最后一个
+    下载项，它完整 ⇒ 轮内校验器曾整体放行；残缺/回滚态仍会被 fetch-models 的逐文件
+    字节尺寸 fail-closed 校验接住。这样热启动跑三个 stat 就定案，不必全清单比对。"""
+    import glob
+    d = os.path.join(base, "_gguf" if group == "gguf" else group)
+    if not os.path.isdir(d):
+        return False
+    if group == "gguf":
+        return any(os.path.getsize(p) > 100_000_000 for p in glob.glob(os.path.join(d, "*.gguf")))
+    _KEY = {"bge-m3": "pytorch_model.bin", "bge-reranker-v2-m3": "model.safetensors"}
+    p = os.path.join(d, _KEY[group])
+    return os.path.isfile(p) and os.path.getsize(p) > 50_000_000
+
+
+def _ensure_runtime_models(env, app_root):
+    """启动期模型装载：镜像不带权重，缺什么补什么（缺组才跑，幂等）。
+
+    装载根：RAG_RUNTIME_MODELS_DIR 显式 > /mnt/workspace/models（持久盘） > ./models。
+    下载复用仓库唯一 start.sh fetch-models（组内 3 轮 aria2 多连接 + curl 断点续传 +
+    逐文件字节尺寸 fail-closed 校验）。装载后做"字面量落位"：.env 的相对路径
+    （./models/<组>）与 OLLAMA_MODELS 的 *.gguf 用 symlink 指向装载根——真实目录
+    已在（烤镜像态/本地直跑）跳过，已指向目标跳过，只缺才建；symlink 建不了（只读
+    盘面等）回退改写 env 绝对路径：.env 由 python-dotenv 读取且默认不覆盖已有
+    os.environ，子进程 import 时改写必然生效。
+    失败一律 return False → cmd_all 退出容器交平台重启（磁盘上已下载字节留盘续传，
+    不会每次从零）。
+    """
+    import glob
+    import subprocess
+    base = _runtime_models_root()
+    missing = [g for g in ("bge-m3", "bge-reranker-v2-m3", "gguf") if not _models_group_complete(base, g)]
+    if missing:
+        log(f"📦 [模型装载] 根目录={base}；缺组: {','.join(missing)}"
+            f"→ start.sh fetch-models 开拉（多连接+断点续传，进度直落日志）")
+        try:
+            proc = subprocess.run(
+                ["bash", os.path.join(app_root, "start.sh"), "fetch-models", base, *missing],
+                cwd=app_root, env=env,
+            )
+        except OSError as exc:
+            log(f"❌ [模型装载] fetch-models 起跑失败: {type(exc).__name__}: {exc}")
+            return False
+        if proc.returncode != 0:
+            log(f"❌ [模型装载] fetch-models 失败（code={proc.returncode}）——已下载字节留盘续传，"
+                f"容器退出交平台重启")
+            return False
+    else:
+        log(f"📦 [模型装载] 全部就绪（零下载命中）: {base}")
+
+    # ── 字面量落位：.env 相对路径（./models/<组>）与 OLLAMA_MODELS 的 *.gguf ──
+    models_dir = os.path.join(app_root, "models")
+    ollama_dir = env.get("OLLAMA_MODELS") or os.path.join(app_root, "ollama_models")
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(ollama_dir, exist_ok=True)
+    links = [
+        (os.path.join(models_dir, "bge-m3"), os.path.join(base, "bge-m3"),
+         ("RAG_EMBED_MODEL_PATH", os.path.join(base, "bge-m3"))),
+        (os.path.join(models_dir, "bge-reranker-v2-m3"), os.path.join(base, "bge-reranker-v2-m3"),
+         ("RAG_RERANK_MODEL_PATH", os.path.join(base, "bge-reranker-v2-m3"))),
+    ]
+    ggufs = sorted(glob.glob(os.path.join(base, "_gguf", "*.gguf")))
+    if ggufs:
+        links.append((os.path.join(ollama_dir, os.path.basename(ggufs[0])), ggufs[0],
+                      ("OLLAMA_MODELS", os.path.join(base, "_gguf"))))
+    for link, target, rewrite in links:
+        rel = os.path.relpath(link, app_root)
+        if os.path.exists(link) and not os.path.islink(link):
+            log(f"📦 [模型落位] {rel}（真实目录已在，跳过）")
+            continue
+        if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(target):
+            log(f"📦 [模型落位] {rel}（已指向 {target}，跳过）")
+            continue
+        try:
+            if os.path.islink(link):
+                os.unlink(link)
+            os.symlink(target, link)
+            log(f"📦 [模型落位] {rel} → {target}")
+        except OSError as exc:
+            var, val = rewrite
+            env[var] = val
+            log(f"📦 [模型落位] symlink 不可建（{exc.__class__.__name__}）→ 改写 {var}={val}")
+    return True
+
+
 def cmd_all(args=None):
     """单容器入口（ModelScope）：Qdrant + Ollama + Streamlit 三进程，带健康等待与自愈。
 
     本地原生请用 start.sh；容器里没有 shell/entrypoint，由本命令直接 exec 三个子进程。
-    功能/配置/模型与本地同源：都读同一份 .env、同一份 models/ 与 artifacts/。
+    功能/配置/模型与本地同源：都读同一份 .env；检索/生成权重在启动期由
+    _ensure_runtime_models 装到持久盘（镜像不带 4.9G），再拉三进程。
     """
     import signal
     import subprocess
@@ -4780,12 +4883,19 @@ def cmd_all(args=None):
     ollama_bin = env.get("OLLAMA_BIN", "/usr/local/bin/ollama")
     env.setdefault("QDRANT__SERVICE__HOST", "127.0.0.1")
     env.setdefault("QDRANT__STORAGE__STORAGE_PATH", os.path.join(root, "storage"))
+    # Ollama blob 库跟权重一起放持久盘：ollama create 只在冷启动做一次（1.5G 拷贝），
+    # 容器重启后 manifest 直接命中、零拷贝启动；无持久盘退化回镜像内目录。
+    if os.path.isdir("/mnt/workspace"):
+        env.setdefault("OLLAMA_MODELS", "/mnt/workspace/ollama_models")
     env.setdefault("OLLAMA_MODELS", os.path.join(root, "ollama_models"))
     env.setdefault("QDRANT_HOST", "127.0.0.1")
     env.setdefault("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    if not _ollama_models_present(env.get("OLLAMA_MODELS", "")) and not _ollama_gguf(env.get("OLLAMA_MODELS", "")):
-        log("❌ [all] OLLAMA_MODELS 里既没有模型 manifest 也没有 .gguf："
-            "把 ~/.ollama/models 内容放进构建上下文 ollama_models/（或运行时挂载到 /app/ollama_models）")
+    # 启动期装载：检索/生成权重缺什么补什么（镜像瘦身后的等价替身——原来是构建期
+    # fetchmodels stage 烤镜像）。失败了退出容器交平台重启，已下载字节留盘续传；
+    # 就绪后 OLLAMA_MODELS 里 manifest/gguf 至少其一，下方 _ensure_ollama_model 兜底
+    # 校验不会放行空目录。
+    if not _ensure_runtime_models(env, root):
+        log("❌ [all] 启动期模型装载失败，容器退出（平台重启后自动重试）")
         return 1
 
     specs = {

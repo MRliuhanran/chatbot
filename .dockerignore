@@ -17,5 +17,10 @@ artifacts/docs/
 artifacts/opencode-sessions/
 artifacts/turns.jsonl
 models/
+artifacts/chunks.json
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+ms_deploy.json
 storage/**/wal/closed-*
 storage/**/wal/open-*

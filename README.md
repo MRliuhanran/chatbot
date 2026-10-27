@@ -116,15 +116,14 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 产物由指纹绑定：切分指纹、词表指纹、稠密缓存键。**不要改名/加装饰器/改空白**到 `chatbot.py` 中 `_CHUNKING_CODE_UNITS`、`_embed_code_fingerprint`、`lexicon_fingerprint` 列出的函数——`inspect.getsource` 变化会触发全量重建。
 
-## 7. ModelScope 部署：一个 Dockerfile（无 compose / 无 shell）
+## 7. ModelScope 部署：一个 Dockerfile
 
-本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三个进程由 `chatbot.py all` 管理（源码里的进程管理器，不是 shell 脚本），不依赖 compose。
+本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三个进程由 `chatbot.py all` 管理（源码里的进程管理器），不依赖 compose。
 
 ### 7.1 Dockerfile 约束
 
 - 所有 `RUN` 都是 **exec form**：`RUN ["pip","install",...]`，不经过 `/bin/sh -c`；
-- 不 COPY 任何 shell 脚本；没有 `entrypoint.sh`；
-- 唯一入口：`ENTRYPOINT ["python","chatbot.py","all"]`；
+- 唯一入口：`ENTRYPOINT ["python","chatbot.py","all"]`（start.sh 只作为运行期模型下载器进镜像）；
 - qdrant / ollama 二进制直接从官方镜像 COPY，不在 Dockerfile 里下载/解压；
 - `HEALTHCHECK` 也是 exec form（`python -c ...`）。
 
@@ -132,38 +131,28 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 ### 7.2 构建与运行
 
-构建阶段会自动准备两类模型，git 仓库里不再需要 `models/` 或 `ollama_models/`：
+**2026-10-27 起镜像不带模型**：4.9G 权重（bge-m3 / bge-reranker / GGUF）由运行期 `cmd_all → _ensure_runtime_models` 装到持久盘 `/mnt/workspace/models`（可用 `RAG_RUNTIME_MODELS_DIR` 覆盖），下载复用仓库唯一 `start.sh fetch-models`（组内幂等 + 断点续传 + 3 轮重试 + fail-closed 校验）。效果：镜像 -4.9G、每次构建省 3-5 分钟，代价只是**冷启动（持久盘损失后）首启一次下载**。
 
 | 资产 | 来源 |
 |---|---|
-| 检索模型 | `fetchmodels` stage 从 ModelScope 按与本地相同的文件清单下载 `BAAI/bge-m3` 与 `BAAI/bge-reranker-v2-m3` |
-| 生成模型 | Dockerfile `ADD` 官方 GGUF（默认 MiniCPM5-2B-Q4_K_M），容器启动后 `chatbot.py all` 自动 `ollama create` |
-| `artifacts/` + `storage/` | 本地已建好的分块产物与 Qdrant 数据（保证指纹一致） |
-| `ollama_models/` | 可选：若想复用宿主机已有 Ollama 模型，用 `-v ~/.ollama/models:/app/ollama_models:ro` 挂载，则跳过 create |
+| 模型（bge-m3 / reranker / GGUF） | **运行期**：容器启动先 `start.sh fetch-models` 装到持久盘；缺什么下什么，字节级幂等 |
+| `artifacts/` + `storage/` | 本地已建好的分块产物与 Qdrant 数据（保证指纹一致；`artifacts/chunks.json` 只服务本地重建，不出镜像） |
+| `ollama_models/` | 可选复用宿主机 Ollama 模型：`-v ~/.ollama/models:/app/ollama_models:ro`；否则运行期把 GGUF 落 `OLLAMA_MODELS` 再 `ollama create` |
 
 ~~~bash
 docker build -t rag-chatbot:modelscope .
 docker run --rm -p 7860:7860 rag-chatbot:modelscope
 # 打开 http://127.0.0.1:7860
-
-# 可选：复用宿主机 Ollama 模型（镜像不再执行 ollama create）
-docker run --rm -p 7860:7860 \
-  -v "$HOME/.ollama/models:/app/ollama_models:ro" rag-chatbot:modelscope
 ~~~
-
-> 检索模型由 `fetchmodels` stage 从 ModelScope 下载**与本地相同的文件清单**（不含 README/configuration.json 等额外文件），
-> 以保证 `_model_content_fingerprint` 与本地 `artifacts/`/`storage/` 完全一致。
-> 生成模型 GGUF 可用 `--build-arg OLLAMA_GGUF_URL=...` 替换；容器内 `all` 会先 `ollama create`
-> 再启动应用，模型不可用时直接退出，不会出现“Ollama 起来了但问答 404”。
 
 容器内 `chatbot.py all` 会：
 
-1. 并行启动 Qdrant 与 Ollama；
-2. 等 `/healthz` 与 `/api/version` 就绪；
-3. 若没有现成 manifest，自动用 `/app/ollama_models/*.gguf` 执行 `ollama create`；
+1. **先装载模型**（缺组 → `start.sh fetch-models`；持久盘命中=零下载）；
+2. 并行启动 Qdrant 与 Ollama；等 `/healthz` 与 `/api/version` 就绪；
+3. 若没有现成 manifest，用 `OLLAMA_MODELS/*.gguf` 执行 `ollama create`（持久盘时限一次拷贝，之后零启动成本）；
 4. 启动 Streamlit（`0.0.0.0:7860`）；
 5. 任一子进程退出 → 指数退避后就地重启（最长 30s）；收到 SIGTERM 优雅终止；
-6. Qdrant/Ollama 120s 不健康或模型创建失败 → 容器直接退出（不启动半残应用）。
+6. 模型装载失败/依赖 120s 不健康/模型创建失败 → 容器退出（平台重启自动重试，已下载字节续传）。
 
 ### 7.3 数据更新
 
@@ -179,15 +168,25 @@ docker exec -it <container> python chatbot.py stages
 
 ### 7.4 功能、性能、效果
 
-- **功能同源**：同一份 `chatbot.py`、`.env`、`artifacts/`、`storage/`；检索模型构建期从 ModelScope 下载同文件清单，生成模型由同一 GGUF 自动创建；没有 torch/http 或 CPU/GPU 的代码分叉。
+- **功能同源**：同一份 `chatbot.py`、`.env`、`artifacts/`、`storage/`；检索/生成模型与本地同一文件清单（运行期下载+字节校验）；没有 torch/http 或 CPU/GPU 的代码分叉。
 - **效果一致**：检索模型、重排模型、生成模型、切分/索引参数都相同，质量口径一致。
 - **性能不可能完全一致**：本地是 Metal/MPS，ModelScope 是 2vCPU 纯 CPU；重排、索引、首字延迟会明显慢于本机。这是硬件差异，不是代码差异。
 - 单容器 8G 档注意 `RAG_NUM_CTX`；OOM 时 `all` 会重启被杀的子进程（与本地 start.sh 的巡检语义一致）。
 
 ### 7.5 并行
 
-- **构建并行**：`pydeps`（依赖）、`fetchmodels`（检索模型下载）、`assets`（语料/产物）三个 stage 互不依赖，BuildKit 默认并行；最终 `app` 合并并 `ADD` 生成模型 GGUF。
-- **运行并行**：`chatbot.py all` 先并行拉起 Qdrant 与 Ollama，健康后再启动 Streamlit。
+- **构建并行**：`pydeps`（依赖）、`assets`（语料/产物）两个 stage 并行；最终 `app` 合并（不再有 fetchmodels 重下载）。
+- **运行并行**：`chatbot.py all` 先装载模型，再并行拉起 Qdrant 与 Ollama，健康后启动 Streamlit。
+
+### 7.6 一键发布（tools/ms_release.sh）
+
+~~~bash
+bash tools/ms_release.sh               # push(魔搭+GitHub) → deploy → 轮询 → 运行日志验收
+bash tools/ms_release.sh --verify-only # 只对当前运行日志做验收
+bash tools/ms_release.sh --no-deploy   # 只 push 不触发构建
+~~~
+
+验收判据与部署事故复盘同源：`🔧 分块指纹` 两侧一致；`📦 [模型装载]`/`[模型落位]` 行；无 `RuntimeError` 与 ❌ 新行（storage 运行时 churn 不挡发布）。构建超时默认自动重触发一次。
 
 ## 8. 常见问题
 
@@ -199,7 +198,7 @@ docker exec -it <container> python chatbot.py stages
 | `index` 提示可开内存不足 | 先 `./start.sh stop` 再重建（8G 档尤其注意） |
 | 改代码/`.env` 不生效 | 本脚本会复用已在跑的进程，`./start.sh stop && ./start.sh start` |
 | 配了 `http` 检索后端但查询报错 | 本版本不内置 infinity，改回 `torch` 或自行启动外部服务 |
-| Docker 构建慢 | 首次要下载 torch 并编译 llama-cpp-python；之后 BuildKit 缓存命中会快很多 |
+| 容器冷启动慢（首启） | 持久盘无权重时先下载 4.9G（运行日志看 `📦 [模型装载]` 进度），下载完成才到 7860；之后重启零下载 |
 
 ## 9. 边界
 

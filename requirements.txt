@@ -104,13 +104,10 @@ OpenCC==1.1.9
 pyahocorasick==2.3.1
 tenacity==9.1.4
 
-# 生成侧精确分词：用 Ollama 背后的 llama.cpp 直接分词（零规则）。
-# ⚠️ llama-cpp-python 0.3.x **没有 glibc wheel**：PyPI 只有 sdist；abetlen 的 cpu 索引与
-# GitHub Release 只发 musl 版（linux_x86_64，DT_NEEDED=libc.musl-x86_64.so.1）。在 bookworm
-# （glibc）上加载即失败 → llama.cpp 分词静默退化成 tokenizer.json。
-# 故 Dockerfile 用独立阶段 lcpwheel 从 sdist **源码编译出 glibc wheel**，放进 --find-links。
-# 2026-10-21 起 wheels/ 已收录 0.3.19 的 amd64 glibc 预编译 wheel（本地 Rosetta 编译，
-# 与魔搭构建机同基座）：lcpwheel 阶段优先复用现货，未命中才回退编译；升版本须重编入仓。
-# 本地/离线构建也可自行 `pip wheel llama-cpp-python==0.3.19` 后把产物丢进 wheels/。
-llama-cpp-python==0.3.19
-diskcache==5.6.3
+# 生成侧精确分词：主路径 = artifacts/gen_tokenizer/tokenizer.json（模型自带、带 sha 与
+# MODEL 匹配两重校验）；GGUF 走 Ollama 背后 llama.cpp 只是兜底路径。
+# ▲ 2026-10-27 起**不再安装 llama-cpp-python / diskcache**：
+#   - 0.3.x 在 PyPI 没有 glibc wheel（只有 sdist），容器里 pip 装它 = 每次构建源码编译
+#     cmake 编译数分钟，在线端主路径根本不用它、是纯部署负担；
+#   - 兜底路径缺包被 try/except 优雅降级（打一条 ℹ️ 走 token 计数估算，不受预算影响）；
+#   - 本地如需 GGUF 精确分词调试：`pip install llama-cpp-python==0.3.19` 手动装。
