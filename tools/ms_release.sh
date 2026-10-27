@@ -7,7 +7,8 @@
 #   bash tools/ms_release.sh --allow-dirty   # 允许带未提交改动发布（默认拒绝）
 #   bash tools/ms_release.sh --strict-github # GitHub 推送失败也视为失败（默认警告放行）
 # 验收判据（与部署事故复盘同源的运行日志关键行）:
-#   1) 🔧 分块指纹: 索引=… / 当前=…   —— 两侧一致才 PASS（指纹闸门）
+#   1) 🔧 分块指纹: 索引=… / 当前=…   —— 两侧一致才 PASS；**未见行=warn 不阻断**
+#      （指纹行要在用户实际发起一次检索后才出现，刚 Running 时没有是正常的）
 #   2) 模型装载/落位行（📦 [模型装载] 全部就绪（零下载命中） 或 [模型落位] ×≥2）
 #   3) 运行日志无 ❌ / RuntimeError / 无新增异常 traceback
 set -euo pipefail
@@ -19,7 +20,8 @@ API="https://modelscope.cn/openapi/v1/studios/${OWNER}/${STUDIO}"
 TARGET_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 NO_DEPLOY=0; VERIFY_ONLY=0; ALLOW_DIRTY=0; STRICT_GITHUB=0
-BUILD_TIMEOUT="${BUILD_TIMEOUT:-1200}"     # 构建轮询上限（秒）；超时自动重触发一次
+BUILD_TIMEOUT="${BUILD_TIMEOUT:-1500}"     # 首窗口上限（秒）：须覆盖真构建最坏情形（调度6min+构建16min）；
+                                           # 2026-10-27 23:37 实证：卡在 runner 排队的第 30 分钟由超时重触发解围
 POLL_INTERVAL="${POLL_INTERVAL:-20}"
 
 for arg in "$@"; do
@@ -120,9 +122,11 @@ if [ "${VERIFY_ONLY}" != "1" ]; then
         echo "⚠️ 构建超时（>${BUILD_TIMEOUT}s）——自动重触发一次（平台调度/卡死最常见解法）"
         _api -X POST "${API}/deploy" -H 'Content-Type: application/json' \
           -d "{\"branch\":\"${BRANCH}\",\"pipeline_type\":\"build_image\"}" | head -c 200; echo
-        _deadline=$(( $(date +%s) + BUILD_TIMEOUT ))
+        _deadline=$(( $(date +%s) + 1800 ))   # 二次窗口更长：重触发的新构建要走完整 build+push+调度
       else
-        echo "❌ 重触发后仍超时 —— 查魔搭控制台构建日志人工归因"; exit 1
+        echo "❌ 重触发后仍超时 —— 不排除仍在收尾：稍后 --verify-only 复核；"
+        echo "   或查 /logs/build 接口看 executionStep 是否在推进（23:37 场实证：HK runner 排队卡住时新起一场 14min 就建完）"
+        exit 1
       fi
     fi
   done
@@ -149,7 +153,7 @@ print("PASS" if seen and ok==seen else ("FAIL" if seen else "ABSENT"))')"
 case "${_fp_ok}" in
   PASS) say "  ✅ 分块指纹两侧一致" ;;
   FAIL) say "  ❌ 分块指纹不一致（垃圾桶在吃过期分块）"; FAIL=1 ;;
-  ABSENT) say "  ⚠️ 未见到分块指纹行（尚未触发首轮检索/日志未到）"; FAIL=1 ;;
+  ABSENT) say "  ⚠️ 未见到分块指纹行（尚未有检索触发指纹闸门，属正常；发一次检索后 --verify-only 复核）——不阻断" ;;
 esac
 
 printf '%s\n' "${LOGS}" | grep -q "📦 \[模型装载\]" \
