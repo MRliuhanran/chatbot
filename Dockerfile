@@ -19,6 +19,11 @@ FROM ollama/ollama:0.34.4 AS ollama
 
 # ── 依赖 stage：完整 python 镜像自带编译工具，供 llama-cpp-python 编译 ──
 FROM base AS pydeps
+# ★ 阶段内必须重声明 ARG：全局 ARG 只进 FROM 行；不重声明时 bash 里读到的是
+#   基础镜像的 ENV PYTHON_VERSION=3.10.22（完整三元版本）——把它去掉所有点拼出
+#   cp31022 的轮子名，pip 当场拒装（2026-10-27 22:01 构建实锤）。重声明后拿到
+#   全局默认 3.10 → cp310；将来全局 ARG 改 3.11 这里也会联动。
+ARG PYTHON_VERSION=3.10
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple \
     PIP_EXTRA_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple \
