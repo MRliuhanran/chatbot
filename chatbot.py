@@ -4763,40 +4763,78 @@ def _ensure_ollama_model(env, ollama_bin):
     return _ollama_models_present(models_dir)
 
 
-# ── 容器启动期模型装载（2026-10-27 部署瘦身：镜像不再烤 4.9G 权重） ──
-def _runtime_models_root():
-    """运行期模型装载根目录：显式 env > 魔搭持久盘 > 应用目录（退化语义与烤镜像一致）。
+# ── 容器启动期模型装载（2026-10-27 最快化定案：烤镜像为主，本套件=校验+落位+兜底） ──
+def _baked_models_ready(app_models):
+    """镜像是否已烤入检索权重（两组同时在且是真实目录）：真的才把镜像当装载根。
 
-    持久盘优先是为了"冷启动只痛一次"：首启把权重下到 /mnt/workspace/models，此后
-    容器重建零下载命中；没有持久盘的环境退化到 ./models，每次启动都当冷启动处理
+    真实目录 = isdir 且非 symlink——烤镜像 COPY 出来是真目录；运行期落位在
+    ./models 下建的 symlink 不算（它指向持久盘，不重复计入）。
+    """
+    for group in ("bge-m3", "bge-reranker-v2-m3"):
+        p = os.path.join(app_models, group)
+        if not (os.path.isdir(p) and not os.path.islink(p)):
+            return False
+    return True
+
+
+def _runtime_models_root():
+    """运行期模型装载根目录：显式 env > 烤镜像真实目录 > 魔搭持久盘 > 应用目录。
+
+    烤镜像优先：镜像里 /app/models/<组> 已是真实目录（构建期烧入），Running 即用、
+    零下载零拷贝——哪怕持久盘"看起来可用"，也不能舍近求远再去下一遍 4.9G。
+    烤不了才走持久盘（"冷启动只痛一次"：首启把权重下到 /mnt/workspace/models，
+    此后容器重建零下载命中）；都没有则退化 ./models，每次启动当冷启动处理
     （fetch-models 逐文件按字节尺寸幂等跳过，不会重复下载）。
     """
     explicit = (os.getenv("RAG_RUNTIME_MODELS_DIR") or "").strip()
     if explicit:
         return os.path.abspath(os.path.expanduser(explicit))
+    app_models = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    if _baked_models_ready(app_models):
+        return app_models
     if os.path.isdir("/mnt/workspace"):
         return "/mnt/workspace/models"
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+    return app_models
 
 
-def _models_group_complete(base, group):
+def _models_group_complete(env, base, group, app_root=None):
     """组级"大概率就绪"判定：只锚定每组**最大的**那个文件（bge-m3=pytorch_model.bin、
     reranker=model.safetensors、gguf=任意 >100MB 的 .gguf）——大文件是组内最后一个
     下载项，它完整 ⇒ 轮内校验器曾整体放行；残缺/回滚态仍会被 fetch-models 的逐文件
-    字节尺寸 fail-closed 校验接住。这样热启动跑三个 stat 就定案，不必全清单比对。"""
+    字节尺寸 fail-closed 校验接住。这样热启动跑三个 stat 就定案，不必全清单比对。
+
+    gguf 是多候选：GGUF 可能烤在 /app/ollama_models（镜像层）、挂在 OLLAMA_MODELS
+    （ollama blob 库同目录）、或由兜底装到 base/_gguf——烤镜像态下 base/_gguf 并
+    不存在，只查那里会把烤好的镜像误判缺组、白跑一遍下载。
+    """
     import glob
-    d = os.path.join(base, "_gguf" if group == "gguf" else group)
+    if group == "gguf":
+        app_root = app_root or os.path.dirname(os.path.abspath(__file__))
+        candidate_dirs = (
+            os.path.join(base, "_gguf"),
+            (env.get("OLLAMA_MODELS") or "").strip(),
+            os.path.join(app_root, "ollama_models"),
+        )
+        for d in candidate_dirs:
+            if not d or not os.path.isdir(d):
+                continue
+            # exists 过滤：悬空 symlink（上次权重目录被清掉的残骸）会被 glob 命中、
+            # 让 getsize 直接炸 FileNotFoundError——过滤后它就归为"不存在"，缺组
+            # 判定照常走缺分支。
+            hits = [p for p in glob.glob(os.path.join(d, "*.gguf")) if os.path.exists(p)]
+            if any(os.path.getsize(p) > 100_000_000 for p in hits):
+                return True
+        return False
+    d = os.path.join(base, group)
     if not os.path.isdir(d):
         return False
-    if group == "gguf":
-        return any(os.path.getsize(p) > 100_000_000 for p in glob.glob(os.path.join(d, "*.gguf")))
     _KEY = {"bge-m3": "pytorch_model.bin", "bge-reranker-v2-m3": "model.safetensors"}
     p = os.path.join(d, _KEY[group])
     return os.path.isfile(p) and os.path.getsize(p) > 50_000_000
 
 
 def _ensure_runtime_models(env, app_root):
-    """启动期模型装载：镜像不带权重，缺什么补什么（缺组才跑，幂等）。
+    """启动期模型装载：烤镜像为主——先校验镜像/持久盘权重，缺什么才补什么（幂等）。
 
     装载根：RAG_RUNTIME_MODELS_DIR 显式 > /mnt/workspace/models（持久盘） > ./models。
     下载复用仓库唯一 start.sh fetch-models（组内 3 轮 aria2 多连接 + curl 断点续传 +
@@ -4811,7 +4849,8 @@ def _ensure_runtime_models(env, app_root):
     import glob
     import subprocess
     base = _runtime_models_root()
-    missing = [g for g in ("bge-m3", "bge-reranker-v2-m3", "gguf") if not _models_group_complete(base, g)]
+    missing = [g for g in ("bge-m3", "bge-reranker-v2-m3", "gguf")
+               if not _models_group_complete(env, base, g, app_root)]
     # 老镜像时代（烤权重 + entrypoint symlink 落位）会在持久盘留下指向 /app/... 的
     # symlink —— 容器重建后全部悬空；fetch-models 在这种 link 上 mkdir 会失败导致
     # 启动死循环。缺组前先清掉 symlink 残留（真实目录不动，那个能直接复用）。
@@ -4853,10 +4892,19 @@ def _ensure_runtime_models(env, app_root):
         (os.path.join(models_dir, "bge-reranker-v2-m3"), os.path.join(base, "bge-reranker-v2-m3"),
          ("RAG_RERANK_MODEL_PATH", os.path.join(base, "bge-reranker-v2-m3"))),
     ]
-    ggufs = sorted(glob.glob(os.path.join(base, "_gguf", "*.gguf")))
-    if ggufs:
-        links.append((os.path.join(ollama_dir, os.path.basename(ggufs[0])), ggufs[0],
-                      ("OLLAMA_MODELS", os.path.join(base, "_gguf"))))
+    gguf_path = None   # 已就绪 GGUF 的路径（>100MB 判过）：兜底=base/_gguf、烤镜像=ollama_models
+    for _d in (os.path.join(base, "_gguf"), os.path.join(app_root, "ollama_models"), ollama_dir):
+        bigs = [p for p in sorted(glob.glob(os.path.join(_d, "*.gguf")))
+                if os.path.exists(p) and os.path.getsize(p) > 100_000_000]
+        if bigs:
+            gguf_path = bigs[0]
+            break
+    if gguf_path and os.path.abspath(os.path.dirname(gguf_path)) != os.path.abspath(ollama_dir):
+        # GGUF 不在 Ollama blob 库里 → symlink 挂进去（ollama create 从这里取权重）；
+        # 已经在就什么都不做——避免给自己建自指 symlink。回退值也要指向真能找到
+        # GGUF 的那个目录，而不是死的 base/_gguf（烤镜像态下它不存在）。
+        links.append((os.path.join(ollama_dir, os.path.basename(gguf_path)), gguf_path,
+                      ("OLLAMA_MODELS", os.path.dirname(gguf_path))))
     for link, target, rewrite in links:
         rel = os.path.relpath(link, app_root)
         if os.path.exists(link) and not os.path.islink(link):
@@ -4881,8 +4929,8 @@ def cmd_all(args=None):
     """单容器入口（ModelScope）：Qdrant + Ollama + Streamlit 三进程，带健康等待与自愈。
 
     本地原生请用 start.sh；容器里没有 shell/entrypoint，由本命令直接 exec 三个子进程。
-    功能/配置/模型与本地同源：都读同一份 .env；检索/生成权重在启动期由
-    _ensure_runtime_models 装到持久盘（镜像不带 4.9G），再拉三进程。
+    功能/配置/模型与本地同源：都读同一份 .env；检索/生成权重已随镜像烤入
+    （fetchmodels stage），启动期 _ensure_runtime_models 校验+落位，缺了才兜底下载。
     """
     import signal
     import subprocess
@@ -4902,10 +4950,10 @@ def cmd_all(args=None):
     env.setdefault("OLLAMA_MODELS", os.path.join(root, "ollama_models"))
     env.setdefault("QDRANT_HOST", "127.0.0.1")
     env.setdefault("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-    # 启动期装载：检索/生成权重缺什么补什么（镜像瘦身后的等价替身——原来是构建期
-    # fetchmodels stage 烤镜像）。失败了退出容器交平台重启，已下载字节留盘续传；
-    # 就绪后 OLLAMA_MODELS 里 manifest/gguf 至少其一，下方 _ensure_ollama_model 兜底
-    # 校验不会放行空目录。
+    # 启动期装载：权重主路径=烤镜像层（Running 即用），这里只做校验+落位；
+    # 镜像层/持久盘双缺失时才触发 fetch-models 兜底。失败了退出容器交平台重启，
+    # 已下载字节留盘续传；就绪后 OLLAMA_MODELS 里 manifest/gguf 至少其一，下方
+    # _ensure_ollama_model 校验不会放行空目录。
     if not _ensure_runtime_models(env, root):
         log("❌ [all] 启动期模型装载失败，容器退出（平台重启后自动重试）")
         return 1

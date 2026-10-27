@@ -131,11 +131,12 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 ### 7.2 构建与运行
 
-**2026-10-27 起镜像不带模型**：4.9G 权重（bge-m3 / bge-reranker / GGUF）由运行期 `cmd_all → _ensure_runtime_models` 装到持久盘 `/mnt/workspace/models`（可用 `RAG_RUNTIME_MODELS_DIR` 覆盖），下载复用仓库唯一 `start.sh fetch-models`（组内幂等 + 断点续传 + 3 轮重试 + fail-closed 校验）。效果：镜像 -4.9G、每次构建省 3-5 分钟，代价只是**冷启动（持久盘损失后）首启一次下载**。
+**模型三层部署（2026-10-27 最快化定案）**：① 镜像层烤权重——`fetchmodels` stage 构建期拉魔搭 CDN，组级层缓存命中即零下载（`ARG MODELS_REV` 不变即命中）；② 持久盘 `/mnt/workspace` 暖 ollama blobs（重启零拷贝）；③ 运行期兜底 `cmd_all → _ensure_runtime_models`——镜像层/持久盘任一缺失才用 `start.sh fetch-models` 补齐（缺组才下、字节级幂等，绝不启动死循环）。Running 后约 12s 可用；只有双层尽失的极端场景才先下 4.9G。
 
 | 资产 | 来源 |
 |---|---|
-| 模型（bge-m3 / reranker / GGUF） | **运行期**：容器启动先 `start.sh fetch-models` 装到持久盘；缺什么下什么，字节级幂等 |
+| 检索/重排模型 | 镜像层（与本地同文件清单、逐文件字节校验）；缺失时运行期 fetch-models 补 |
+| GGUF 生成模型 | 镜像层 `/app/ollama_models`；启动后 `ollama create`（manifest 落持久盘，重启零拷贝） |
 | `artifacts/` + `storage/` | 本地已建好的分块产物与 Qdrant 数据（保证指纹一致；`artifacts/chunks.json` 只服务本地重建，不出镜像） |
 | `ollama_models/` | 可选复用宿主机 Ollama 模型：`-v ~/.ollama/models:/app/ollama_models:ro`；否则运行期把 GGUF 落 `OLLAMA_MODELS` 再 `ollama create` |
 
@@ -147,7 +148,7 @@ docker run --rm -p 7860:7860 rag-chatbot:modelscope
 
 容器内 `chatbot.py all` 会：
 
-1. **先装载模型**（缺组 → `start.sh fetch-models`；持久盘命中=零下载）；
+1. **先校验模型**（烤镜像命中=零下载；缺组才 `start.sh fetch-models` 兜底）；
 2. 并行启动 Qdrant 与 Ollama；等 `/healthz` 与 `/api/version` 就绪；
 3. 若没有现成 manifest，用 `OLLAMA_MODELS/*.gguf` 执行 `ollama create`（持久盘时限一次拷贝，之后零启动成本）；
 4. 启动 Streamlit（`0.0.0.0:7860`）；
@@ -175,7 +176,7 @@ docker exec -it <container> python chatbot.py stages
 
 ### 7.5 并行
 
-- **构建并行**：`pydeps`（依赖）、`assets`（语料/产物）两个 stage 并行；最终 `app` 合并（不再有 fetchmodels 重下载）。
+- **构建并行**：`pydeps`（依赖）、`fetchmodels`（烤模型）、`assets`（语料/产物）三个 stage 互不依赖并行执行，最终 `app` 合并。
 - **运行并行**：`chatbot.py all` 先装载模型，再并行拉起 Qdrant 与 Ollama，健康后启动 Streamlit。
 
 ### 7.6 一键发布（tools/ms_release.sh）

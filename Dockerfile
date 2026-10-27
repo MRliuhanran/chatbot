@@ -1,9 +1,12 @@
 # ── 单容器 ModelScope 镜像（无 compose）──────────────────────────────
 # 一个容器里跑 Qdrant + Ollama + Streamlit，入口是 chatbot.py 的 all 命令；
 # 与本地源码运行共用同一份 .env / artifacts / storage，功能与效果同源。
-# 所有 RUN 使用 exec form；构建期不再下载模型 —— 4.9G 权重（bge-m3 /
-# bge-reranker/GGUF）由运行期 cmd_all → _ensure_runtime_models 用仓库唯一的
-# start.sh fetch-models 装到持久盘（/mnt/workspace/models），冷启动只下一次。
+# 所有 RUN 使用 exec form；模型部署三层各司其职（2026-10-27 最快化定案）：
+#   ① 镜像层烤权重（fetchmodels stage，构建机走魔搭 CDN + 组级层缓存命中=零下载）
+#      —— Running 后 ~12s 可用，没有冷启动 4.9G 下载；
+#   ② 持久盘 /mnt/workspace 暖缓存（ollama blobs 必落盘，重启零拷贝）；
+#   ③ 运行期兜底 cmd_all → _ensure_runtime_models——镜像层/持久盘任一缺失时用
+#      start.sh fetch-models 拉齐（缺组才下、字节幂等），绝不启动死循环。
 #
 # 构建:
 #   docker build -t rag-chatbot:modelscope .
@@ -43,10 +46,26 @@ COPY requirements.txt /tmp/requirements.txt
 RUN ["bash","-c","exec pip install --no-cache-dir \"https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.7.1%2Bcpu-cp${PYTHON_VERSION//./}-cp${PYTHON_VERSION//./}-manylinux_2_28_x86_64.whl\""]
 RUN ["pip","install","--no-cache-dir","-r","/tmp/requirements.txt"]
 
-# ── 资产 stage：与 pydeps 并行；源码/产物/配置 ──
-# 模型（4.9G）不烤进镜像：运行期由 cmd_all → _ensure_runtime_models 用仓库唯一
-# start.sh fetch-models 装到持久盘（/mnt/workspace/models），冷启动只下一次。
-# ollama_models 留空目录占位（本地直跑舒服；正式 GGUF 运行期落到 OLLAMA_MODELS）。
+# ── 检索模型 + GGUF stage：构建期从魔搭 CDN 拉取（烤镜像=Running 后 12s 可用） ──
+# 2026-10-27 部署最快化的定案：**烤镜像为主 + 运行期兜底**（三层各司其职）：
+#   - 模型层组级缓存（ARG MODELS_REV 不变=命中层缓存零下载，参见 22:02→22:08 实测
+#     5m47s 的那场）；首次无缓存时 16 连接 aria2（构建机走魔搭 CDN 最快通道）；
+#   - 生成侧 manifest/blobs 经运行期 ollama create 落持久盘（跨重建零拷贝收益）；
+#     bge 权重不暖盘——烤镜像层已在，拷一份纯耗时没有收益。
+#   - 镜像层/持久盘任一丢失都由运行期下兜底拉齐，绝不出现启动死循环。
+# 模型清单变化时 bump MODELS_REV 强制重拉；组内单文件变更由字节校验兜住。
+FROM base AS fetchmodels
+ARG MODELS_REV=2026-10-26
+ENV MODELS_REV=${MODELS_REV}
+COPY start.sh /tmp/start.sh
+RUN ["apt-get","update"]
+RUN ["apt-get","install","-y","--no-install-recommends","aria2","ca-certificates"]
+RUN ["bash","/tmp/start.sh","fetch-models","/models","gguf"]
+RUN ["bash","/tmp/start.sh","fetch-models","/models","bge-m3"]
+RUN ["bash","/tmp/start.sh","fetch-models","/models","bge-reranker-v2-m3"]
+
+# ── 资产 stage：与 pydeps / fetchmodels 并行；语料/产物/配置 ──
+# artifacts/chunks.json 只服务本地重建，不出镜像（serve 只读 meta+collection）。
 FROM scratch AS assets
 COPY .env /app/.env
 COPY corpus/ /app/corpus/
@@ -72,11 +91,20 @@ COPY --from=ollama /usr/bin/ollama /usr/local/bin/ollama
 COPY --from=ollama /usr/lib/ollama /usr/local/lib/ollama
 RUN ["test","-x","/usr/local/lib/ollama/llama-server"]
 COPY --from=assets /app/ /app/
-# start.sh 进入镜像：运行期 fetch-models 的唯一下载器（构建期已不下载模型）。
+# ── 烤镜像层：权重进镜像（Running 即用；运行期兜底只在缺失时才动）──
+COPY --from=fetchmodels /models/bge-m3 /app/models/bge-m3
+COPY --from=fetchmodels /models/bge-reranker-v2-m3 /app/models/bge-reranker-v2-m3
+# 生成模型 GGUF 直落 /app/ollama_models；启动后 all 执行 ollama create（manifest
+# 落持久盘 OLLAMA_MODELS，重启零拷贝）。>100MB 断言：GGUF 无稳定清单大小，构建期
+# 就 fail-fast，不让半截文件进镜像。
+COPY --from=fetchmodels /models/_gguf/MiniCPM5-2B-Q4_K_M.gguf /app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf
+RUN ["python","-c","import os,sys; p='/app/ollama_models/MiniCPM5-2B-Q4_K_M.gguf'; n=os.path.getsize(p); print('GGUF bytes:', n); sys.exit(0 if n > 100000000 else 1)"]
+# start.sh 进入镜像：运行期兜底的唯一下载器（主路径=烤镜像层）。
 COPY start.sh /app/start.sh
 COPY chatbot.py /app/chatbot.py
 EXPOSE 7860
-# start-period 600s：冷启动（持久盘无权重）要先下载 4.9G 模型再到 7860，120s 的
-# 老窗口会把"正在装模型"的健康等待误判成不健康。
+# start-period 600s：烤镜像主路径 ~12s 就绪；只有兜底路径（镜像层/持久盘双缺失）
+# 才需要先下 4.9G 再到 7860——宽窗口只服务那种极端场景（120s 老窗口曾把"装模型"
+# 的健康等待误判成不健康）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 CMD ["python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/_stcore/health', timeout=3)"]
 ENTRYPOINT ["python","chatbot.py","all"]
