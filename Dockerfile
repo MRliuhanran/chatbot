@@ -27,7 +27,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CMAKE_ARGS="-DGGML_OPENMP=OFF"
 RUN ["pip","install","--no-cache-dir","cmake","ninja"]
 COPY requirements.txt /tmp/requirements.txt
-RUN ["pip","install","--no-cache-dir","--index-url","https://download.pytorch.org/whl/cpu","torch==2.7.1"]
+RUN ["pip","install","--no-cache-dir","https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.7.1%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl"]
 RUN ["pip","install","--no-cache-dir","-r","/tmp/requirements.txt"]
 
 # ── 检索模型 + GGUF stage：唯一 shell start.sh 构建期下载 ───────────────────
