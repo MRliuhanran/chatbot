@@ -285,10 +285,10 @@ _fetch_models() {
         _need=1
     done
     _file="${_dest}/${_gguf_rel}"
+    mkdir -p "$(dirname "${_file}")"
     _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
     if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
         rm -f "${_file}"
-        mkdir -p "$(dirname "${_file}")"
         printf '%s\n  dir=%s\n  out=%s\n' "${_gguf_url}" "$(dirname "${_file}")" "$(basename "${_file}")" >> "${_input}"
         _need=1
     fi
@@ -319,6 +319,22 @@ _fetch_models() {
                     --retry 5 --retry-delay 3 --retry-all-errors -o "${_file}" "${_gguf_url}" || _die "下载失败: ${_gguf_url}"
             fi
         fi
+    fi
+    # aria2 部分失败/服务端断连时，用 curl 补齐缺失文件（再走统一校验）
+    for _item in "${_entries[@]}"; do
+        IFS='|' read -r _rel _url _size <<< "${_item}"
+        _file="${_dest}/${_rel}"
+        _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [ "${_got}" != "${_size}" ]; then
+            _log "curl 补齐: ${_rel}"
+            _fetch_curl_one "${_url}" "${_file}"
+        fi
+    done
+    _file="${_dest}/${_gguf_rel}"
+    _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
+        _log "curl 补齐: ${_gguf_rel}"
+        _fetch_curl_one "${_gguf_url}" "${_file}"
     fi
     rm -f "${_input}"
     for _item in "${_entries[@]}"; do
