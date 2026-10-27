@@ -43,6 +43,20 @@ TOKEN="$(_ms_token)"
 
 _api() { curl -sS -H "Authorization: Bearer ${TOKEN}" "$@"; }
 
+_buildlog_lastts() {  # 构建日志最后一行的时间戳（yyyy-mm-dd hh:mm:ss，runner 本地 CST≈本机时间）；空=无 executionStep/无日志
+  _api "${API}/logs/build?page=1&page_size=20" | python3 -c '
+import json,sys,re
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+rows=(d.get("data") or {}).get("logs") or (d.get("Data") or [])
+txt="".join(str(r) for r in rows)
+lines=[l for l in txt.split("\n") if l.strip()]
+for l in reversed(lines):
+    m=re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", l)
+    if m: print(m.group(1)); break' 2>/dev/null
+}
+_tsparse() { date -d "$1" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$1" +%s 2>/dev/null || echo 0; }
+
 _studio_state() { _api "${API}" | python3 -c '
 import json,sys
 d=json.load(sys.stdin).get("data") or {}
@@ -101,8 +115,11 @@ if [ "${VERIFY_ONLY}" != "1" ]; then
   echo "${RESP}" | head -c 400; echo
 
   echo "── 轮询构建状态（每 ${POLL_INTERVAL}s，上限 ${BUILD_TIMEOUT}s）──"
+  # ── 轮询（活量感知）：死线到点不盲目重触发——先看构建日志最后行年龄：还在推进就续期
+  #    （2026-10-28 01:11→01:27 实证：烤镜像 4.9G 推仓库要 16min+，fixed 死线会误杀真进度），
+  #    日志停滞（>阈值）才重触发；两次停滞直接退出归因。
   _deadline=$(( $(date +%s) + BUILD_TIMEOUT ))
-  _retrigged=0
+  _retrigged=0; _live_extend=0
   while : ; do
     sleep "${POLL_INTERVAL}"
     STATE="$(_studio_state)"
@@ -116,18 +133,27 @@ if [ "${VERIFY_ONLY}" != "1" ]; then
       *)
         echo "  （未知状态，继续观察）" ;;
     esac
-    if [ "${_t}" -gt "${_deadline}" ]; then
-      if [ "${_retrigged}" = "0" ]; then
-        _retrigged=1
-        echo "⚠️ 构建超时（>${BUILD_TIMEOUT}s）——自动重触发一次（平台调度/卡死最常见解法）"
-        _api -X POST "${API}/deploy" -H 'Content-Type: application/json' \
-          -d "{\"branch\":\"${BRANCH}\",\"pipeline_type\":\"build_image\"}" | head -c 200; echo
-        _deadline=$(( $(date +%s) + 1800 ))   # 二次窗口更长：重触发的新构建要走完整 build+push+调度
-      else
-        echo "❌ 重触发后仍超时 —— 不排除仍在收尾：稍后 --verify-only 复核；"
-        echo "   或查 /logs/build 接口看 executionStep 是否在推进（23:37 场实证：HK runner 排队卡住时新起一场 14min 就建完）"
-        exit 1
-      fi
+    if [ "${STATE}" != "Building" ] || [ "${_t}" -le "${_deadline}" ]; then continue; fi
+    _lastts="$(_buildlog_lastts)"
+    if [ -n "${_lastts}" ]; then
+      _age=$(( _t - $(_tsparse "${_lastts}") ))
+    else
+      _age=99999   # 无 executionStep/无日志 = runner 排队卡死（23:07/00:44 两场实证）
+    fi
+    if [ "${_age}" -le "${BUILD_LIVE_THRESHOLD:-420}" ] && [ "${_live_extend}" -lt "${BUILD_MAX_LIVE_EXTEND:-6}" ]; then
+      _live_extend=$((_live_extend+1))
+      echo "  🔎 构建日志仍在推进（最后行 ${_age}s 前，续期 ${_live_extend}/${BUILD_MAX_LIVE_EXTEND:-6}）——不重触发，宽限 10min"
+      _deadline=$(( _t + 600 ))
+    elif [ "${_retrigged}" = "0" ]; then
+      _retrigged=1
+      echo "⚠️ 构建停滞（最后行 ${_age}s 前）——自动重触发一次（runner 排队/卡死的最常见解法）"
+      _api -X POST "${API}/deploy" -H 'Content-Type: application/json' \
+        -d "{\"branch\":\"${BRANCH}\",\"pipeline_type\":\"build_image\"}" | head -c 200; echo
+      _deadline=$(( _t + 1800 ))
+    else
+      echo "❌ 重触发后仍停滞（最后行 ${_age}s 前）—— 稍后 --verify-only 复核（不排除仍在收尾）；"
+      echo "   或查魔搭控制台 /logs/build 人工归因"
+      exit 1
     fi
   done
   sleep 12   # 等运行日志刚起步的首屏落库
