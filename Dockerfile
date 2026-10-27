@@ -27,19 +27,26 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CMAKE_ARGS="-DGGML_OPENMP=OFF"
 RUN ["pip","install","--no-cache-dir","cmake","ninja"]
 COPY requirements.txt /tmp/requirements.txt
-RUN ["pip","install","--no-cache-dir","https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.7.1%2Bcpu-cp310-cp310-manylinux_2_28_x86_64.whl"]
+# 唯一 need-shell 的 RUN：wheel 文件名里的 cpXR 与 ARG PYTHON_VERSION 绑定（此前写死
+# cp310 —— 有人改 ARG 就会往不匹配的 Python 装轮子）。ARG 在构建容器里是环境变量，
+# bash 形参替换 3.10 → 310；镜像自带的 /bin/bash 可用。
+RUN ["bash","-c","exec pip install --no-cache-dir \"https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.7.1%2Bcpu-cp${PYTHON_VERSION//./}-cp${PYTHON_VERSION//./}-manylinux_2_28_x86_64.whl\""]
 RUN ["pip","install","--no-cache-dir","-r","/tmp/requirements.txt"]
 
 # ── 检索模型 + GGUF stage：唯一 shell start.sh 构建期下载 ───────────────────
 # 为什么不在 Dockerfile 里写 17 个 ADD：远程 ADD 不走层缓存，每次部署重下 4GB；
-# 这里一个 RUN 可缓存，且下载逻辑并入本仓库唯一的 start.sh（Docker/本机共用）。
+# 下载逻辑并入本仓库唯一的 start.sh（Docker/本机共用）。按模型拆成 3 个 RUN：
+# 单组网络失败只重下该组，已完成组留在层缓存里；此前 5.9G 全挤一个 RUN，
+# 2026-10-27 两次构建都死在整组下载中段，失败即全量重来。
 FROM base AS fetchmodels
 ARG MODELS_REV=2026-10-26
 ENV MODELS_REV=${MODELS_REV}
 COPY start.sh /tmp/start.sh
 RUN ["apt-get","update"]
 RUN ["apt-get","install","-y","--no-install-recommends","aria2","ca-certificates"]
-RUN ["bash","/tmp/start.sh","fetch-models","/models"]
+RUN ["bash","/tmp/start.sh","fetch-models","/models","gguf"]
+RUN ["bash","/tmp/start.sh","fetch-models","/models","bge-m3"]
+RUN ["bash","/tmp/start.sh","fetch-models","/models","bge-reranker-v2-m3"]
 
 # ── 资产 stage：与 pydeps 并行；源码/产物/配置 ──
 # ollama_models 可选：留 .keep 也能构建；正式生成模型由 fetchmodels 下载，all 里执行 ollama create。

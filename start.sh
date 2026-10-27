@@ -242,14 +242,44 @@ _detect_hw() {
 }
 
 
+# curl 单文件下载/补齐：fetch-models 的三处调用共用（aria2 残留补齐、无 aria2 时的降级下载）。
+# 以前补齐分支直接调用了一个从未定义的 _fetch_curl_one —— aria2 断连必触发
+# `_fetch_curl_one: command not found`（set -e 下 exit 127），救断连的逻辑自己先崩。
+_fetch_curl_one() {
+    local _url="${1}" _file="${2}" _max_time="${3:-1800}"
+    _log "curl 下载: ${_file}"
+    # -C - 先续传 aria2/上一轮 curl 留下的前缀字节（aria2 --file-allocation=none，落盘即真实
+    # 已下载量，可直接作 Range 起点）；续传被拒（服务端不支持 Range / 前缀异常）再整文件重下。
+    # 返回值交给调用方处置：补齐循环里单文件失败**不再 _die 杀死整次构建**——build 2026-10-27
+    # 21:34 正是这样死于"一个文件补齐失败=全部报废"；外层重试轮 + 终局校验兜底。
+    if curl -fL --http1.1 -C - --connect-timeout 20 --max-time "${_max_time}" \
+        --retry 5 --retry-delay 3 --retry-all-errors -o "${_file}" "${_url}"; then
+        return 0
+    fi
+    _log "curl 续传未成功，整文件重下: ${_file}"
+    rm -f "${_file}"
+    curl -fL --http1.1 --connect-timeout 20 --max-time "${_max_time}" \
+        --retry 5 --retry-delay 3 --retry-all-errors -o "${_file}" "${_url}"
+}
+
 # ── 构建期模型下载：唯一 shell 文件内完成，Docker 与本机共用 ────────────────
 # 替代 Dockerfile 的 17 个远程 ADD（远程 ADD 不走层缓存，每次部署重下 4GB）。
+# 用法: fetch-models [dest] [group...]   group ∈ {gguf|bge-m3|bge-reranker-v2-m3|all}，默认 all。
+# 分组的意义：Dockerfile 按组拆成 3 个 RUN —— 单组网络失败只重下该组，已完成组留在
+# 层缓存；此前 5.9G 全在同一个 RUN，任何一次 CDN 抖动都全量重来（2026-10-27 两次
+# 构建都死在整组下载中段）。组内再带 3 轮「aria2 → curl -C - 续传补齐 → 校验」重试。
 _fetch_models() {
-    local _dest="${1:-/models}" _input _item _rel _url _size _file _dir _need=0 _got
+    local _dest="${1:-/models}"; shift
+    local _groups="${*:-all}"
+    # 组名 = 模型目录名（gguf 是唯一的例外，目录 "_gguf" 以外的特判）。
+    # 曾经想用短名 "reranker" 当别名 —— 组按 rel 一级目录名过滤，别名永远匹配不上、
+    # reranker 组会静默下载 0 个文件（本地替身测试抓到），不做映射、名字保持一致。
+    case " ${_groups} " in *" all "*) _groups="gguf bge-m3 bge-reranker-v2-m3" ;; esac
     local _bge="https://modelscope.cn/models/BAAI/bge-m3/resolve/master"
     local _rr="https://modelscope.cn/models/BAAI/bge-reranker-v2-m3/resolve/master"
     local _gguf_rel="_gguf/MiniCPM5-2B-Q4_K_M.gguf"
     local _gguf_url="https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-gguf/resolve/master/MiniCPM5-2B-Q4_K_M.gguf"
+    # rel|url|size（size 必须与源站一字节不差；GGUF 无稳定清单大小，单独按 >100MB 校验）
     local _entries=(
         "bge-m3/colbert_linear.pt|${_bge}/colbert_linear.pt|2100674"
         "bge-m3/config.json|${_bge}/config.json|687"
@@ -269,84 +299,126 @@ _fetch_models() {
         "bge-reranker-v2-m3/tokenizer.json|${_rr}/tokenizer.json|17098273"
         "bge-reranker-v2-m3/tokenizer_config.json|${_rr}/tokenizer_config.json|1173"
     )
-    mkdir -p "${_dest}"
-    _input="$(mktemp "${TMPDIR:-/tmp}/rag-models.XXXXXX")"
+    # 组过滤：按 rel 的一级目录名匹配（gguf 不在 _entries 里，单独开关）
+    local _sel=() _item _rel _url _size
     for _item in "${_entries[@]}"; do
-        IFS='|' read -r _rel _url _size <<< "${_item}"
-        _file="${_dest}/${_rel}"
-        if [ -f "${_file}" ]; then
-            _got="$(wc -c < "${_file}" | tr -d '[:space:]')"
-            [ "${_got}" = "${_size}" ] && { _log "跳过已就绪: ${_rel}"; continue; }
-        fi
-        rm -f "${_file}"
-        _dir="${_dest}/$(dirname "${_rel}")"
-        mkdir -p "${_dir}"
-        printf '%s\n  dir=%s\n  out=%s\n' "${_url}" "${_dir}" "$(basename "${_rel}")" >> "${_input}"
-        _need=1
+        _rel="${_item%%|*}"
+        case " ${_groups} " in *" ${_rel%%/*} "*) _sel+=("${_item}") ;; esac
     done
-    _file="${_dest}/${_gguf_rel}"
-    mkdir -p "$(dirname "${_file}")"
-    _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
-        rm -f "${_file}"
-        printf '%s\n  dir=%s\n  out=%s\n' "${_gguf_url}" "$(dirname "${_file}")" "$(basename "${_file}")" >> "${_input}"
-        _need=1
-    fi
-    if [ "${_need}" = 1 ]; then
+    local _want_gguf=0
+    case " ${_groups} " in *" gguf "*) _want_gguf=1 ;; esac
+
+    local _attempt _input _file _dir _got _need _ok
+    for _attempt in 1 2 3; do
+        # —— 收集本组缺失文件（幂等：完整即跳过；不完整的把 .aria2 控制文件与数据文件
+        #    一起重置 —— 只删数据会留下孤儿控制文件，反而让 aria2 续传错乱）——
+        _input="$(mktemp "${TMPDIR:-/tmp}/rag-models.XXXXXX")"
+        _need=0
+        for _item in ${_sel[@]+"${_sel[@]}"}; do
+            IFS='|' read -r _rel _url _size <<< "${_item}"
+            _file="${_dest}/${_rel}"
+            if [ -f "${_file}" ]; then
+                _got="$(wc -c < "${_file}" | tr -d '[:space:]')"
+                [ "${_got}" = "${_size}" ] && { _log "跳过已就绪: ${_rel}"; continue; }
+            fi
+            rm -f "${_file}" "${_file}.aria2"
+            _dir="${_dest}/$(dirname "${_rel}")"
+            mkdir -p "${_dir}"
+            printf '%s\n  dir=%s\n  out=%s\n' "${_url}" "${_dir}" "$(basename "${_rel}")" >> "${_input}"
+            _need=1
+        done
+        if [ "${_want_gguf}" = 1 ]; then
+            _file="${_dest}/${_gguf_rel}"
+            mkdir -p "$(dirname "${_file}")"
+            _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
+                rm -f "${_file}" "${_file}.aria2"
+                printf '%s\n  dir=%s\n  out=%s\n' "${_gguf_url}" "$(dirname "${_file}")" "$(basename "${_file}")" >> "${_input}"
+                _need=1
+            fi
+        fi
+        if [ "${_need}" = 0 ]; then
+            rm -f "${_input}"
+            _log "第 ${_attempt} 轮：本组文件全部就绪，无需下载"
+            break
+        fi
+        # —— aria2 多连接（max-tries=10 抗 CDN 抖动；summary-interval=30 止住进度刷屏）。
+        #    失败不致命：交给 curl 续传补齐，再不行还有外层重试轮 —— 此前的组合拳是
+        #    "aria2 一次定生死 + 补齐分支调用未定义函数"，任何抖动都直接 BuildFailed。
         if command -v aria2c >/dev/null 2>&1; then
-            _log "aria2 多连接下载模型"
+            _log "aria2 多连接下载模型（第 ${_attempt}/3 轮）"
             aria2c -i "${_input}" \
                 --max-concurrent-downloads=8 --split=16 --max-connection-per-server=16 \
                 --min-split-size=1M --file-allocation=none --continue=true \
                 --allow-overwrite=true --auto-file-renaming=false \
-                --retry-wait=2 --max-tries=5 --console-log-level=warn || \
-                _log "⚠️ aria2 返回非零，继续做完整性校验"
+                --connect-timeout=20 --timeout=120 \
+                --retry-wait=3 --max-tries=10 --summary-interval=30 \
+                --console-log-level=warn \
+                || _log "⚠️ aria2 返回非零（第 ${_attempt} 轮），尝试 curl 续传补齐"
         else
-            _log "未找到 aria2c，使用 curl 顺序下载"
-            for _item in "${_entries[@]}"; do
+            _log "未找到 aria2c，使用 curl 顺序下载（第 ${_attempt}/3 轮）"
+            for _item in ${_sel[@]+"${_sel[@]}"}; do
                 IFS='|' read -r _rel _url _size <<< "${_item}"
                 _file="${_dest}/${_rel}"
                 _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
                 [ "${_got}" = "${_size}" ] && continue
-                _log "curl 下载: ${_rel}"
-                curl -fL --http1.1 --connect-timeout 20 --max-time 1200 \
-                    --retry 5 --retry-delay 3 --retry-all-errors -o "${_file}" "${_url}" || _die "下载失败: ${_url}"
+                _fetch_curl_one "${_url}" "${_file}" 1200 || true
             done
+            if [ "${_want_gguf}" = 1 ]; then
+                _file="${_dest}/${_gguf_rel}"
+                _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+                if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
+                    _fetch_curl_one "${_gguf_url}" "${_file}" || true
+                fi
+            fi
+        fi
+        # —— aria2 部分失败/断连时，curl -C - 从已落盘前缀续传补齐；失败只记日志，
+        #    由本轮校验 + 外层重试接手（绝不在这里 _die）——
+        for _item in ${_sel[@]+"${_sel[@]}"}; do
+            IFS='|' read -r _rel _url _size <<< "${_item}"
+            _file="${_dest}/${_rel}"
+            _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [ "${_got}" != "${_size}" ]; then
+                _log "curl 补齐: ${_rel}"
+                _fetch_curl_one "${_url}" "${_file}" || true
+            fi
+        done
+        if [ "${_want_gguf}" = 1 ]; then
             _file="${_dest}/${_gguf_rel}"
             _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
             if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
-                curl -fL --http1.1 --connect-timeout 20 --max-time 1800 \
-                    --retry 5 --retry-delay 3 --retry-all-errors -o "${_file}" "${_gguf_url}" || _die "下载失败: ${_gguf_url}"
+                _log "curl 补齐: ${_gguf_rel}"
+                _fetch_curl_one "${_gguf_url}" "${_file}" || true
             fi
         fi
-    fi
-    # aria2 部分失败/服务端断连时，用 curl 补齐缺失文件（再走统一校验）
-    for _item in "${_entries[@]}"; do
-        IFS='|' read -r _rel _url _size <<< "${_item}"
-        _file="${_dest}/${_rel}"
-        _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
-        if [ "${_got}" != "${_size}" ]; then
-            _log "curl 补齐: ${_rel}"
-            _fetch_curl_one "${_url}" "${_file}"
+        rm -f "${_input}"
+        # —— 本轮校验：全过提前收工；否则带着缺口进下一轮 ——
+        _ok=1
+        for _item in ${_sel[@]+"${_sel[@]}"}; do
+            IFS='|' read -r _rel _url _size <<< "${_item}"
+            _got="$(wc -c < "${_dest}/${_rel}" 2>/dev/null | tr -d '[:space:]' || true)"
+            [ "${_got}" = "${_size}" ] || { _ok=0; _log "⚠️ 第 ${_attempt} 轮未完成: ${_rel}（期望 ${_size}，实际 ${_got:-缺失}）"; }
+        done
+        if [ "${_want_gguf}" = 1 ]; then
+            _got="$(wc -c < "${_dest}/${_gguf_rel}" 2>/dev/null | tr -d '[:space:]' || true)"
+            { [ -n "${_got}" ] && [ "${_got}" -gt 100000000 ]; } || { _ok=0; _log "⚠️ 第 ${_attempt} 轮未完成: ${_gguf_rel}"; }
         fi
+        [ "${_ok}" = 1 ] && break
+        [ "${_attempt}" = 3 ] || sleep 5
     done
-    _file="${_dest}/${_gguf_rel}"
-    _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [ -z "${_got}" ] || [ "${_got}" -le 100000000 ]; then
-        _log "curl 补齐: ${_gguf_rel}"
-        _fetch_curl_one "${_gguf_url}" "${_file}"
-    fi
-    rm -f "${_input}"
-    for _item in "${_entries[@]}"; do
+    # —— 终局校验（fail-closed：缺一个字节都不放行，宁可使构建失败也不入库残缺产物）——
+    for _item in ${_sel[@]+"${_sel[@]}"}; do
         IFS='|' read -r _rel _url _size <<< "${_item}"
-        _file="${_dest}/${_rel}"
-        _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+        _got="$(wc -c < "${_dest}/${_rel}" 2>/dev/null | tr -d '[:space:]' || true)"
         [ "${_got}" = "${_size}" ] || _die "模型文件大小不符: ${_rel}（期望 ${_size}，实际 ${_got:-缺失}）"
     done
-    _file="${_dest}/${_gguf_rel}"
-    _got="$(wc -c < "${_file}" 2>/dev/null | tr -d '[:space:]' || true)"
-    [ -n "${_got}" ] && [ "${_got}" -gt 100000000 ] || _die "GGUF 文件缺失或过小: ${_gguf_rel}"
-    _log "模型下载完成: ${_dest}"
+    if [ "${_want_gguf}" = 1 ]; then
+        _got="$(wc -c < "${_dest}/${_gguf_rel}" 2>/dev/null | tr -d '[:space:]' || true)"
+        { [ -n "${_got}" ] && [ "${_got}" -gt 100000000 ]; } || _die "GGUF 文件缺失或过小: ${_gguf_rel}"
+    fi
+    # 成功下载时 aria2 会自删控制文件；这里兜底清残留，绝不混进最终镜像
+    find "${_dest}" -name "*.aria2" -delete 2>/dev/null || true
+    _log "模型下载完成: ${_dest}（组: ${_groups}）"
 }
 
 _usage() { sed -n '2,23p' "${ROOT}/start.sh"; }
