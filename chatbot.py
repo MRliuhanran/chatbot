@@ -4970,6 +4970,7 @@ def cmd_all(args=None):
     功能/配置/模型与本地同源：都读同一份 .env；检索/生成权重已随镜像烤入
     （fetchmodels stage），启动期 _ensure_runtime_models 校验+落位，缺了才兜底下载。
     """
+    import shutil
     import signal
     import subprocess
     import time
@@ -4980,7 +4981,19 @@ def cmd_all(args=None):
     qdrant_bin = env.get("QDRANT_BIN", "/usr/local/bin/qdrant")
     ollama_bin = env.get("OLLAMA_BIN", "/usr/local/bin/ollama")
     env.setdefault("QDRANT__SERVICE__HOST", "127.0.0.1")
-    env.setdefault("QDRANT__STORAGE__STORAGE_PATH", os.path.join(root, "storage"))
+    # 镜像里的 storage 是 overlayfs 下层目录。Qdrant 更新/稀疏重建后会 rename segment
+    # 目录为 *.deleted；下层目录 rename 在 overlayfs 上会报 EXDEV（Invalid cross-device
+    # link），导致 flush 失败。启动时复制到可写上层目录（/app/storage-rw），让 Qdrant
+    # 的所有 rename 都发生在同一可写层；容器重启后复用已复制的目录。
+    storage_src = os.path.join(root, "storage")
+    storage_rw = os.path.join(root, "storage-rw")
+    if not os.path.isdir(storage_rw) and os.path.isdir(storage_src):
+        try:
+            shutil.copytree(storage_src, storage_rw)
+            log(f"[all] storage 复制到可写层: {storage_rw}")
+        except Exception as exc:
+            log(f"⚠️  [all] storage 复制失败，回退只读镜像目录: {type(exc).__name__}: {exc}")
+    env["QDRANT__STORAGE__STORAGE_PATH"] = storage_rw if os.path.isdir(storage_rw) else storage_src
     # Ollama blob 库跟权重一起放持久盘：ollama create 只在冷启动做一次（1.5G 拷贝），
     # 容器重启后 manifest 直接命中、零拷贝启动；无持久盘退化回镜像内目录。
     if os.path.isdir("/mnt/workspace"):
