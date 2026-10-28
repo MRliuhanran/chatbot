@@ -4925,44 +4925,6 @@ def _ensure_runtime_models(env, app_root):
     return True
 
 
-def _repair_sparse_if_stale():
-    """启动期自愈：索引里的 lexicon_id 与当前词表不一致时，先 sparse 原地重建。
-
-    背景：镜像里烤的是 storage 快照，词表文件随代码更新后若没有重跑 sparse，
-    首个查询会被 _check_lexicon_consistency 的 fail-closed 闸门拦下（用户看到 500）。
-    这里在 Qdrant 就绪后、应用启动前做一次全量 lexicon_id 检查；只有不一致才重建，
-    正常情况下是一次 21k 点 scroll（毫秒级），不影响启动延迟。
-    """
-    from qdrant_client import QdrantClient
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
-    try:
-        try:
-            collection = resolve_collection_name(client)
-        except Exception as exc:
-            log(f"[all] 跳过稀疏自检（集合/别名不可用）: {type(exc).__name__}: {exc}")
-            return True
-        ids = _distinct_lexicon_ids(client, collection)
-        if not ids:
-            return True
-        current = lexicon_fingerprint(client)
-        stale = [(lid, n) for lid, n in ids if lid != current]
-        if not stale:
-            log(f"[all] 稀疏词表一致: {current}（{sum(n for _lid, n in ids)} 条）")
-            return True
-        log(f"[all] ⚠️ 词表与索引不一致（索引 {stale} / 当前 {current}），启动期自动 sparse 重建")
-        rc = _sparse_rebuild()
-        if rc != 0:
-            log("[all] ❌ 稀疏自动重建失败；应用仍会启动，但检索会被词表闸门拦截")
-            return False
-        log("[all] ✅ 稀疏自动重建完成")
-        return True
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
-
-
 def cmd_all(args=None):
     """单容器入口（ModelScope）：Qdrant + Ollama + Streamlit 三进程，带健康等待与自愈。
 
@@ -5050,12 +5012,6 @@ def cmd_all(args=None):
             process.terminate()
         log("❌ [all] Ollama 模型不可用，容器退出")
         return 1
-
-    # 应用启动前自愈：镜像里的 storage 可能比 lexicon/ 旧；不修的话首个查询必 500。
-    try:
-        _repair_sparse_if_stale()
-    except Exception as exc:
-        log(f"⚠️  [all] 稀疏自检异常（不影响启动，首查询可能报词表不一致）: {type(exc).__name__}: {exc}")
 
     try:
         spawn("app")
