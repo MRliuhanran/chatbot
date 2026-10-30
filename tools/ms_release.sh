@@ -192,6 +192,14 @@ printf '%s\n' "${LOGS}" | grep -cE '\[模型落位\]|检索模型落位' >/dev/n
 if printf '%s\n' "${LOGS}" | grep -q "RuntimeError"; then
   say "  ❌ 运行日志出现 RuntimeError:"; printf '%s\n' "${LOGS}" | grep -n "RuntimeError" | head -3; FAIL=1
 else say "  ✅ 无 RuntimeError"; fi
+# 启动编排失败（❌ [all] 是 cmd_all 退出容器交平台重启的那类行）必须算失败——不然 app
+# 没起来、日志干净没错误的"空跑"会被误判成验收 PASS。
+if printf '%s\n' "${LOGS}" | grep -q '❌ \[all\]'; then
+  say "  ❌ 运行日志出现 ❌ [all]（启动编排失败）:"; printf '%s\n' "${LOGS}" | grep '❌ \[all\]' | head -3; FAIL=1
+else say "  ✅ 无 ❌ [all]"; fi
+printf '%s\n' "${LOGS}" | grep -q '\[all\] infinity 就绪' \
+  && say "  ✅ infinity: $(printf '%s\n' "${LOGS}" | grep -m1 '\[all\] infinity 就绪' | sed 's/^ *//')" \
+  || say "  ⚠️ 未见到 infinity 就绪行（torch/http 后端不编排或尚未就绪）"
 if printf '%s\n' "${LOGS}" | grep -q "❌"; then
   say "  ⚠️ 有 ❌ 行（人工过目是否有致命项）:"; printf '%s\n' "${LOGS}" | grep "❌" | tail -5
 fi

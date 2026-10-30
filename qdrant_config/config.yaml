@@ -25,3 +25,9 @@ service:
   grpc_port: 6334
   http_port: 6333
   host: 0.0.0.0
+  # max_workers 显式固定（2026-10-30）。默认 0 = 可用核−1：本机 10 核无碍，但 2vCPU 容器
+  # 只会得到 1 个 serving worker —— 每轮检索 dense+sparse 两个并发请求会在这 1 个 worker
+  # 上排队，客户端精心排好的"墙钟 = max 而非和"在服务端被退回成求和。4 = 客户端读并发
+  # (2) ×2 的裕量；serving 是 IO 型协程调度，超配不吃 CPU，其余角色（search/optimizers/
+  # hnsw 建图）仍各按各自默认（见 docs/architecture 02 的并行默认表）。
+  max_workers: 4

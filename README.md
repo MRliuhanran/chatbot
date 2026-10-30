@@ -70,8 +70,13 @@ open http://127.0.0.1:8501
 | `./start.sh stages` | 四阶段新鲜度检查，给出最小重跑命令 |
 | `./start.sh lexicon` | 词表自检 |
 | `./start.sh compare-chunks A [B]` | 两份分块产物对比 |
+| `./start.sh evaluate <评测集> [...]` | 离线检索评估（Recall@k / MRR@k / nDCG@k；不依赖 Ollama，只测检索链路） |
 
 所有命令最终都落到 `chatbot.py` 的 CLI；`start.sh` 只做服务编排与命令透传。
+
+构建台账默认开（`RAG_BUILD_STATS=0` 关）：process / index / sparse 每次成功收尾在
+`artifacts/builds.jsonl` 追加一行结构化读数（复用率、缓存命中率/是否重写、嵌入与写批墙钟、
+写批构造-往返分解），摘要工具 `python tools/build_stats.py`（`--json` / `--tail N`）。
 
 ## 4. 配置
 
@@ -84,11 +89,13 @@ open http://127.0.0.1:8501
 | `MODEL` / `OLLAMA_BASE_URL` | 生成模型与 Ollama 地址 |
 | `RAG_NUM_CTX` / `RAG_NUM_PREDICT` | 上下文窗口 / 输出上限（0=不限长） |
 | `RAG_DATA_DIR` / `RAG_DOC_GLOB` | 语料目录与匹配模式（默认 `corpus/*.txt`） |
-| `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND` | `torch`（进程内，默认）或 `http`（外部服务，本版本不内置） |
+| `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND` | `http`（现行：同一 infinity 实例双模型，GPU=auto）/ `torch`（进程内降档） |
 | `RAG_EMBED_MODEL_PATH` / `RAG_RERANK_MODEL_PATH` | 本地检索模型目录 |
-| `RAG_TOP_K` / `RAG_RERANK_TOP_K` | 返回条数 / 重排候选池 |
-| `RAG_LOGIN_ENABLED` | 登录门开关（本地无 OAuth 时自动关闭） |
+| `RAG_TOP_K` / `RAG_RECALL_LIMIT` | 返回条数 / 每通道召回深度（重排候选不截断） |
+| `RAG_LOGIN_ENABLED` / `RAG_LOGIN_IDLE_TTL_S` | 登录门开关（本地手机号模式，无第三方 IdP）/ 闲置过期秒数（默认 3600，每次使用顺延） |
+| `RAG_MEM_GUARD` / `RAG_MEM_KILL_PCT` | 内存熔断开关 / 触发水位（默认 95%：触线中止本轮，等同"停止生成"） |
 | `RAG_TURN_STATS` | 单轮台账（排查性能时临时开） |
+| `RAG_BUILD_STATS` / `RAG_BUILD_STATS_FILE` | 构建台账（默认开；每轮 process/index/sparse 成功收尾各一行）/ 落盘路径（默认 `artifacts/builds.jsonl`） |
 
 ## 5. 架构一句话版
 
@@ -103,7 +110,7 @@ L5 编排：run_turn、CLI 命令
 L6 Streamlit UI（唯一 import streamlit 的层）
 ~~~
 
-在线链路：空查询守卫 → 分块/词表指纹闸门 → 稠密 + 稀疏并发召回 → 加权 RRF → 按 id 回取 → 父块去重 → 全候选重排 → token 硬上界装配 → Ollama 流式生成。失败不入历史，Stop 主动断开上游流。
+在线链路：分块/词表指纹闸门 → 稠密 + 稀疏并发召回 → 加权 RRF → 按 id 回取 → 父块去重 → 全候选重排 → token 硬上界装配 → Ollama 流式生成。失败不入历史，Stop 主动断开上游流。
 
 ## 6. 数据重建与指纹
 
@@ -116,9 +123,17 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 产物由指纹绑定：切分指纹、词表指纹、稠密缓存键。**不要改名/加装饰器/改空白**到 `chatbot.py` 中 `_CHUNKING_CODE_UNITS`、`_embed_code_fingerprint`、`lexicon_fingerprint` 列出的函数——`inspect.getsource` 变化会触发全量重建。
 
+嵌入缓存的两条运行期约定（2026-10-29 起）：
+
+- **落盘位宽与文件名标签同源**：`fp16` 计算路径（GPU half 权重）的缓存真的存 float16（磁盘减半），
+  `fp32`（CPU）保持 float32；读侧统一升 float32，在线 upsert 与质量口径不变。文件名四段键
+  （治路径/内容/代码/精度）不受影响，**已有缓存不失效**。
+- **index 成功收尾自动 GC**：换嵌入模型或改嵌入代码后，旧的 `code_key`/模型指纹缓存文件不再被
+  任何一次运行读取，index 会顺手删掉它们（`*.tmp.npz` 中断残留照旧在起手时清）。不再手工删旧 npz。
+
 ## 7. ModelScope 部署：一个 Dockerfile
 
-本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三个进程由 `chatbot.py all` 管理（源码里的进程管理器），不依赖 compose。
+本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三进程由 `chatbot.py all` 管理（源码里的进程管理器）；**http 后端多托一个 infinity 作为第 4 进程**（2026-10-30 起 `.env=http/http`：应用层 pip 补装 `infinity-emb[torch,server]==0.0.76` + `psutil`，`cmd_all` 按 start.sh 同构 argv 编排并等其健康，未就绪退出容器交平台重启）。不依赖 compose。
 
 ### 7.1 Dockerfile 约束
 
@@ -198,12 +213,14 @@ bash tools/ms_release.sh --no-deploy   # 只 push 不触发构建
 | 页面提示向量库为空 | 先 `./start.sh process && ./start.sh index` |
 | `index` 提示可开内存不足 | 先 `./start.sh stop` 再重建（8G 档尤其注意） |
 | 改代码/`.env` 不生效 | 本脚本会复用已在跑的进程，`./start.sh stop && ./start.sh start` |
-| 配了 `http` 检索后端但查询报错 | 本版本不内置 infinity，改回 `torch` 或自行启动外部服务 |
+| 配了 `http` 检索后端但查询报错 | 本地：`./start.sh status` 看 infinity 是否健康，起服务后先跑 `./start.sh embedpairs`（对拍 cos≥0.999 才准入）；容器：`cmd_all` 自行编排并等就绪，看运行日志的 `[all] infinity 未就绪` 行 |
 | 容器冷启动慢（首启） | 持久盘无权重时先下载 4.9G（运行日志看 `📦 [模型装载]` 进度），下载完成才到 7860；之后重启零下载 |
 
 ## 9. 边界
 
-- 单机、单用户；无多租户、无并发队列、无鉴权（默认登录门关闭）。
+- 单机、单用户；无多租户、无并发队列。登录门是**自报手机号识别**（无密码/短信/IdP），不是认证；会话存进程内，重启即全员重登。
+- 不限制在线人数与并发数：内存是唯一闸门（`RAG_MEM_*`）。生成中触到水位线即中止本轮（等同"停止生成"，残缺答案不入历史）；不排队、不拒绝登录、不卸载模型（驻留交给 Ollama keep_alive）。
 - 语料仅支持 `*.txt`。
 - 生成侧不重试、不拒答、无输出长度闸（窗口是唯一上限）；这是显式设计。
-- 没有测试框架与 CI；质量靠指纹闸门、`start.sh stages` 与人工验收。
+- 没有测试框架与 CI；质量靠指纹闸门、`start.sh stages` 与人工验收。检索质量可用离线评估
+  `evaluate` 命令（手标评测集，只测检索链路、不依赖 Ollama），但它不是常驻的回归防线，评测集是人工维护的。

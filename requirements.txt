@@ -17,6 +17,13 @@ streamlit==1.62.0
 # 故显式锁定；entrypoint.sh 运行期用它把平台注入的 OAUTH_* 装配成 secrets.toml 的 [auth]。
 authlib==1.7.2
 requests==2.32.4
+# 内存熔断（RAG_MEM_*）的兜底口径：Linux 容器优先走 cgroup/宿主的 _mem_available_mb，
+# 只有 macOS 本地（无 /proc、无 cgroup）才靠 psutil 读可用量 —— 缺了它熔断在本地直接失效。
+psutil==7.0.0
+# 检索侧 http 后端的外部推理服务（2026-10-30 起 .env=http/http：bge-m3 + bge-reranker-v2-m3
+# 同实例）。本地 start.sh _ensure_infinity 起、容器 cmd_all 起——都是进程外，不进 chatbot
+# 进程。版本 = 本地实测组合；Dockerfile 应用层同键补装（base 重层没带，见 Dockerfile RUN）。
+infinity-emb[torch,server]==0.0.76
 qdrant-client==1.19.0
 # .env 加载（chatbot.py 顶部）。缺失即报错、不静默跳过 —— 静默跳过会让 .env 的
 # MODEL/OLLAMA_BASE_URL 全失效，程序悄悄跑在代码默认值上，极难定位。

@@ -7,14 +7,16 @@
 #   ./start.sh stop              停本脚本记录的三个进程
 #   ./start.sh restart           先停后起
 #   ./start.sh status            健康状态 + pid
-#   ./start.sh logs              tail -F 三个日志
+#   ./start.sh logs              tail -F 全部日志（含 infinity，若已起）
 #   ./start.sh serve             只起 Streamlit（前台，调试用）
 #   ./start.sh process           分块（python chatbot.py process）
 #   ./start.sh index             建索引
 #   ./start.sh sparse            重建稀疏向量
 #   ./start.sh stages            四阶段新鲜度检查
 #   ./start.sh lexicon           词表自检
+#   ./start.sh embedpairs        嵌入对拍探针（本地 torch vs http，cos≥0.999 准入）
 #   ./start.sh compare-chunks A [B]
+#   ./start.sh evaluate <评测集> [--rerank] [--k 1 3 5 10] [--out 报告.json]
 #   ./start.sh fetch-models [dest] 构建期下载模型（Docker 也复用本文件）
 #
 # 前置:
@@ -35,9 +37,16 @@ QDRANT_BIN="${QDRANT_BIN:-${ROOT}/.bin/qdrant/qdrant}"
 QDRANT_LOG="${ROOT}/qdrant.log"
 OLLAMA_LOG="${ROOT}/ollama.log"
 APP_LOG="${ROOT}/streamlit.log"
+INFINITY_LOG="${ROOT}/infinity.log"
 QDRANT_PID="${ROOT}/.qdrant.pid"
 OLLAMA_PID="${ROOT}/.ollama.pid"
 APP_PID="${ROOT}/.streamlit.pid"
+INFINITY_PID="${ROOT}/.infinity.pid"
+# infinity（外部嵌入/重排服务）只在 http 后端时被编排；端口必须与 .env 的 *_URL 对齐。
+INFINITY_PORT="${RAG_INFINITY_PORT:-8001}"
+INFINITY_URL="http://127.0.0.1:${INFINITY_PORT}"
+# /health 挂在根路由还是 /v1 前缀下随版本而异：两个候选都试（嵌入/重排端点必在前缀下）。
+_infinity_ok() { _http_ok "${INFINITY_URL}/health" || _http_ok "${INFINITY_URL}/v1/health"; }
 
 _log() { printf '[start] %s\n' "${*}"; }
 _die() { printf '[start] ❌ %s\n' "${*}" >&2; exit 1; }
@@ -125,11 +134,58 @@ _load_dotenv() {
     done < "${_file}"
 }
 
-_check_backends() {
+# ── infinity 编排（2026-10-30 起）：http 后端就绪闸，替代旧的"警告不内置"────────
+# torch 后端 → 直接放行（本机进程内跑）；http 后端 → 必须有就绪的 infinity：
+#   · 一个服务同时托管两组模型（bge-m3 + bge-reranker-v2-m3），--model-id/--served-model-name
+#     成对重复传；名字必须与 .env 的 RAG_*_MODEL_NAME 逐字一致（客户端按名调用，运行期
+#     还有合同三查兜底）；
+#   · --device auto：cuda/mps 可用即 GPU，都没有自动 CPU（"没有 GPU 的时候用 cpu"）；
+#   · 已健康则复用：本脚本实例（pid 文件）或外部实例（平台自管 infinity 的场景）都放行，
+#     与 Qdrant 的"拒绝外部实例"不同 —— 推理服务无状态，来源不影响检索正确性；
+#   · 端口/前缀/超时可覆写：RAG_INFINITY_PORT / RAG_INFINITY_DEVICE / RAG_INFINITY_BATCH /
+#     RAG_INFINITY_WAIT（秒；torch 首次冷加载两模型可能数分钟）。
+_ensure_infinity() {
     case "${RAG_EMBED_BACKEND:-torch}/${RAG_RERANK_BACKEND:-torch}" in
-        *http*) _log "⚠️  .env 配置了 http 检索后端；本发行版不内置 infinity 服务，查询会报错。"
-                _log "    改回 RAG_EMBED_BACKEND=torch / RAG_RERANK_BACKEND=torch 即可进程内运行。" ;;
+        *http*) ;;
+        *) return 0 ;;
     esac
+    if _infinity_ok; then
+        if _owned_pid "${INFINITY_PID}" "infinity_emb" >/dev/null; then
+            _log "infinity 已在运行（本脚本实例，复用）"
+        else
+            _log "infinity 已在 ${INFINITY_URL} 运行（外部实例，复用）"
+        fi
+        return 0
+    fi
+    command -v infinity_emb >/dev/null 2>&1 \
+        || _die "http 后端需要 infinity_emb：pip install infinity-emb（GPU 机器上装 CUDA 版 torch），或先把两模型手动起在 ${INFINITY_PORT}（--url-prefix /v1）"
+    local _emb="${RAG_EMBED_MODEL_PATH:-./models/bge-m3}" _rer="${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-v2-m3}"
+    _emb="${ROOT}/${_emb#./}"; _rer="${ROOT}/${_rer#./}"
+    [ -d "${_emb}" ] || _die "缺少嵌入模型目录: ${_emb}（先 ./start.sh fetch-models）"
+    [ -d "${_rer}" ] || _die "缺少重排模型目录: ${_rer}（先 ./start.sh fetch-models）"
+    local _dev="${RAG_INFINITY_DEVICE:-auto}" _batch="${RAG_INFINITY_BATCH:-32}"
+    _log "启动 infinity：device=${_dev}（cuda/mps 可用即 GPU，无则 CPU）、batch=${_batch}、两组模型同实例"
+    nohup infinity_emb v2 \
+        --host 127.0.0.1 --port "${INFINITY_PORT}" --url-prefix /v1 \
+        --engine torch --device "${_dev}" \
+        --batch-size "${_batch}" \
+        --model-id "${_emb}" --served-model-name "${RAG_EMBED_MODEL_NAME:-bge-m3}" \
+        --model-id "${_rer}" --served-model-name "${RAG_RERANK_MODEL_NAME:-bge-reranker-v2-m3}" \
+        >"${INFINITY_LOG}" 2>&1 &
+    printf '%s' "$!" >"${INFINITY_PID}"
+    local _i _ready=0 _wait="${RAG_INFINITY_WAIT:-300}"
+    for _i in $(seq 1 "${_wait}"); do
+        _infinity_ok && { _ready=1; break; }
+        if [ -f "${INFINITY_PID}" ] && ! _pid_alive "$(cat "${INFINITY_PID}" 2>/dev/null || true)"; then break; fi
+        sleep 1
+    done
+    if [ "${_ready}" = 0 ]; then
+        _log "infinity ${_wait}s 未就绪，最后 50 行日志："
+        tail -n 50 "${INFINITY_LOG}" 2>/dev/null || true
+        _die "infinity 启动失败（torch 冷加载可调 RAG_INFINITY_WAIT；健康端点 /health 或 /v1/health 任一命中即就绪）"
+    fi
+    _log "infinity 就绪：${INFINITY_URL}（日志 ${INFINITY_LOG}）"
+    _log "⚠️  首次启用请跑对拍后再收流：./start.sh embedpairs（本地 vs http，cos≥0.999 才准入）"
 }
 
 _start_qdrant() {
@@ -206,6 +262,7 @@ _stop_all() {
     _stop_pidfile "应用" "${APP_PID}"
     _stop_pidfile "Ollama" "${OLLAMA_PID}"
     _stop_pidfile "Qdrant" "${QDRANT_PID}"
+    _stop_pidfile "infinity" "${INFINITY_PID}"
 }
 
 _status_one() {
@@ -225,6 +282,11 @@ _status_one() {
 _status_all() {
     _status_one "Qdrant" "${QDRANT_URL}/healthz" "${QDRANT_PID}" "qdrant"
     _status_one "Ollama" "${OLLAMA_URL}/api/version" "${OLLAMA_PID}" "ollama serve"
+    case "${RAG_EMBED_BACKEND:-torch}/${RAG_RERANK_BACKEND:-torch}" in
+        *http*) _infinity_ok && printf '✅ %-8s 健康  %s\n' "infinity" "${INFINITY_URL}" ||
+                printf '❌ %-8s 未响应 %s（http 后端将不可用）\n' "infinity" "${INFINITY_URL}" ;;
+        *) printf '—  %-8s 不适用（torch 后端，进程内推理）\n' "infinity" ;;
+    esac
     _status_one "应用" "${APP_URL}/_stcore/health" "${APP_PID}" "chatbot.py"
 }
 
@@ -421,25 +483,33 @@ _fetch_models() {
     _log "模型下载完成: ${_dest}（组: ${_groups}）"
 }
 
-_usage() { sed -n '2,23p' "${ROOT}/start.sh"; }
+_usage() { sed -n '2,25p' "${ROOT}/start.sh"; }
 
 _load_dotenv
 _detect_hw
 case "${1:-start}" in
     fetch-models) shift; _fetch_models "$@" ;;
     start)
-        _check_backends
+        _ensure_infinity
         _start_qdrant
         _start_ollama
         _start_app
-        _log "全部就绪：应用 ${APP_URL} ／ Qdrant ${QDRANT_URL} ／ Ollama ${OLLAMA_URL}"
+        _svc="Qdrant ${QDRANT_URL} ／ Ollama ${OLLAMA_URL}"
+        case "${RAG_EMBED_BACKEND:-torch}/${RAG_RERANK_BACKEND:-torch}" in
+            *http*) _svc="infinity ${INFINITY_URL} ／ ${_svc}" ;;
+        esac
+        _log "全部就绪：应用 ${APP_URL} ／ ${_svc}"
         ;;
     stop)    _stop_all ;;
     restart) _stop_all; "${ROOT}/start.sh" start ;;
     status)  _status_all ;;
-    logs)    tail -F "${QDRANT_LOG}" "${OLLAMA_LOG}" "${APP_LOG}" ;;
-    serve)   _check_backends; exec "${PY}" chatbot.py serve ;;
-    process|index|sparse|stages|lexicon|compare-chunks)
+    logs)
+        _tail_files=("${QDRANT_LOG}" "${OLLAMA_LOG}" "${APP_LOG}")
+        [ -f "${INFINITY_LOG}" ] && _tail_files+=("${INFINITY_LOG}")
+        tail -F "${_tail_files[@]}"
+        ;;
+    serve)   _ensure_infinity; exec "${PY}" chatbot.py serve ;;
+    process|index|sparse|stages|lexicon|embedpairs|compare-chunks|evaluate)
         _cmd="${1}"; shift
         exec "${PY}" chatbot.py "${_cmd}" "$@"
         ;;
