@@ -16,8 +16,7 @@ COPY chatbot.py /app/chatbot.py
 # http 后端两个 extras：[torch]=sentence-transformers+torch（base 已有 torch 2.7.1，
 # 不重装）、[server]=fastapi/uvicorn/pydantic 等 HTTP 面板。版本 = 本地实测组合 0.0.76。
 # psutil：内存熔断（RAG_MEM_GUARD=1）的唯一水位口径，base 也没有。
-RUN ["pip", "install", "--no-cache-dir", "-i", "https://mirrors.aliyun.com/pypi/simple/",
-     "infinity-emb[torch,server]==0.0.76", "psutil==7.0.0"]
+RUN ["pip", "install", "--no-cache-dir", "-i", "https://mirrors.aliyun.com/pypi/simple/", "infinity-emb[torch,server]==0.0.76", "psutil==7.0.0"]
 
 EXPOSE 7860
 ENTRYPOINT ["python","chatbot.py","all"]
