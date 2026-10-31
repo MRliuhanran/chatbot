@@ -5006,6 +5006,63 @@ def _wait_http_ready(name, url, timeout):
     return False
 
 
+def _wait_infinity_ready(port, embed_model, rerank_model, budget):
+    """cmd_all 后台线程的 infinity 就绪探测：两段式，返回 (ok, 已用秒, 归因)。
+
+    段一"端口/合约"：/health 与 /v1/health 双候选轮询（start.sh _infinity_ok 同款；0.0.76
+    实测 /v1/health 是 404、只有裸 /health 生效）。段二"真就绪"：POST /v1/embeddings 与
+    /v1/rerank 各真打一发——绑票本身已是 lifespan（装载+warmup）完成之后（2026-10-31 实证），
+    两侧都 200 算就绪并顺带预热首轮前向（用户第一问不背冷启动）；若某版本又改"先绑票后装",
+    老语义下两段式仍能拦住"端口在不可算"的半成品。双段共享 budget（RAG_INFINITY_WAIT 秒）；
+    请求级超时 = max(30, min(150, 剩余))，加载期服务端挂起不误杀（batch 8：终端 2vCPU 冷启动
+    预算远小于 .env 的 1200）。日志只打跃迁，轮询不留痕。
+    """
+    import requests
+    import time
+    base = f"http://127.0.0.1:{port}"
+    session = requests.Session()
+    session.trust_env = False   # 127.0.0.1 不吃任何系统代理
+    started = time.time()
+    announced = False
+    last_emb = last_rr = None
+
+    while True:
+        if time.time() >= started + budget:
+            return False, time.time() - started, f"预算耗尽（最后 embeddings={last_emb} rerank={last_rr}）"
+        up = None
+        for path in ("/v1/health", "/health"):
+            try:
+                if session.get(base + path, timeout=3).status_code == 200:
+                    up = path
+                    break
+            except requests.RequestException:
+                pass
+        if up is None:
+            time.sleep(1)
+            continue
+        if not announced:
+            announced = True
+            log(f"[all] infinity 端口已监听（{up} 200），embeddings/rerank 装载探测中…")
+
+        remaining = started + budget - time.time()
+
+        def _post(path, body, _to=max(30.0, min(150.0, remaining)), _base=base, _s=session):
+            try:
+                return _s.post(f"{_base}{path}", json=body, timeout=_to).status_code
+            except Exception as exc:
+                return f"{exc.__class__.__name__}"
+
+        last_emb = _post("/v1/embeddings", {"model": embed_model, "input": ["就绪探测"]})
+        if last_emb != 200:
+            time.sleep(2)
+            continue
+        last_rr = _post("/v1/rerank", {"model": rerank_model, "query": "就绪探测", "documents": ["片", "段"]})
+        if last_rr != 200:
+            time.sleep(2)
+            continue
+        return True, time.time() - started, f"embeddings({last_emb})+rerank({last_rr})"
+
+
 
 def _ollama_models_present(models_dir):
     """Ollama 模型目录是否至少有一个 manifest（避免容器起来后生成 404 才发现）。"""
@@ -5161,6 +5218,15 @@ def _ensure_runtime_models(env, app_root):
     base = _runtime_models_root()
     missing = [g for g in ("bge-m3", "bge-reranker-v2-m3", "gguf")
                if not _models_group_complete(env, base, g, app_root)]
+    # 组级锚点只看最大文件（pytorch_model.bin），看不见 ST 池化元文件——modules.json
+    # 要求的 1_Pooling/config.json 若缺，infinity 的 ST 引擎把模型路径当 HF repo id
+    # 去 snapshot_download → HFValidationError rc=3（2026-10-31 本地实证）。补判：
+    # 缺就把 bge-m3 组放进 missing 重拉一遍（fetch-models 逐文件按字节尺寸幂等跳过，
+    # 已完整的 2.1G 不会重下，实际只取这 191B 锚定镜面文件）。
+    if "bge-m3" not in missing \
+            and not os.path.exists(os.path.join(app_root, "models", "bge-m3", "1_Pooling", "config.json")):
+        missing.append("bge-m3")
+        log("📦 [模型装载] bge-m3 缺 1_Pooling/config.json（ST 池化元文件）→ fetch-models 补齐")
     # 老镜像时代（烤权重 + entrypoint symlink 落位）会在持久盘留下指向 /app/... 的
     # symlink —— 容器重建后全部悬空；fetch-models 在这种 link 上 mkdir 会失败导致
     # 启动死循环。缺组前先清掉 symlink 残留（真实目录不动，那个能直接复用）。
@@ -5235,7 +5301,7 @@ def _ensure_runtime_models(env, app_root):
     return True
 
 
-def _infinity_spec(root):
+def _infinity_spec(root, env=None):
     """容器 `cmd_all` 的 infinity 启动 spec：返回 (argv 或 None, 失败原因或 None)。
 
     http 后端（2026-10-30 起 .env=http/http）下 cmd_all 要托管的第 4 个进程：bge-m3 +
@@ -5243,37 +5309,42 @@ def _infinity_spec(root):
     逐字对齐 .env 的 RAG_*_MODEL_NAME（客户端按名调用）。与 start.sh 的
     _ensure_infinity **同构**（本地由它编排；容器里没有 shell，改由这里编排——
     这是 2026-10-30 反思发现的部署断点：旧三进程时代容器内 8001 无人监听，第一轮
-    检索必炸）。路径读 os.environ 而非 import 时常量：_ensure_runtime_models 的
-    "symlink 不可建 → 改写绝对路径"兜底发生在 import 之后，env 才是当前语义。
-    --device 默认 auto（容器无 GPU → cpu，与本地同语义）、端点双候选 /health 与
-    /v1/health（健康判定由调用方 _wait_http_ready 两连做）。
+    检索必炸）。
+    路径/名字/端口读调用方传进来的**子进程 env**（cmd_all 传 env；缺省 os.environ），
+    不读 import 时常量：_ensure_runtime_models 的落位改写发生在 import 之后，且只写
+    children env dict（不回写 os.environ）——读 os.environ 看不到改写后的值。
+    --model-id 用 env 值**原样**传（与 start.sh 同构；本地 .env 是 "./models/bge-m3"，
+    子进程 cwd=root ⇒ 解析为 /app/models/bge-m3；落位改写产物是绝对路径，同样合法）。
+    存在性校验用 abspath 对照 root，不受进程 cwd 影响。
+    --device 默认 auto（容器无 GPU → cpu，与本地同语义）。
     """
     import shutil
     if EMBED_BACKEND != "http" and RERANK_BACKEND != "http":
         return None, None
-    emb = (os.environ.get("RAG_EMBED_MODEL_PATH") or "").strip()
-    rer = (os.environ.get("RAG_RERANK_MODEL_PATH") or "").strip()
-    emb = os.path.abspath(os.path.join(root, emb)) if emb.startswith("./") else emb
-    rer = os.path.abspath(os.path.join(root, rer)) if rer.startswith("./") else rer
+    scope = env if env is not None else os.environ
+    emb = (scope.get("RAG_EMBED_MODEL_PATH") or "").strip()
+    rer = (scope.get("RAG_RERANK_MODEL_PATH") or "").strip()
     if not emb or not rer:
         return None, "http 后端需要 .env 配置 RAG_EMBED_MODEL_PATH / RAG_RERANK_MODEL_PATH"
     emb_bin = shutil.which("infinity_emb")
     if not emb_bin:
         return None, "http 后端需要 infinity_emb：镜像应用层 pip install infinity-emb[torch,server]（见 Dockerfile）"
-    if not os.path.isdir(emb):
-        return None, f"缺少嵌入模型目录: {emb}（fetch-models 兜底或检查镜像烤入层）"
-    if not os.path.isdir(rer):
-        return None, f"缺少重排模型目录: {rer}（fetch-models 兜底或检查镜像烤入层）"
-    port = (os.environ.get("RAG_INFINITY_PORT") or "8001").strip()
-    batch = (os.environ.get("RAG_INFINITY_BATCH") or "32").strip()
-    device = (os.environ.get("RAG_INFINITY_DEVICE") or "auto").strip()
+    emb_dir = os.path.abspath(os.path.join(root, emb))
+    rer_dir = os.path.abspath(os.path.join(root, rer))
+    if not os.path.isdir(emb_dir):
+        return None, f"缺少嵌入模型目录: {emb_dir}（fetch-models 兜底或检查镜像烤入层）"
+    if not os.path.isdir(rer_dir):
+        return None, f"缺少重排模型目录: {rer_dir}（fetch-models 兜底或检查镜像烤入层）"
+    port = (scope.get("RAG_INFINITY_PORT") or "8001").strip()
+    batch = (scope.get("RAG_INFINITY_BATCH") or "32").strip()
+    device = (scope.get("RAG_INFINITY_DEVICE") or "auto").strip()
     argv = [
         emb_bin, "v2",
         "--host", "127.0.0.1", "--port", port, "--url-prefix", "/v1",
         "--engine", "torch", "--device", device,
         "--batch-size", batch,
-        "--model-id", emb, "--served-model-name", os.environ.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME,
-        "--model-id", rer, "--served-model-name", os.environ.get("RAG_RERANK_MODEL_NAME") or RERANK_MODEL_NAME,
+        "--model-id", emb, "--served-model-name", scope.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME,
+        "--model-id", rer, "--served-model-name", scope.get("RAG_RERANK_MODEL_NAME") or RERANK_MODEL_NAME,
     ]
     return argv, None
 
@@ -5286,8 +5357,12 @@ def cmd_all(args=None):
     功能/配置/模型与本地同源：都读同一份 .env；检索/生成权重已随镜像烤入
     （fetchmodels stage），启动期 _ensure_runtime_models 校验+落位，缺了才兜底下载。
     http 后端（2026-10-30 起 .env=http/http）下 infinity 由这里编排：镜像应用层
-    pip 装 infinity-emb[torch,server]==0.0.76（base 重层没有它），健康端点 /health
-    与 /v1/health 双候选，未就绪退出容器交平台重启。
+    pip 装 infinity-emb[torch,server]==0.0.76（base 重层没带；bge-m3 还共用 base 烤入
+    层，需 1_Pooling 池化元文件，由 Dockerfile 应用层补 COPY——2026-10-31 实证缺
+    该文件时 ST 引擎把路径当 HF repo id，rc=3 启动即崩）。app 在依赖就绪后立即
+    放量（平台健康探测打 7860，不能押在冷加载后）；infinity 就绪由后台线程两段式
+    探测（/health→embeddings+rerank 真打一发，≤RAG_INFINITY_WAIT），未就绪
+    fail-closed 退出容器交平台重启。
     """
     import signal
     import subprocess
@@ -5380,30 +5455,52 @@ def cmd_all(args=None):
         log("❌ [all] Ollama 模型不可用，容器退出")
         return 1
 
-    if "infinity" in specs:
-        # 双候选健康端点（start.sh _infinity_ok 同款）：0.0.76 的 unas 端点其一在
-        # --url-prefix /v1 下为 /v1/health、另一裸 /health；两轮各等一半上限，合计 ≤
-        # RAG_INFINITY_WAIT（默认 300s）。未就绪退出容器交平台重启——同其他依赖的
-        # fail-closed 语义（Infinity 没 ready 就放行 app，第一轮检索必炸）。
-        _inf = specs["infinity"]
-        inf_port = _inf[_inf.index("--port") + 1]
-        inf_url = f"http://127.0.0.1:{inf_port}"
-        inf_wait = (os.environ.get("RAG_INFINITY_WAIT") or "300").strip()
-        _inf_half = max(60, (int(inf_wait) if inf_wait.isdigit() else 300) // 2)
-        ready = _wait_http_ready("infinity", f"{inf_url}/health", _inf_half)
-        if not ready:
-            ready = _wait_http_ready("infinity", f"{inf_url}/v1/health", _inf_half)
-        if not ready:
-            for process in children.values():
-                process.terminate()
-            log("❌ [all] infinity 未就绪（torch 冷加载可调 RAG_INFINITY_WAIT），容器退出（交由平台重启）")
-            return 1
-
     try:
+        # ⚠️ 平台部署健康探测直接打 7860：app 必须尽早监听，不能押在 infinity 就绪
+        # 之后——旧阻塞版把 7860 首听拖到 torch 双模型冷加载完成（2vCPU 数分钟），
+        # 恰好撞进部署探测窗口（23:53 场 DeployFailed、运行日志 0 行的头号嫌疑）。
+        # 改法：qdrant/ollama 就绪 → 立即放量 app（探测窗口内 7860 在线）；infinity
+        # 的就绪确认挪到后台线程（fail-loud：判定检索侧不可用就自尽容器交平台重启，
+        # 日志留 ❌ [all] 行让它被验收抓到）。
         spawn("app")
     except OSError as exc:
         log(f"❌ [all] 应用启动失败: {type(exc).__name__}: {exc}")
         return 1
+
+    if "infinity" in specs:
+        import threading
+        _inf = specs["infinity"]
+        _inf_port = _inf[_inf.index("--port") + 1]
+        _inf_wait = (env.get("RAG_INFINITY_WAIT") or "900").strip()
+        try:
+            _inf_budget = float(_inf_wait)
+        except ValueError:
+            _inf_budget = 300.0
+        _embed_name = env.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME
+        _rerank_name = env.get("RAG_RERANK_MODEL_NAME") or RERANK_MODEL_NAME
+
+        def _watch_infinity():
+            ok, elapsed, detail = _wait_infinity_ready(_inf_port, _embed_name, _rerank_name, _inf_budget)
+            if ok:
+                log(f"[all] infinity 就绪: embeddings/rerank 探测通过（冷加载 {elapsed:.0f}s）")
+                return
+            # fail-loud：检索服务判定不可用就退役整个容器（app 可能已通过平台探测，
+            # 靠日志 ❌ 行说话）；平台重启容器重试——错误能在两次重启间被看到。
+            log(f"❌ [all] infinity 未就绪（{elapsed:.0f}s，{detail}；冷加载可调 RAG_INFINITY_WAIT），"
+                f"容器退出（交由平台重启）")
+            for process in list(children.values()):
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            for process in list(children.values()):
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+            os._exit(1)
+
+        threading.Thread(target=_watch_infinity, name="infinity-watch", daemon=True).start()
 
     restarts: dict = {}
     while not stopping["value"]:

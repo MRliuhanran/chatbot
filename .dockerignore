@@ -16,7 +16,16 @@ artifacts/embeddings/
 artifacts/docs/
 artifacts/opencode-sessions/
 artifacts/turns.jsonl
-models/
+# models/：base 层已烤入双模型权重，上下文只放 bge-m3 的 1_Pooling 池化元文件
+# （191B delta，Dockerfile 应用层 COPY；缺则 infinity ST 引擎 rc=3，2026-10-31 实证）。
+# 梯子同 .gitignore：models/* 不跨 /，重开 !models/bge-m3 后须再排除孙层，否则
+# pytorch_model.bin 等知名文件涌入上下文。
+models/*
+!models/bge-m3
+models/bge-m3/*
+!models/bge-m3/1_Pooling
+models/bge-m3/1_Pooling/*
+!models/bge-m3/1_Pooling/config.json
 artifacts/chunks.json
 .ruff_cache/
 .pytest_cache/

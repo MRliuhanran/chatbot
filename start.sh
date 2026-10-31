@@ -347,6 +347,10 @@ _fetch_models() {
         "bge-m3/config.json|${_bge}/config.json|687"
         "bge-m3/config_sentence_transformers.json|${_bge}/config_sentence_transformers.json|123"
         "bge-m3/modules.json|${_bge}/modules.json|349"
+        # ST 池化元文件：modules.json 的 "1_Pooling" 路径指向它。缺了 infinity 的
+        # ST 引擎会把模型路径当 HF repo id 去 snapshot_download → HFValidationError
+        # rc=3（2026-10-31 本地实证；镜像 base 层也曾缺此文件）。
+        "bge-m3/1_Pooling/config.json|${_bge}/1_Pooling/config.json|191"
         "bge-m3/pytorch_model.bin|${_bge}/pytorch_model.bin|2271145830"
         "bge-m3/sentence_bert_config.json|${_bge}/sentence_bert_config.json|54"
         "bge-m3/sentencepiece.bpe.model|${_bge}/sentencepiece.bpe.model|5069051"

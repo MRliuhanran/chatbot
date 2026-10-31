@@ -5,7 +5,17 @@ venv/
 .python3.10/
 
 # ---- 模型（体积大，从 HuggingFace 重新下载）----
-models/
+# 权重不入库；但 models/bge-m3/1_Pooling/config.json 是 sentence-transformers 装载
+# 元文件（191B，modules.json 指向它）——infinity 的 ST 引擎启动必需，必须进 git 才能进
+# 魔搭构建上下文（2026-10-31 实证）。gitignore 语义：父目录被排除后子文件不能重开，
+# 需逐级"重开再排除"；且 models/* 的 * 不跨 /，重开 !models/bge-m3 后孙子层全部裸奔
+# （实证 12 个文件含 pytorch_model.bin 解除忽略）——故每级都要补再排除行。
+models/*
+!models/bge-m3
+models/bge-m3/*
+!models/bge-m3/1_Pooling
+models/bge-m3/1_Pooling/*
+!models/bge-m3/1_Pooling/config.json
 
 # ---- 索引产物与运行时缓存（可重建：process + index）----
 # 入仓的是少数固定产物（artifacts/chunks.json、chunks.meta.json、gen_tokenizer/），其余

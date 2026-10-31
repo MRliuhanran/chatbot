@@ -133,13 +133,14 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 ## 7. ModelScope 部署：一个 Dockerfile
 
-本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三进程由 `chatbot.py all` 管理（源码里的进程管理器）；**http 后端多托一个 infinity 作为第 4 进程**（2026-10-30 起 `.env=http/http`：应用层 pip 补装 `infinity-emb[torch,server]==0.0.76` + `psutil`，`cmd_all` 按 start.sh 同构 argv 编排并等其健康，未就绪退出容器交平台重启）。不依赖 compose。
+本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三进程由 `chatbot.py all` 管理（源码里的进程管理器）；**http 后端多托一个 infinity 作为第 4 进程**（2026-10-30 起 `.env=http/http`：应用层 pip 补装 `infinity-emb[torch,server]==0.0.76` + `psutil`，并 COPY 补齐 bge-m3 缺失的 `1_Pooling/config.json` 池化元文件——缺它 infinity 的 ST 引擎启动即崩 rc=3）。`cmd_all` 按 start.sh 同构 argv 编排：app 依赖就绪后立即放量（平台健康探测打 7860），infinity 就绪由后台线程两段式探测（health → embeddings+rerank 真打一发 ≤ `RAG_INFINITY_WAIT`），未就绪 fail-closed 退出交平台重启。不依赖 compose。
 
 ### 7.1 Dockerfile 约束
 
 - 所有 `RUN` 都是 **exec form**：`RUN ["pip","install",...]`，不经过 `/bin/sh -c`；
 - 唯一入口：`ENTRYPOINT ["python","chatbot.py","all"]`（start.sh 只作为运行期模型下载器进镜像）；
 - qdrant / ollama 二进制直接从官方镜像 COPY，不在 Dockerfile 里下载/解压；
+- 应用层只做小 delta：COPY 三配置文件 + 补 COPY `models/bge-m3/1_Pooling/config.json`（191B 池化元文件，`.dockerignore` 白名单放行）+ RUN exec-form pip 装 infinity-emb/psutil 小包；torch 等重件留在 base；
 - `HEALTHCHECK` 也是 exec form（`python -c ...`）。
 
 > pip 等包管理器内部仍会执行自己的脚本，但 Dockerfile 本身没有 shell 形式的命令行。

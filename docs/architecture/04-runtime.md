@@ -139,7 +139,7 @@ flowchart TD
 flowchart TD
     E["ENTRYPOINT python chatbot.py all"] --> I["import 期副作用：load_dotenv → NO_PROXY → 日志 → 配置校验 (L32-L607)"]
     I --> J["cmd_all：root=脚本目录；env=os.environ.copy()<br/>port=RAG_HTTP_PORT 默认 7860 (L4578-L4580)"]
-    J --> J2["cmd_all：_infinity_spec(root)<br/>+ _ensure_runtime_models 落位<br/>port=RAG_HTTP_PORT 默认 7860"]
+    J --> J2["cmd_all：_infinity_spec(root, env)<br/>+ _ensure_runtime_models 落位<br/>port=RAG_HTTP_PORT 默认 7860"]
     J2 --> J3{"EMBED/RERANK 后端含 http?<br/>（2026-10-30 起 .env=http/http）"}
     J3 -->|"否（torch 后端）"| K
     J3 -->|"是，spec 构不出 argv"| Z1["❌ [all] 容器退出（平台重启）"]
@@ -153,9 +153,10 @@ flowchart TD
     N -->|"任一失败"| Z2["terminate 全部子进程 → 返回 1 (L4628-L4632)"]
     N --> O["_ensure_ollama_model：无 manifest 但有 GGUF<br/>→ 写 Modelfile.chatbot → ollama create (L4634, L4531-L4565)"]
     O -->|"失败"| Z3["terminate 全部 → 返回 1 (L4636-L4638)"]
-    O --> INFQ{"http 后端：infinity /health 与 /v1/health<br/>各等 RAG_INFINITY_WAIT/2（torch 跳过），就绪?"}
-    INFQ -->|"否"| Z2
-    INFQ -->|"是"| P["spawn app：streamlit run chatbot.py --server.address 0.0.0.0 --server.port 7860 (L4596-L4600, L4641)"]
+    O --> P["spawn app：streamlit run chatbot.py --server.address 0.0.0.0 --server.port 7860<br/>（app 尽早放量——平台健康探测打 7860，不能押在 infinity 冷加载之后）"]
+    P --> MON{"http 后端：后台线程 _wait_infinity_ready<br/>/v1/health 与 /health 双候选 → /v1/embeddings+/v1/rerank 真打一发<br/>≤ RAG_INFINITY_WAIT（torch 后端跳过）"}
+    MON -->|"两侧 200"| Z4["[all] infinity 就绪 行落运行日志（顺带预热）"]
+    MON -->|"预算耗尽"| Z5["❌ [all] infinity 未就绪 → terminate 全部 → 容器退出<br/>（fail-loud 交平台重启，验收脚本把这个行算 FAIL）"]
     P --> Q{"每 2s poll 子进程 (L4647-L4662)"}
     Q -->|"某子进程退出"| R["指数退避 min(30, 2^min(n,5)) 后就地重启该进程 (L4650-L4658)"]
     R --> Q
@@ -168,6 +169,8 @@ flowchart TD
 - `signal` 只置 `stopping` 标志（L4613–L4617），真正的 terminate 在主循环退出后统一执行（L4664–L4672），避免信号处理器里做重活。
 - 重启退避：`min(30, 2 ** min(attempt, 5))` → 2,4,8,16,30,30…（L4651–L4653）；`restarts` 计数**永不重置**（L4646–L4652），长跑后崩溃固定 30s 退避。
 - Qdrant/Ollama 起不来或模型创建失败 → **容器直接退出**（交平台重启），不启动"半残应用"（L4628–L4638、`README.md:L166`）。
+- app 先于 infinity 就绪放量（2026-10-31 起两段式）：阻塞旧版把 7860 首听拖到 torch 双模型冷加载之后，撞平台部署健康探测窗口（23:53 场 DeployFailed、运行日志 0 行的头号嫌疑）。现在 app 在 qdrant/ollama 就绪后立即 spawn，infinity 的就绪由守护线程 `_wait_infinity_ready` 确认——/health 双候选（0.0.76 实测 /v1/health 404、只有裸 /health）→ `/v1/embeddings`+`/v1/rerank` **真打一发**，双 200 才落 `[all] infinity 就绪` 行，跑满 `RAG_INFINITY_WAIT` 未过就 ❌ + 自尽容器。warmup calibration 批成本实证：`--batch-size 32` 一批 32×513 token 44s、Mac 全链 8 min 未绑票；batch 8 全链 69s 就绪、RSS 峰 2.17GB（.env 已定 batch 8 / wait 1200）。
+- `_infinity_spec(root, env)` 的路径/名字/参数读**调用方传入的子进程 env**（落位改写只写 children env dict，读 os.environ 看不到）；`--model-id` 用 env 值原样传（与 start.sh `_ensure_infinity` 同构；子进程 cwd=root）。
 - `cmd_all` 不调用 `_qdrant_gate`（对比 `cmd_serve`）——空知识库在容器里不会 fail-fast，改由 UI 的计数检查兜底（见 §8 与 §11 张力 8）。
 - Qdrant 配置文件里写的 `storage_path: /qdrant/storage`（`qdrant_config/config.yaml:L6-L7`）会被 `all` 的 `setdefault` 覆盖成 `/app/storage`（L4583-L4584）；显式环境变量仍然优先。
 - Streamlit 的项目级配置在 `.streamlit/config.toml`（`address=127.0.0.1`、`port=8501`、`headless=true`、`corsAllowedOrigins` 两个创空间域名、`toolbarMode=minimal`、`showErrorDetails=none`、`gatherUsageStats=false`，L1–L25）；`all` 用 CLI 参数把地址/端口改成 `0.0.0.0:7860`（L4596-L4599），CLI 优先级高于该文件。
@@ -430,6 +433,8 @@ flowchart TD
 | `PYTORCH_MPS_HIGH/LOW_WATERMARK_RATIO` | 未设 → `1.0/0.9` | 防 MPS 换页拖死整机（L132–L142） |
 | `RAG_CONTEXT_LABELS/TAGS` | `True/True` → `0/0` | 但 `RAG_CONTEXT_META=1` 接管，故不参与（L111–L121） |
 | `RAG_EMBED_BACKEND/RERANK_BACKEND` | 都是 `http`（2026-10-30 起，同一 infinity 双模型；旧值 torch/进程内） | start.sh `_ensure_infinity` 编排 |
+| `RAG_INFINITY_BATCH` | 未设（代码缺省 32）→ `8`（2026-10-31） | warmup calibration 批成本实证：32×513 tk 一批 44s、Mac 全链 8 min 不绑票；8 全链 69s 就绪、RSS 峰 2.17GB（检索请求 1-20 条，服务面无差） |
+| `RAG_INFINITY_WAIT` | 未设（代码缺省 900/300）→ `1200` | 容器 2vCPU 冷启动预算；监听后 embeddings/rerank 真打一发再放行 |
 
 ### 3.6 配置系统的取舍
 
