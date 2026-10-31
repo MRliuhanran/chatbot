@@ -1,0 +1,11 @@
+{
+  "manifest_version": 1,
+  "chunk_fingerprint": "3502968fe6f7039e",
+  "lexicon_fingerprint": "d491515c19757aac",
+  "collection": "rag_documents_v1__301a4bf4",
+  "build_id": "301a4bf4dbc24d979be1c691a45dfef4",
+  "points": 21255,
+  "embed_model_content": "7a66ee5161b0",
+  "qdrant_server": "1.19.1",
+  "built_at": "2026-10-31T18:45:17"
+}

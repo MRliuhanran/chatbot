@@ -1,6 +1,6 @@
 {
   "meta_version": 1,
-  "fingerprint": "923236fe7e4acc7c",
+  "fingerprint": "3502968fe6f7039e",
   "chunking_config": {
     "child_max_tokens": 128,
     "parent_max_tokens": 512,
@@ -10,7 +10,7 @@
     "text_opencc": "t2s",
     "ftfy_fix": "{\"fix_character_width\": false, \"fix_encoding\": true, \"fix_latin_ligatures\": false, \"fix_line_breaks\": false, \"fix_surrogates\": false, \"remove_control_chars\": false, \"remove_terminal_escapes\": false, \"uncurl_quotes\": false, \"unescape_html\": false}",
     "embed_model": "./models/bge-m3",
-    "embed_model_content": "23d8f4c1c39f",
+    "embed_model_content": "7a66ee5161b0",
     "splitter": "0.33.0",
     "chunking_code": "888afa9b7f3ff2c8"
   },
@@ -1016,5 +1016,5 @@
   "total_chunks": 21255,
   "total_parents": 4852,
   "reused_documents": 0,
-  "build_time": "2026-10-23T20:15:50"
+  "build_time": "2026-10-31T18:44:55"
 }
