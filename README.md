@@ -148,6 +148,7 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 - qdrant / ollama 二进制直接从官方镜像 COPY，不在 Dockerfile 里下载/解压；
 - 层顺序固定：**base → pip RUN → 应用文件（.env/start.sh/chatbot.py/池化元文件）→ 可变数据层 → verify-build**。应用文件与数据 COPY 都在 pip RUN 之后：改代码/改数据都不会重跑 16min 级依赖层，日常发布只重打后三层；torch 重件留在 base；
 - 数据层先 `RUN ["rm","-rf","/app/storage","/app/corpus","/app/lexicon"]` 再 COPY：`COPY 目录` 是 merge 语义，不删会留下 base 旧 segment / 已删语料，容器内现算指纹与清单永远对不上；
+- COPY `storage` 后必须**补空 `wal/` 目录**：git 不跟踪空目录、`.dockerignore` 又排除 wal 大文件（closed-*/open-*），缺目录时 Qdrant 1.19.1 启动直接 panic rc=101（`Can't init WAL: NotFound ... /wal`，2026-10-31 远程 DeployFailed 真因，已用官方 qdrant 容器同 storage 复现）；WAL 内容不必进镜像，正常 stop 已 flush 到 segment；`verify-build` 会复核每个 shard 的 `wal/` 存在；
 - 构建最后一步 `RUN ["python","chatbot.py","verify-build"]`：清单指纹 ≠ 现算指纹直接构建失败（fail-fast，不把问题留到运行期闸门）；
 - `HEALTHCHECK` 也是 exec form（`python -c ...`）。
 

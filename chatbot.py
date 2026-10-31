@@ -7179,6 +7179,23 @@ def cmd_verify_build(args=None):
                 f"集合目录不存在: {coll_dir} —— storage/ 没随镜像带上（或 .dockerignore/commit 漏掉），"
                 f"运行期 Qdrant 找不到清单记录的集合 {coll}"
             )
+        # WAL 目录：git 不跟踪空目录 + .dockerignore 排除了 wal 大文件 → 镜像里可能没有
+        # wal/。Qdrant 1.19.1 在 "Can't init WAL: NotFound ... /wal" 时直接 panic 退出
+        # rc=101（2026-10-31 用 qdrant/qdrant:v1.19.1 容器 + 同一份 storage 精确复现：
+        # 远程 DeployFailed 的真因，错过一次按"载入慢"误判）。空目录即可，WAL 内容不进镜像。
+        shard_dirs = [
+            p for p in glob.glob(os.path.join(_qdrant_storage_root(), "collections", "*", "*"))
+            if os.path.isdir(p)
+        ]
+        wal_missing = [p for p in shard_dirs if not os.path.isdir(os.path.join(p, "wal"))]
+        if wal_missing:
+            _bad(
+                f"{len(wal_missing)} 个 collection shard 缺 wal/ 空目录（Qdrant 启动会 panic rc=101）："
+                f"{[os.path.basename(p) for p in wal_missing[:3]]} —— 构建层必须补 mkdir（Dockerfile 已含）"
+            )
+        else:
+            log(f"  ✅ WAL 目录: {len(shard_dirs)} 个 shard 均已有 wal/（空目录即可，WAL 内容不必进镜像）")
+
         # 别名映射（只告警不判死）：运行期 resolve_collection_name 优先读别名，但别名文件
         # 格式随 Qdrant 版本变化，这里把它当"能读到才核对"的辅助判据，别让辅助判据变成
         # 构建假失败的来源。

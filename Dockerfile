@@ -53,6 +53,12 @@ COPY models/bge-m3/1_Pooling/config.json /app/models/bge-m3/1_Pooling/config.jso
 # 于是容器内现算的语料/分块指纹与 manifest 永远对不上——正是 923/350 事故的形态。
 RUN ["rm", "-rf", "/app/storage", "/app/corpus", "/app/lexicon"]
 COPY storage /app/storage
+# 补空 wal/ 目录：**Qdrant 1.19.1 启动必需**。git 不跟踪空目录，且 .dockerignore 排除了
+# wal 大文件（closed-*/open-*）→ 不补的话镜像里的 collection shard 没有 wal/ 目录，Qdrant
+# 启动直接 panic 退出 rc=101："Can't init WAL: NotFound ... /wal"（2026-10-31 远程
+# DeployFailed 真因；已用 qdrant/qdrant:v1.19.1 容器 + 同一份 storage 精确复现，空目录即可，
+# WAL 内容不需要进镜像 —— 正常 stop 时已 flush 到 segment）。verify-build 会复核这些目录。
+RUN ["python", "-c", "import glob,os; [os.makedirs(p+'/wal', exist_ok=True) for p in glob.glob('/app/storage/collections/*/*') if os.path.isdir(p)]"]
 COPY corpus /app/corpus
 COPY lexicon /app/lexicon
 COPY qdrant_config /app/qdrant_config
