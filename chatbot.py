@@ -5359,7 +5359,11 @@ def cmd_all(args=None):
     http 后端（2026-10-30 起 .env=http/http）下 infinity 由这里编排：镜像应用层
     pip 装 infinity-emb[torch,server]==0.0.76（base 重层没带；bge-m3 还共用 base 烤入
     层，需 1_Pooling 池化元文件，由 Dockerfile 应用层补 COPY——2026-10-31 实证缺
-    该文件时 ST 引擎把路径当 HF repo id，rc=3 启动即崩）。app 在依赖就绪后立即
+    该文件时 ST 引擎把路径当 HF repo id，rc=3 启动即崩）。cage 终验又钉出第三暴雷：
+    EngineArgs.bettertransformer 默认 True，acceleration.py:46 解引用 OptimumCompat
+    BetterTransformerManager——该符号属 optimum 可选 extra（不在 [torch,server]），
+    容器缺 optimum → NameError rc=3 启动即崩 + 30s 循环，Dockerfile 补 optimum==1.22.0
+    治本。app 在依赖就绪后立即
     放量（平台健康探测打 7860，不能押在冷加载后）；infinity 就绪由后台线程两段式
     探测（/health→embeddings+rerank 真打一发，≤RAG_INFINITY_WAIT），未就绪
     fail-closed 退出容器交平台重启。

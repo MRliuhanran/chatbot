@@ -62,10 +62,10 @@ import json,sys
 d=json.load(sys.stdin).get("data") or {}
 print(d.get("status") or "?")' 2>/dev/null || echo "?"; }
 
-_run_logs() {  # 运行日志按行摊平输出（接口把超长行压成一条需 split）
+_run_logs() {  # 运行日志按行摊平输出（接口把超长行压成一条需 split；data/Data 双形状兜底同 _buildlog_lastts）
   _api "${API}/logs/run?page=1&page_size=800" | python3 -c '
 import json,sys
-d=json.load(sys.stdin); rows=d.get("Data") or []
+d=json.load(sys.stdin); rows=((d.get("data") or {}).get("logs")) or (d.get("Data") or [])
 for r in rows:
     for line in str(r).splitlines(): print(line)' 2>/dev/null
 }
