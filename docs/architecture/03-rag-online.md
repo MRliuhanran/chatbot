@@ -334,7 +334,7 @@ asyncio：每轮只有 2-3 个长延迟 IO（嵌入 http + 双路 recall），�
    kept ≤ 20 → **不截断，全体 kept 进重排**（2026-10-30 两度拍板"不用截断"，机制整体删除）
         │ 重排全体 kept（RERANK_ON=child → contextual_text）
         ▼
-   rr_k = min(top_k=5, kept) = 5 → 返回 ≤ 5 条父块
+   rr_k = min(top_k=10, kept) → 按重排分数取前 10 条父块（kept<10 时按实返回）
 ```
 
 **为什么融合上限 = RECALL_LIMIT × n_channels**：上限只做一件事——把"本轮召回的命中"整体
@@ -664,7 +664,7 @@ stream_chat 的 finally → r.close()
 | presence / frequency / repeat | 0.0 / 0.0 / 1.1 | .env:L231-L233 |
 | repeat_last_n | 128 | .env:L236 |
 | seed | -1 | .env:L238 |
-| RAG_TOP_K | 未设 → 5 | 默认 L847 |
+| RAG_TOP_K | 未设 → 10（.env 显式 10） | 默认 L847 |
 | RAG_RERANK_TOP_K | 20（键已从 .env 移除） | 候选池上限退场后仅作 RECALL_LIMIT 缺省跟随源 |
 | RAG_RECALL_LIMIT | 10（显式；payload 全字段随召回） | .env |
 | RRF k / 权重 | 60 / 1.0、1.0 | 默认 L1089-L1091 |

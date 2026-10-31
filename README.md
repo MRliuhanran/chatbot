@@ -92,7 +92,7 @@ open http://127.0.0.1:8501
 | `RAG_DATA_DIR` / `RAG_DOC_GLOB` | 语料目录与匹配模式（默认 `corpus/*.txt`） |
 | `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND` | `http`（现行：同一 infinity 实例双模型，GPU=auto）/ `torch`（进程内降档） |
 | `RAG_EMBED_MODEL_PATH` / `RAG_RERANK_MODEL_PATH` | 本地检索模型目录 |
-| `RAG_TOP_K` / `RAG_RECALL_LIMIT` | 返回条数 / 每通道召回深度（重排候选不截断） |
+| `RAG_TOP_K` / `RAG_RECALL_LIMIT` | 最终返回条数（默认 10：融合→去重→全体重排后按分数取前 10）/ 每通道召回深度（默认 10，重排候选不截断） |
 | `RAG_LOGIN_ENABLED` / `RAG_LOGIN_IDLE_TTL_S` | 登录门开关（本地手机号模式，无第三方 IdP）/ 闲置过期秒数（默认 3600，每次使用顺延） |
 | `RAG_MEM_GUARD` / `RAG_MEM_KILL_PCT` | 内存熔断开关 / 触发水位（默认 95%：触线中止本轮，等同"停止生成"） |
 | `RAG_QDRANT_WAIT` | 容器启动期等 Qdrant `/healthz` 的预算秒数（默认 300；新数据层首启 + 2vCPU 冷载入实测超过旧 120s） |

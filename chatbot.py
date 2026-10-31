@@ -932,7 +932,7 @@ if SOURCE_FIELD in _RESERVED_SOURCE_FIELDS:
         f"RAG_SOURCE_FIELD={SOURCE_FIELD!r} 与内部字段冲突，"
         f"不能使用 {sorted(_RESERVED_SOURCE_FIELDS)}"
     )
-TOP_K = env_int_min("RAG_TOP_K", 5, 1)
+TOP_K = env_int_min("RAG_TOP_K", 10, 1)
 RERANK_TOP_K = env_int_min("RAG_RERANK_TOP_K", 20, 1)
 # 2026-10-30 起（用户两度拍板"不用截断"）：**候选池截断/预算收缩机制整体退场**——重排吃下
 # 全体"父块去重后"候选（上界 = RECALL_LIMIT × 通道数），不存在静默或显式的收口。理由落在
