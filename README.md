@@ -235,7 +235,7 @@ bash tools/ms_release.sh --skip-preflight # 应急：跳过 preflight 全部闸�
 
 1. 必须见到启动期 `🔧 分块指纹: 索引=… / 当前=…`（`cmd_all` 启动即打）；**到点未见 = FAIL**（不再按“未见=ABSENT”放行），两侧必须相等且索引侧 = `EXPECTED_FP`；
 2. `📦 [模型装载]` / `[模型落位]` 行；
-3. 无 `RuntimeError`、无 `❌ [all]`（启动编排失败）；infinity 就绪行尽力检查；启动期 `🧮 词表指纹` 行仅记录不阻断。
+3. 无 `RuntimeError`、无 `❌ [all]`（启动编排失败）；infinity 就绪行尽力检查；启动期 `🧮 词表指纹` 行**两侧相等则 PASS、不等则 FAIL**（未见行不阻断——平台日志行会被 ~2KB 截断/丢行，故 `_run_logs` 用 `page_size=100` 取证，稀疏侧另有检索期闸门兜底）。
 
 构建超时默认自动重触发一次；`storage` 运行时 churn 不挡发布。
 

@@ -94,7 +94,10 @@ d=json.load(sys.stdin).get("data") or {}
 print(d.get("status") or "?")' 2>/dev/null || echo "?"; }
 
 _run_logs() {  # 运行日志按行摊平输出（接口把超长行压成一条需 split；data/Data 双形状兜底同 _buildlog_lastts）
-  _api "${API}/logs/run?page=1&page_size=800" | python3 -c '
+  # page_size=100 而非 800：平台对每条日志行做 ~2KB 截断，page_size 越大每行被切得越碎、
+  # 甚至丢行（2026-10-31 实证：同一时刻 800 只还原 161 行文本、100 还原 210 行，且
+  # "🧮 词表指纹"行在 800 下消失 —— 启动期自检明明已打）。验收只关心最近窗口，用小页。
+  _api "${API}/logs/run?page=1&page_size=100" | python3 -c '
 import json,sys
 d=json.load(sys.stdin); rows=((d.get("data") or {}).get("logs")) or (d.get("Data") or [])
 for r in rows:
@@ -375,12 +378,29 @@ case "${_fp_verdict}" in
     say "  ❌ 分块指纹判定异常：${_fp_verdict}"; FAIL=1 ;;
 esac
 
-# 词表指纹启动行：只记录不阻断（稀疏侧一致性仍由检索期词表闸门长期兜底）
-if printf '%s\n' "${LOGS}" | grep -q '🧮 词表指纹'; then
-  say "  ℹ️ 启动期词表指纹：$(printf '%s\n' "${LOGS}" | grep -m1 '🧮 词表指纹' | sed 's/^ *//')"
-else
-  say "  （未见启动期 🧮 词表指纹行，仅记录不阻断）"
-fi
+# 词表指纹启动行：两边相等 → PASS；不等 → FAIL（稀疏通道已错配，召回会静默下降）。
+# 未见行不阻断：平台日志行会被 ~2KB 截断/丢行（page_size=100 已尽量补全），且稀疏侧
+# 一致性仍由检索期词表闸门长期兜底；「分块指纹行」才是必见判据。
+_lex_verdict="$(printf '%s\n' "${LOGS}" | "${PY_BIN}" -c '
+import re,sys
+pat=re.compile(r"词表指纹: *索引=([0-9a-fA-F]+) */ *当前=([0-9a-fA-F]+)")
+pairs=[]
+for line in sys.stdin.read().splitlines():
+    m=pat.search(line)
+    if m: pairs.append((m.group(1).lower(), m.group(2).lower()))
+if not pairs:
+    print("ABSENT|"); raise SystemExit(0)
+bad=[p for p in pairs if p[0] != p[1]]
+print(("FAIL|" if bad else "PASS|") + " ".join(i+"/"+c for i,c in pairs))')"
+case "${_lex_verdict}" in
+  PASS*)
+    say "  ✅ 词表指纹两侧一致（${_lex_verdict#*|}）" ;;
+  FAIL*)
+    say "  ❌ 词表指纹不一致（索引/当前）：${_lex_verdict#*|}"
+    say "     稀疏通道词空间已错配，检索会静默下降——应在同一份词表/Qdrant 版本下重跑 sparse 后重新发布" ; FAIL=1 ;;
+  *)
+    say "  ℹ️ 未见启动期 🧮 词表指纹行（平台日志截断/尚未滚动完，不阻断；稀疏侧仍由检索期闸门兜底）" ;;
+esac
 
 printf '%s\n' "${LOGS}" | grep -q "📦 \[模型装载\]" \
   && say "  ✅ 模型装载行: $(printf '%s\n' "${LOGS}" | grep -m1 '📦 \[模型装载\]' | sed 's/^ *//')" \
