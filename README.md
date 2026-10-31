@@ -88,7 +88,7 @@ open http://127.0.0.1:8501
 | 变量 | 说明 |
 |---|---|
 | `MODEL` / `OLLAMA_BASE_URL` | 生成模型与 Ollama 地址 |
-| `RAG_NUM_CTX` / `RAG_NUM_PREDICT` | 上下文窗口 / 输出上限（0=不限长） |
+| `RAG_NUM_PREDICT` | 输出上限（0=不限长）；上下文窗口**不再配置**：运行期读 Ollama `/api/show` 的模型原生窗口，再按整机内存档位钳制（≤9G→32768、≤18G→65536、更大→原生值），输入上界/历史预算随之派生 |
 | `RAG_DATA_DIR` / `RAG_DOC_GLOB` | 语料目录与匹配模式（默认 `corpus/*.txt`） |
 | `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND` | `http`（现行：同一 infinity 实例双模型，GPU=auto）/ `torch`（进程内降档） |
 | `RAG_EMBED_MODEL_PATH` / `RAG_RERANK_MODEL_PATH` | 本地检索模型目录 |
@@ -213,7 +213,7 @@ docker exec -it <container> python chatbot.py stages
 - **功能同源**：同一份 `chatbot.py`、`.env`、`storage/`、`corpus/`、`artifacts/index_manifest.json`（全部经应用层 COPY，且数据与清单来自同一次 index）；检索/生成模型与本地同一文件清单（运行期下载+字节校验）；没有 torch/http 或 CPU/GPU 的代码分叉。
 - **效果一致**：检索模型、重排模型、生成模型、切分/索引参数都相同，质量口径一致。
 - **性能不可能完全一致**：本地是 Metal/MPS，ModelScope 是 2vCPU 纯 CPU；重排、索引、首字延迟会明显慢于本机。这是硬件差异，不是代码差异。
-- 单容器 8G 档注意 `RAG_NUM_CTX`；OOM 时 `all` 会重启被杀的子进程（与本地 start.sh 的巡检语义一致）。
+- 上下文窗口自 2026-10-31 起**动态派生**（不再有 `RAG_NUM_CTX` 配置）：窗口 = min(模型原生上限，整机内存档位) —— ≤9G 内存取 32768（8G 档实测稳定），≤18G 取 65536，更大才用满模型原生 131072（8G 上直接用 131072 会内存熔断，实测 9.3s 触 95.9%）。OOM 时 `all` 会重启被杀的子进程（与本地 start.sh 的巡检语义一致）。
 
 ### 7.5 并行
 

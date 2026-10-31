@@ -247,7 +247,7 @@ flowchart TD
 | 重叠与容量 | `CHUNK_OVERLAP < CHILD_MAX_TOKENS`（否则 splitter 每篇都抛，process 全量失败） | L965–L969 |
 | RRF 权重 | 稠密/稀疏权重不能同时为 0（两条召回都退出 = 检索恒空） | L1092–L1093 |
 | 召回首数 | `RAG_RECALL_LIMIT >= 0`（0 = 跟随 `RAG_RERANK_TOP_K`） | L1094–L1097 |
-| 窗口与预留 | `RAG_NUM_CTX > RAG_INPUT_RESERVE`（否则输入上界 ≤ 0，装配会截出空提问） | L3151–L3155 |
+| 窗口与预留 | 窗口 = 运行期动态读模型原生值；`plan_generation` 校验 `num_ctx > RAG_INPUT_RESERVE` 且 input_cap>0（否则会截出空提问） | `model_context_window`、`plan_generation` |
 | GPU 层数 | `RAG_GEN_NUM_GPU` 只能是 int 或 `auto`，且 ≥ -1 | L941–L952 |
 
 ### 3.3 配置键分类表（代码默认值为准）
@@ -271,11 +271,11 @@ flowchart TD
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | 派生 `API_URL = {base}/api/chat` | L570–L571 |
 | `MODEL` | `qwen3.5:2b-q4_K_M`（.env 覆盖为 `minicpm5-2b`） | 生成模型短名 | L572 |
 | `RAG_THINK` | `False`（.env=1） | 思维链唯一开关；思考只展示、不进生成上下文 | L574、L1123–L1135 |
-| `RAG_NUM_CTX` | `8192`（.env=32768） | 窗口 | L577 |
+| ~~`RAG_NUM_CTX`~~ | 已删除（2026-10-31） | 窗口 = min(Ollama `/api/show` 的 `*.context_length` 原生值, 整机内存档位)：≤9G→32768、≤18G→65536、更大→原生值（MiniCPM5-2B=131072）；输入上界/历史预算由最终窗口派生。读不到时回退 8192 并告警 | `model_context_window()`、`_hardware_ctx_cap()` |
 | `RAG_NUM_PREDICT` | `4096`（.env=0=不限长→发 -1） | 输出上限；≤0 映射 -1 | L578、L671、L4143–L4144 |
 | `OLLAMA_TIMEOUT` | `180`（.env=900） | 非流式/请求总超时（预热也用） | L579 |
-| `RAG_STREAM_READ_TIMEOUT` | `300` | 流式读空闲超时 | L583 |
-| `RAG_TURN_TIMEOUT` | `1800` | 整轮硬上限 | L584 |
+| `RAG_STREAM_READ_TIMEOUT` | `300`（.env=0=关闭） | 流式读空闲超时；0=不限 | L583 |
+| `RAG_TURN_TIMEOUT` | `1800`（.env=0=关闭） | 整轮硬上限；0=不限 | L584 |
 | `RAG_TEMPERATURE` | `0.0` | 贪心；问答复现 | L586 |
 | `RAG_REPEAT_LAST_N` | `64`（.env=128） | 三类惩罚共用回看窗口 | L589 |
 | `RAG_GEN_TOP_K/TOP_P/MIN_P` | `20 / 0.9 / 0.0` | 温度 0 下空转，保留 A/B | L597–L599 |
@@ -419,7 +419,7 @@ flowchart TD
 |---|---|---|
 | `MODEL` | `qwen3.5:2b-q4_K_M` → `minicpm5-2b` | 生成模型（L76） |
 | `RAG_THINK` | `False` → `1` | 思维链开（L190） |
-| `RAG_NUM_CTX` | `8192` → `32768` | 8G 档折中（L202；原 131072 会顶破） |
+| ~~`RAG_NUM_CTX`~~ | 删除配置 → 动态派生窗口 | 2026-10-31：窗口 = min(模型原生 131072, 内存档位)；8G 实测直接用 131072 会内存熔断（9.3s/95.9%），故 8G 档动态取 32768，16G 取 65536，32G+ 才满额 |
 | `RAG_NUM_PREDICT` | `4096` → `0`（-1 不限长） | 输出不限长（L205） |
 | `RAG_INPUT_RESERVE` | `256` → `0` | 窗口全给输入（L217） |
 | `OLLAMA_TIMEOUT` | `180` → `900` | 慢冷启动可等（L253） |
@@ -544,7 +544,7 @@ stateDiagram-v2
 | 生成模型驻留/卸载 | Ollama 服务端策略（默认 5m） | `.env:L163-L170`、L748–L750 |
 | 检索模型懒加载 + 常驻 | `RAGEngine._get_embed/_get_rerank` 双检锁 | L3739–L3750 |
 | 构建期不与服务争内存 | `RAG_INDEX_MIN_FREE_MB` 闸门（可选，fail-closed） | L2494–L2506 |
-| 8G 档不 OOM | `OLLAMA_KV_CACHE_TYPE=q8_0` + `RAG_NUM_CTX` 档位选择 | `.env:L41-L51、L192-L202` |
+| 不 OOM | `OLLAMA_KV_CACHE_TYPE=q8_0` + 内存熔断；当前 131072 档会换页（显式接受的代价，回退档 65536/32768） | `.env:L41-L51、L192-L202` |
 | MPS 不换页拖死整机 | `PYTORCH_MPS_HIGH/LOW_WATERMARK_RATIO` | `.env:L132-L142` |
 | 进程被杀后恢复 | `all` 的子进程巡检重启 / 平台重启容器 | L4646–L4662 |
 
@@ -733,7 +733,7 @@ flowchart TD
 | 优先级 | 判据函数 | 判据 | 页面提示（下一步动作） |
 |---|---|---|---|
 | 1 | `_is_missing_model`（L4688-L4689） | `"http 404"` 或（`"not found"` 且含 `"model"`） | 生成模型不在 Ollama：看运行日志的 `[entrypoint]` 拉取行 |
-| 2 | `_is_oom`（L4692-L4693） | `"signal: killed"` 或 `"out of memory"` | 生成进程被系统杀掉：看 `[entrypoint] [mem]` 观测行，必要时调小 `RAG_NUM_CTX` |
+| 2 | `_is_oom`（L4692-L4693） | `"signal: killed"` 或 `"out of memory"` | 生成进程被系统杀掉：看 `[entrypoint] [mem]` 观测行；窗口已动态用满模型原生上限，持续 OOM 只能升级内存或换更小窗口的模型 |
 | 3 | `_is_http_500`（L4696-L4697） | `"http 500"` | 生成服务 500：模型未就绪或进程已被杀，看 `[entrypoint]` 与 `/tmp/ollama.log` |
 | 4 | `_is_connection`（L4700-L4701） | `econnrefused / connection / timed out` | 连不上生成服务：确认 `ollama serve` 已启动、`OLLAMA_BASE_URL` 可达 |
 

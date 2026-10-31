@@ -258,7 +258,7 @@ embed_model=./models/bge-m3  embed_model_content=23d8f4c1c39f  chunking_code=888
    （`chatbot.py`）。
    - 降级点都会写 `_degraded` 说明（例如稀疏通道失败仍可用稠密，`chatbot.py:L4000-L4007`、
      `chatbot.py:L2927-L2931`）；业务上"部分降级"必须可见，不能冒充正常。
-3. 装配：`<document>` 块按检索顺序拼接 → token 预算（输入上界 = `RAG_NUM_CTX` − `RAG_INPUT_RESERVE`）
+3. 装配：`<document>` 块按检索顺序拼接 → token 预算（输入上界 = 动态派生窗口 − `RAG_INPUT_RESERVE`；窗口 = min(模型原生, 内存档位)）
    → 历史从旧到新整轮淘汰（`chatbot.py:L3525-L3562`、`chatbot.py:L3380-L3404`）。
 4. 生成：单事件契约，首事件恒为 `retrieval`，之后 `thinking/delta/error/done`
    （`chatbot.py:L4153-L4178`）；UI 边收边渲染（`chatbot.py:L4731-L4785`）。
@@ -286,7 +286,7 @@ embed_model=./models/bge-m3  embed_model_content=23d8f4c1c39f  chunking_code=888
 | 约束 | 具体表现 | 实现位置 | 对业务的意义 | 代价 |
 |---|---|---|---|---|
 | **单机单用户** | 无账号、无队列、无并发会话隔离；`OLLAMA_NUM_PARALLEL=1`（`.env`） | `README.md:206`、`chatbot.py:L4809-L4814` 提到单槽 | 简单、可解释、无多租户风险 | 第二个人打开页面就是"另一个人自己"，历史互不可见但资源互相争 |
-| **8G 内存档** | 并行度/批大小按核数与可用内存**派生**；index 有可开内存闸门 | `chatbot.py:L151-L160`（cgroup）、`chatbot.py:L278-L343`、`chatbot.py:L2489-L2506` | 保证"重建时不会把服务顶穿"——用**可开内存**表达隔离规则，不靠检测进程 | `.env` 已由 131072 下调到 `RAG_NUM_CTX=32768`（KV 0.75G/路），8G 档不再顶破 |
+| **8G 内存档** | 并行度/批大小按核数与可用内存**派生**；index 有可开内存闸门 | `chatbot.py:L151-L160`（cgroup）、`chatbot.py:L278-L343`、`chatbot.py:L2489-L2506` | 保证"重建时不会把服务顶穿"——用**可开内存**表达隔离规则，不靠检测进程 | 2026-10-31 起窗口动态派生 = min(模型原生 131072, 内存档位)：8G 档取 32768（实测 131072 会内存熔断），16G 档 65536，32G+ 才满额；不再有配置项 |
 | **只做内存熔断** | 不限制人数/并发/排队；生成中按 500ms 采样 psutil 水位，触线（默认 95%）中止本轮并显示显式错误；**不卸载模型**（驻留交给 Ollama keep_alive） | `chatbot.py` 的 `RAG_MEM_*` 与 `stream_chat` 熔断段 | 行为可预测（不编排装卸，不会"上一轮卸载、这一轮加载"抖动）；慢/断有明确读数（ttft/tps） | 触发后请求直接失败（不排队）；熔断没追上的 OOM 仍由进程级巡检重启 |
 | **fail-closed 门禁** | 分块/词表/混合态三道闸门；旧索引无指纹 = 拒绝服务 | `chatbot.py:L3823-L3921` | 用户永远看不到"过期知识库的答案" | 忘了重跑命令 = 服务不可用（不是降级） |
 | **模型/数据指纹一致性** | 分块指纹、词表指纹、嵌入模型**内容**指纹（小文件全量哈希 + 大文件头尾采样） | `chatbot.py:L1478-L1540`、`chatbot.py:L2256-L2308`、`chatbot.py:L2104-L2144` | 本地与 ModelScope 效果同源：同一份 `.env`、`artifacts/`、`storage/`、同文件清单模型（`Dockerfile:L31-L51`） | 改 `chatbot.py` 里列出的切分函数会触发**全量重建**（`README.md:117`） |
@@ -307,7 +307,7 @@ embed_model=./models/bge-m3  embed_model_content=23d8f4c1c39f  chunking_code=888
 | 问"今天天气" | 仍会生成（不拒答），答案来自模型先验 | `chatbot.py:L4149-L4156` | 业务上必须人工判断；系统只给 confidence 数据，不判定（`chatbot.py:L2983-L2984`） |
 | 想要"点开引用看原文" | 做不到：UI 不展示资料清单 | `chatbot.py:L4825` | 看 `rag.log` / 台账 / 直接搜 corpus |
 | 刷新页面后继续上次对话 | 历史丢失 | `chatbot.py:L4960-L4961` | 无持久化，属设计边界 |
-| 在 8G 容器里用 131072 上下文 | OOM 风险 | 已处置：`.env` 下调到 32768 | 需要长上下文时逐档回调并盯 `[mem]` 熔断日志 |
+| 在 8G 容器里用 131072 上下文 | 换页/OOM 风险 | 2026-10-31 已上调到 131072（用户决策"去掉输入窗口上限"），8G 换页属接受代价 | 盯 `[mem]` 熔断日志与台账 tps；持续换页就回退 65536/32768 |
 | 想用外部嵌入服务（infinity） | 本版本不内置，查询会报错 | `README.md:201`、`start.sh:L127-L132` | 保持 `RAG_EMBED_BACKEND=torch`，或自建服务 |
 
 ### 7.2 已知降级（会用，但必须显式告警）
@@ -327,9 +327,8 @@ embed_model=./models/bge-m3  embed_model_content=23d8f4c1c39f  chunking_code=888
 - `_qdrant_gate` 的失败提示仍写"请先确认服务已启动: docker compose up -d"
   （`chatbot.py:L4435`），但本仓库明确**不使用 compose**（`README.md:5`、`Dockerfile:L1`），
   而实际本机启动方式是 `./start.sh start`（`start.sh:L1-L22`）。人照着提示做会找不到文件。
-- `.env` 的 `RAG_NUM_CTX` 已从 131072 下调到 32768（2026-10-28）：同一份 `.env` 会被
-  Docker 构建复制进镜像（`Dockerfile:L56`），而 8G 档沿用 131072 会 OOM —— 下调后本地与容器
-  同档，部署不再需要额外覆盖；需要长上下文时按 65536 → 131072 逐档回调并盯 `[mem]` 熔断日志。
+- 窗口配置变迁：2026-10-28 曾把 `RAG_NUM_CTX` 从 131072 下调到 32768（8G 防 OOM）；2026-10-31 直接**删除该配置**，改为运行期从 Ollama `/api/show` 动态读模型原生窗口（MiniCPM5-2B=131072）：窗口是模型属性，同一份代码/`.env` 在本地与容器都自动用满当前模型的真实能力。
+  8G 档换页是显式接受的代价；持续换页只能升级内存或换更小窗口的模型（没有"把窗口调小"的配置了），并盯 `[mem]` 熔断日志。
 
 ---
 
@@ -371,5 +370,5 @@ embed_model=./models/bge-m3  embed_model_content=23d8f4c1c39f  chunking_code=888
    （`chatbot.py:L4904-L4970`）。所有可调项都在 `.env`，配置唯一权威是代码默认值（`README.md:78`）。
 9. **同源优先于性能**：本地与容器共用同一份 `.env`/`artifacts`/`storage`，模型按同文件清单下载
    （`Dockerfile:L31-L51`、`README.md:182-185`）；性能差异来自硬件（MPS vs 2vCPU），不是代码分叉。
-10. **最大的两个落地风险**：① ~~8G 档沿用 `.env` 的 `RAG_NUM_CTX=131072` 会 OOM~~（已下调到 32768）；
+10. **最大的两个落地风险**：① ~~8G 档沿用 `.env` 的 `RAG_NUM_CTX=131072` 会 OOM~~（2026-10-31 起窗口动态用满模型原生值 131072，8G 换页为已接受代价；无配置可回退，只能升级内存/换小窗口模型）；
     ② 错误提示里仍有 `docker compose` 的旧文案（`chatbot.py:L4435`），与实际启动方式不一致。

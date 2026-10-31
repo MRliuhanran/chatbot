@@ -577,16 +577,18 @@ API_URL = f"{OLLAMA_BASE_URL}/api/chat"
 MODEL = os.getenv("MODEL", "qwen3.5:2b-q4_K_M")
 # 思维链唯一开关：模型/页面/API/会话共用（默认关）；开启时只展示（历史与正文同栏）、永不进入生成上下文。
 THINK = env_bool("RAG_THINK", False)
-# num_ctx / num_predict 与思维链开关解耦：固定预算，不随开关浮动。
-# 解析必须走 env_int（具名报错）；下限在 GEN_INPUT_RESERVE 定义处与它交叉校验。
-NUM_CTX = env_int("RAG_NUM_CTX", 8192)
+# num_ctx 与思维链开关解耦：**不再是配置项**（2026-10-31 定）。窗口是模型属性，
+# 运行期由 model_context_window() 从 Ollama /api/show 的模型元数据动态读取（见下），
+# 永远与当前 MODEL 的原生能力对齐；写死会在换模型/升级模型后静默用不满或超窗。
+# num_predict 仍可配（默认 4096；≤0 = 不限长）。
 NUM_PREDICT = env_int("RAG_NUM_PREDICT", 4096)
 TIMEOUT = env_float_min("OLLAMA_TIMEOUT", 180, 1.0)
-# 生成流的读空闲超时（无任何新数据即判超时）与整轮硬上限：
-# 先前的"无时间闸"让 Ollama/llama-server 僵死时前端只能永久空白；这两个闸只负责
-# 把"无进展"变成显式错误，不限制正常生成长度（正常流持续有 chunk 不会触发）。
-STREAM_READ_TIMEOUT = env_float_min("RAG_STREAM_READ_TIMEOUT", 300, 10.0)
-TURN_TIMEOUT = env_float_min("RAG_TURN_TIMEOUT", 1800, 60.0)
+# 生成流的读空闲超时（无任何新数据即判超时）与整轮硬上限：**0 = 关闭（不限）**。
+# 关闭后"卡死/无进展"不再自动变成显式错误 —— 生成会一直等/一直续写，只能由用户
+# 点「停止生成」结束（本仓 .env 按"整轮输出不设时间上限"配置为 0）。
+# 两者都不限制正常生成长度：正常流只要持续有 chunk 就不会触发。
+STREAM_READ_TIMEOUT = env_float_min("RAG_STREAM_READ_TIMEOUT", 300, 0.0)
+TURN_TIMEOUT = env_float_min("RAG_TURN_TIMEOUT", 1800, 0.0)
 # ── 内存熔断（2026-10-28 定稿）：只有内存一条上限，没有人数 / 并发 / 排队限制。
 # 一轮对话只有两种结局：正常输出，或水位触线后中止（等同「停止生成」）。
 # 口径只有 psutil；触线只停生成，不卸载模型 —— 驻留/卸载交给 Ollama 自己的 keep_alive
@@ -600,7 +602,7 @@ TEMPERATURE = env_float("RAG_TEMPERATURE", 0.0)
 # 惩罚回看窗口：repeat/presence/frequency 三类惩罚共用同一历史窗口（llama.cpp 采样链）。
 # 64=Ollama 内置默认；128 拉长一倍去挡间隔更大的原文复读（思考链循环式复核）。
 REPEAT_LAST_N = env_int_min("RAG_REPEAT_LAST_N", 64, 1)
-# 输入窗口上限 = RAG_NUM_CTX - RAG_INPUT_RESERVE（token 度量）：窗口**全部给输入，不做输出
+# 输入窗口上限 = 动态模型窗口 - RAG_INPUT_RESERVE（token 度量）：窗口**全部给输入，不做输出
 # 预留**。生成空间由服务端上下文移位腾出 —— 生成超窗时从最前面按 token 遗忘（先丢输入前文
 # /历史，见 plan_generation）。RAG_NUM_PREDICT ≤ 0 时请求发 num_predict=-1，输出不限长。
 # ── 采样/惩罚（Ollama options；单一来源见 _chat_options）──
@@ -618,7 +620,7 @@ GEN_FREQUENCY_PENALTY = env_float("RAG_GEN_FREQUENCY_PENALTY", 0.0)
 GEN_REPEAT_PENALTY = env_float_min("RAG_GEN_REPEAT_PENALTY", 1.1, 0.0)
 # 随机种子：-1=每次随机（temperature=0 下无影响）；固定正整数用于可复现采样。
 GEN_SEED = env_int("RAG_GEN_SEED", -1)
-# 生成侧**不设任何长度/时间闸、也不重试**：窗口（RAG_NUM_CTX，token 度量）是唯一上限；超窗
+# 生成侧**不设任何长度/时间闸、也不重试**：窗口（动态读模型原生上下文，token 度量）是唯一上限；超窗
 # 由服务端上下文移位从最前面按 token 丢续写；空答/截断/报错原样交给上层。
 
 
@@ -659,6 +661,99 @@ def _ollama_session():
     return session
 
 
+# ── 动态上下文窗口（唯一来源：Ollama 模型元数据，不再配置）──────────────────
+_MODEL_CTX_CACHE = {"value": None, "warned": False}
+_MODEL_CTX_LOCK = threading.Lock()
+_MODEL_CTX_FALLBACK = 8192   # 唯一兜底：Ollama 不可达时（此时也生成不了）的保守窗口
+
+
+def _hardware_ctx_cap():
+    """整机内存档位 → 可承载的上下文窗口上限（token）。**不是配置项**，由总内存派生。
+
+    为什么模型原生窗口不能直接全用：KV cache 随窗口线性增长（q8_0 每 token ≈22.3KB；
+    8G 档 131072 档 ≈2.86G/路），8G 机器再叠 infinity 双模型（≈2.2G）+ 生成权重（1.6G）
+    必换页。2026-10-31 本地 8G 实测：num_ctx=131072 时 9.3s 内内存到 95.9%，熔断中止。
+    档位取实测稳定值：≤9G→32768（KV≈0.75G），≤18G→65536（≈1.5G），更大→用满模型原生值。
+    psutil 不可用时返回 None（不钳制，交给调用方用模型原生值）。
+    """
+    try:
+        import psutil
+        total_gb = psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return None
+    if total_gb <= 9:
+        return 32768
+    if total_gb <= 18:
+        return 65536
+    return None
+
+
+def model_context_window():
+    """动态读取当前生成模型的**原生上下文窗口**（token）。
+
+    为什么不再配置（2026-10-31）：窗口是**模型属性**，不是部署参数。旧 RAG_NUM_CTX 写死
+    32768/131072 后，换模型/升级模型会静默变成"只用了一部分能力"或"超过模型原生上限"；
+    同一份 .env 也会被本地与远程不同硬件共用同一个数。改为运行期从 Ollama /api/show 的
+    model_info 读 `*.context_length`（llama 架构键名如 `llama.context_length`），与当前
+    MODEL 永远同源；窗口相关的输入上界/历史预算全部由它派生，不再有配置项。
+
+    **硬件钳制**：模型原生窗口只是上限，能否装下由整机内存决定。最终窗口 =
+    min(模型原生值, _hardware_ctx_cap())；后者按总内存档位派生（≤9G→32768、≤18G→65536、
+    更大→原生值），不是配置项。2026-10-31 本地 8G 实测 131072 会内存熔断 → 不能只看模型。
+
+    失败语义（fail-open 但有记录）：Ollama 不可达时返回 _MODEL_CTX_FALLBACK 并告警一次；
+    **不缓存失败**，下一轮重试（应用先于 ollama 就绪启动是合法时序）。成功值进程内缓存：
+    模型元数据与整机内存档位在一次进程生命周期内不变，不必每轮计算/打 HTTP。
+    """
+    cached = _MODEL_CTX_CACHE["value"]
+    if cached is not None:
+        return cached
+    with _MODEL_CTX_LOCK:
+        cached = _MODEL_CTX_CACHE["value"]
+        if cached is not None:
+            return cached
+        value = None
+        try:
+            resp = _ollama_session().post(
+                f"{OLLAMA_BASE_URL}/api/show", json={"model": MODEL}, timeout=10,
+            )
+            if resp.status_code == 200:
+                info = (resp.json() or {}).get("model_info") or {}
+                vals = []
+                for key, raw in info.items():
+                    if not str(key).endswith(".context_length"):
+                        continue
+                    try:
+                        iv = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if iv > 0:
+                        vals.append(iv)
+                if vals:
+                    value = max(vals)
+            elif not _MODEL_CTX_CACHE["warned"]:
+                _MODEL_CTX_CACHE["warned"] = True
+                log(f"⚠️  [ctx] Ollama /api/show 返回 HTTP {resp.status_code}，本次回退 {_MODEL_CTX_FALLBACK} token（下轮重试）")
+        except Exception as exc:
+            if not _MODEL_CTX_CACHE["warned"]:
+                _MODEL_CTX_CACHE["warned"] = True
+                log(f"⚠️  [ctx] 读取模型 {MODEL} 原生窗口失败: {type(exc).__name__}: {exc}；本次回退 {_MODEL_CTX_FALLBACK} token（下轮重试）")
+        if value is None:
+            return _MODEL_CTX_FALLBACK
+        native = value
+        cap = _hardware_ctx_cap()
+        if cap is not None and value > cap:
+            value = cap
+        _MODEL_CTX_CACHE["value"] = value
+        if value != native:
+            log(
+                f"[ctx] 模型 {MODEL} 原生窗口 {native} token；整机内存档位可承载 ≤{value} → "
+                f"动态窗口 {value}（Ollama /api/show + 内存档位派生，不配置）"
+            )
+        else:
+            log(f"[ctx] 模型 {MODEL} 原生上下文窗口: {value} token（Ollama /api/show 动态读取，不再配置 RAG_NUM_CTX）")
+        return value
+
 
 # ── 生成客户端：Ollama 流式对话 ──
 # 事件词表封闭产出（stream_chat + run_turn）：retrieval → thinking / delta / error / done。
@@ -679,7 +774,7 @@ def _chat_options(temperature=None, num_ctx=None, num_predict=None):
     _predict = int(NUM_PREDICT if num_predict is None else num_predict)
     opts = {
         "temperature": TEMPERATURE if temperature is None else temperature,
-        "num_ctx": int(NUM_CTX if num_ctx is None else num_ctx),
+        "num_ctx": int(model_context_window() if num_ctx is None else num_ctx),
         # ≤0 = 不限长，映射到 Ollama 的 -1（默认即无限）；正数才是硬上限。
         "num_predict": _predict if _predict > 0 else -1,
         "top_k": int(GEN_TOP_K),
@@ -791,8 +886,8 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
     **设内存熔断**（RAG_MEM_GUARD / RAG_MEM_KILL_PCT，默认 95%）：触线即中止本轮（与
     「停止生成」同效，产出 EVENT_ERROR 而非 done，故残缺答案不会进历史）；不排队、不限
     人数、不卸载模型（驻留/卸载交给 Ollama keep_alive）。
-    但设**读空闲超时**（RAG_STREAM_READ_TIMEOUT，默认 300s 无新数据 → EVENT_ERROR）与
-    **整轮硬上限**（RAG_TURN_TIMEOUT，默认 1800s）：只把卡死变显式错误，不影响正常长回答。
+    **时间闸均可关闭（0=不限）**：读空闲 RAG_STREAM_READ_TIMEOUT、整轮上限 RAG_TURN_TIMEOUT。
+    配置为 0 后卡死不会自动报错，只能手动「停止生成」——这是"输出不限时间"的显式代价。
     """
     options = _chat_options(temperature, num_ctx, num_predict)
     use_think = THINK if think is None else bool(think)
@@ -813,16 +908,17 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
         # 不发请求级 keep_alive：驻留/卸载交给 Ollama 服务端自身策略（上游默认 5m），
         # 应用层不编排组件行为。
         payload = { "model": MODEL, "messages": messages, "stream": True, "think": use_think, "options": options, }
-        # (connect, read) 分开：连接 10s；读空闲 STREAM_READ_TIMEOUT（默认 300s）。
-        # 模型加载/首 token 可能慢，但不应无限等待；超时由下面的 except 转成 EVENT_ERROR。
-        r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, STREAM_READ_TIMEOUT), )
+        # (connect, read) 分开：连接恒 10s；读空闲由 RAG_STREAM_READ_TIMEOUT 决定，0=不限（None）。
+        # 连接阶段始终有闸（Ollama 没起/端口不通要快速暴露），输出阶段按配置可以无限等。
+        _read_timeout = STREAM_READ_TIMEOUT if STREAM_READ_TIMEOUT > 0 else None
+        r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, _read_timeout), )
         if r.status_code != 200 and _gen_gpu_fallback(f"HTTP {r.status_code} {r.text[:160]!r}"):
             # auto 模式 + 本进程首次：去掉 num_gpu 重发一次。此刻**尚未产出任何 token**
             # （流都还没开始读），所以不构成"生成重试"，没有任何已生成内容被丢弃。
             # options 重新组装（而不是就地 pop）：回落状态已翻转，_chat_options 自然不再放 num_gpu。
             r.close()
             payload["options"] = _chat_options(temperature, num_ctx, num_predict)
-            r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, STREAM_READ_TIMEOUT), )
+            r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, _read_timeout), )
         if r.status_code != 200:
             yield EVENT_ERROR, f"HTTP {r.status_code} {r.text[:300]}"
             return
@@ -886,10 +982,15 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
         # 归因必须分开：ConnectionError 绝大多数是**连接建立失败/被重置**（Ollama 没起、
         # 端口不通、服务重启瞬间 —— requests 的 (10, READ) 超时里 10s 就会抛），把它的
         # 文案写成"等待超过读空闲超时无新数据"会指错方向（调大 RAG_STREAM_READ_TIMEOUT
-        # 毫无用处）。真正属于读空闲的只有 ReadTimeout。
+        # 毫无用处）。真正属于读空闲的只有 ReadTimeout；RAG_STREAM_READ_TIMEOUT=0 时读阶段
+        # 无闸，此时 Timeout 只可能来自连接阶段（10s）。
         if _ename in ("ReadTimeout", "Timeout"):
-            yield EVENT_ERROR, (f"生成超时：连接已建立但等待超过 {STREAM_READ_TIMEOUT:.0f}s 无新数据"
-                                f"（{_ename}；可调 RAG_STREAM_READ_TIMEOUT / 看 ollama 日志）")
+            if STREAM_READ_TIMEOUT > 0:
+                yield EVENT_ERROR, (f"生成超时：连接已建立但等待超过 {STREAM_READ_TIMEOUT:.0f}s 无新数据"
+                                    f"（{_ename}；可调 RAG_STREAM_READ_TIMEOUT / 看 ollama 日志）")
+            else:
+                yield EVENT_ERROR, (f"生成超时：{_ename}: {exc}"
+                                    f"（RAG_STREAM_READ_TIMEOUT=0 已关闭读空闲超时，本错误来自连接阶段）")
         elif _ename == "ConnectionError":
             yield EVENT_ERROR, (f"生成失败：连不上 Ollama 或连接被重置（{_ename}: {exc}）"
                                 f"—— 先确认 ollama serve 在跑、OLLAMA_BASE_URL/NO_PROXY 正确，再看 ollama 日志")
@@ -3557,16 +3658,12 @@ def context_sources(results):
 RAG_USE_CONTEXT = env_bool("RAG_USE_CONTEXT", True)
 
 
-# 下限 0：负值会让输入上界 I = NUM_CTX - RESERVE **超过真实窗口**（下面的交叉校验只拦
-# I ≤ 0，拦不住"上界比窗口还大"），装配于是把超长 prompt 发出去，由服务端移位悄悄丢前文。
+# 下限 0：负值会让输入上界 I = 动态窗口 - RESERVE **超过真实窗口**（plan_generation 的
+# 交叉校验只拦 I ≤ 0，拦不住"上界比窗口还大"），装配于是把超长 prompt 发出去，由服务端
+# 移位悄悄丢前文。窗口本身由 model_context_window() 动态解析，这里只留模板 token 的余量。
 GEN_INPUT_RESERVE = env_int_min("RAG_INPUT_RESERVE", 256, 0)
-# 交叉校验（启动即报错）：输入上界 I = NUM_CTX - RESERVE。I ≤ 0 时装配会把提问截成
-# 空串，最后一条 user 消息内容为空 —— 模型收到空提问，而启动时没有任何人报错。
-if NUM_CTX <= GEN_INPUT_RESERVE:
-    raise ValueError(
-        f"RAG_NUM_CTX={NUM_CTX} 必须大于 RAG_INPUT_RESERVE={GEN_INPUT_RESERVE}："
-        f"否则输入上界 ≤ 0，装配会截出空提问（请调大 RAG_NUM_CTX 或调小 RAG_INPUT_RESERVE）"
-    )
+# 交叉校验已挪到 plan_generation（那里拿得到本轮实际 num_ctx）：import 期不再需要窗口值，
+# 因此应用可以先于 Ollama 就绪启动，首次生成时再动态解析模型窗口。
 # 生成历史的硬上限（token）：把"历史最多塞多少"从窗口余量里独立出来。
 # 0=不设上限（行为与不带该配置完全一致，只受窗口余量约束）。
 # 生效形式是 min(窗口余量, 本上限)：本上限只做第二道、更严的约束，永不越过窗口安全边界。
@@ -3956,7 +4053,7 @@ def plan_generation(results, history, query, num_ctx, use_context=True):
     # 不做输出预留：生成超窗时由服务端上下文移位从最前面按 token 遗忘（先丢输入前文/历史）；
     # 输出不限长（num_predict ≤ 0 → 请求 -1）。
     input_cap = max(0, int(num_ctx) - GEN_INPUT_RESERVE)
-    # 与启动期 NUM_CTX 交叉校验对称：外部调用方可以传进任意 num_ctx，这里同样拦。
+    # 外部调用方可以传进任意 num_ctx，这里同样拦（窗口默认值由 model_context_window 动态解析）。
     # 不拦的后果是"看似正常发出、实则空提问"（失效原型：静默）。
     if input_cap <= 0:
         raise ValueError(
@@ -4637,7 +4734,7 @@ def _slow_hint(ttft_s, tps):
     if ttft_s is not None and ttft_s >= SLOW_TTFT_S:
         hints.append(f"首字 {ttft_s:.0f}s：查 load_duration/prefill（冷加载或整段重算）")
     if tps is not None and tps < SLOW_TPS:
-        hints.append(f"解码 {tps:.1f} tok/s：算力/换页（对比内存水位与 RAG_NUM_CTX）")
+        hints.append(f"解码 {tps:.1f} tok/s：算力/换页（对比内存水位与动态模型窗口）")
     return "；".join(hints) or None
 
 
@@ -4660,7 +4757,7 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     chat = chat or _CHAT_BACKEND.stream
     top_k = TOP_K if top_k is None else top_k
     use_context = RAG_USE_CONTEXT if use_context is None else use_context
-    num_ctx = NUM_CTX if num_ctx is None else num_ctx
+    num_ctx = model_context_window() if num_ctx is None else num_ctx
     # num_predict ≤ 0 = 不限长：请求发 -1，窗口是唯一上限；输入上界与 num_predict 无关
     # （见 plan_generation：输入窗口 = num_ctx - 模板余量，不做输出预留）。
     _raw_predict = int(NUM_PREDICT if num_predict is None else num_predict)
@@ -5790,7 +5887,7 @@ _GEN_FAILURE_HINTS = (
     (_is_missing_model,
      "生成模型不在 Ollama 里：看运行日志的 [entrypoint] 拉取行（后台拉取期间问答都会失败，拉完自动恢复）"),
     (_is_oom,
-     "生成进程被系统杀掉（内存超限）：看运行日志的 [entrypoint] [mem] 观测行，必要时调小 RAG_NUM_CTX"),
+     "生成进程被系统杀掉（内存超限）：看运行日志的 [entrypoint] [mem] 观测行；窗口已动态用满模型原生上限，持续 OOM 只能升级内存或换更小窗口的模型"),
     (_is_http_500,
      "生成服务返回 500：模型未就绪或进程已被杀，看运行日志的 [entrypoint] 与 /tmp/ollama.log"),
     (_is_connection,

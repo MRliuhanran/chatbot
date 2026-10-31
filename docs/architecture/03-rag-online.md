@@ -86,11 +86,11 @@ presence_penalty、frequency_penalty、seed，外加可选 num_gpu。未列出�
 |---|---|---|---|---|
 | MODEL | qwen3.5:2b-q4_K_M | minicpm5-2b | L572、.env:L76 | Ollama 模型名 |
 | RAG_THINK | False | 1 | L574、.env:L190 | 思维链唯一开关：只影响展示，永不进生成上下文 |
-| RAG_NUM_CTX | 8192 | 32768 | L577、.env | 上下文窗口（token）；2026-10-28 由 131072 下调（8G 档 KV 2.86G→0.75G/路） |
+| ~~RAG_NUM_CTX~~ | 删除配置 → 动态派生窗口 | 8G 档 32768 / 16G 档 65536 / 32G+ 模型原生 131072 | `model_context_window()`、`_hardware_ctx_cap()` | 2026-10-31 起窗口 = min(模型原生, 内存档位)：`/api/show` 读原生值后再钳制（8G 直接用 131072 实测会内存熔断） |
 | RAG_NUM_PREDICT | 4096 | 0 | L578、.env:L205 | ≤0 映射为请求里的 -1（不限长） |
 | OLLAMA_TIMEOUT | 180s | 900 | L579、.env:L253 | 只用于启动预热探针，不用于问答流 |
-| RAG_STREAM_READ_TIMEOUT | 300s | 300 | L583、.env:L256 | 流式读空闲超时（无新数据即判超时） |
-| RAG_TURN_TIMEOUT | 1800s | 1800 | L584、.env:L257 | 整轮硬上限（0=关闭） |
+| RAG_STREAM_READ_TIMEOUT | 300s | 0（关闭） | L583、.env:L256 | 流式读空闲超时（无新数据即判超时）；0=不限 |
+| RAG_TURN_TIMEOUT | 1800s | 0（关闭） | L584、.env:L257 | 整轮硬上限；0=不限 |
 | RAG_TEMPERATURE | 0.0 | 0.0 | L586、.env:L221 | 0=贪心 |
 | RAG_REPEAT_LAST_N | 64 | 128 | L589、.env:L236 | 三类惩罚共用的回看窗口 |
 | RAG_GEN_TOP_K | 20 | 20 | L597、.env:L224 | 贪心下不参与 argmax，保留给温度>0 的 A/B |
@@ -440,7 +440,7 @@ B = I − T(system) − T(context) − T(query)       给历史的最大预算
 over_window = T(system) + T(context) + T(query) > I
 ```
 
-本仓 .env 的 RAG_INPUT_RESERVE=0，所以 I = num_ctx = 32768；GEN_HISTORY_MAX_TOKENS=0 表示不额外
+本仓 .env 的 RAG_INPUT_RESERVE=0，所以 I = num_ctx = 131072；GEN_HISTORY_MAX_TOKENS=0 表示不额外
 限制历史（只受窗口余量约束）。注意"输入窗口全部给输入、不做输出预留"（L590-L592、L3532-L3534）：
 输出超窗由服务端上下文移位从最前面按 token 遗忘，而不是在客户端预留 num_predict 的空间。
 
@@ -609,8 +609,8 @@ stream_chat 的 finally → r.close()
 | 10 | 检索结果为空 | 语料空/零命中/被过滤 | 照常生成（纯对话） | 正常回答 | 正常轮 | — |
 | 11 | 生成 HTTP 非 200 | 模型缺失/服务异常 | auto+设备类错 → 去 num_gpu 重发一次；否则 EVENT_ERROR | st.error + 下一步提示 | 不入历史、台账 error | 修服务/拉模型 |
 | 12 | 流内 error 块 | Ollama 报错 | yield ERROR 后 return（不产出 done） | st.error | 不入历史、台账 error | 重试 |
-| 13 | 读空闲超时 | 300s 无新数据 | EVENT_ERROR"生成超时/连接中断" | st.error + 提示 | 不入历史、台账 error | 调 RAG_STREAM_READ_TIMEOUT |
-| 14 | 整轮超时 | 有 chunk 但超 1800s | EVENT_ERROR | st.error | 不入历史、台账 error | 调 RAG_TURN_TIMEOUT |
+| 13 | 读空闲超时 | 300s 无新数据（.env=0 已关闭） | EVENT_ERROR"生成超时/连接中断" | st.error + 提示 | 不入历史、台账 error | 调 RAG_STREAM_READ_TIMEOUT（0=关闭） |
+| 14 | 整轮超时 | 有 chunk 但超 1800s（.env=0 已关闭） | EVENT_ERROR | st.error | 不入历史、台账 error | 调 RAG_TURN_TIMEOUT（0=关闭） |
 | 15 | 空答案（有 done） | 预算被思考吃光等 | done 照常产出，answer 为空 | st.markdown"⚠️" + st.warning"无正文" | 不入历史、台账 done（answer_chars=0） | 关 think/调预算 |
 | 16 | done_reason=length | 触 num_predict | 正常 done | st.warning"被截断" | **入历史**（正文非空）、台账 done | 调 num_predict |
 | 17 | Stop 按钮 | Streamlit 抛 BaseException | close 事件流 → 回滚 user → 上抛 | 停止（write_stream 已流出的部分保留） | 无历史、无台账 | — |
@@ -656,7 +656,7 @@ stream_chat 的 finally → r.close()
 |---|---|---|
 | 生成模型 | minicpm5-2b | .env:L76 |
 | think | 1（开） | .env:L190 |
-| num_ctx | 32768 | .env |
+| num_ctx | 131072 | .env |
 | num_predict | 0 → 请求 -1 | .env:L205 |
 | input_reserve | 0（I = num_ctx） | .env:L217 |
 | temperature | 0.0 | .env:L221 |
