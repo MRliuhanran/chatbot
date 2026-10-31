@@ -1,3 +1,9 @@
+# ⚠️ 构建上下文里必须保留下面这些路径（Dockerfile 应用层会 COPY；缺一个就构建失败或镜像数据不完整）：
+#   storage/  corpus/  lexicon/  qdrant_config/  artifacts/index_manifest.json  artifacts/chunks.meta.json
+# 本文件**不要**给它们加排除规则；当前也确实没有排除（artifacts/chunks.json 是被刻意排除的：
+# 它只服务本地重建，运行期/verify-build 都不读它）。
+# storage/**/wal/* 的排除是刻意的：发布前必须 ./start.sh stop 让 Qdrant 把 WAL 刷盘，否则会打出
+# "正在写的半快照"；tools/ms_release.sh 的 preflight 已拦截"Qdrant 仍在跑"这一种情况。
 .git
 .venv
 .bin/

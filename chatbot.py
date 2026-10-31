@@ -1066,6 +1066,16 @@ CHUNKS_JSON = os.path.join(_ARTIFACTS_DIR, "chunks.json")
 
 CHUNKS_META_JSON = os.path.splitext(CHUNKS_JSON)[0] + ".meta.json"
 CHUNKS_META_VERSION = 1
+# ── 发布契约：索引清单（artifacts/index_manifest.json）────────────────────────
+# index **成功收尾**时写一份"这份索引是谁建的"（分块/词表/模型内容指纹 + 物理集合名），
+# 供构建期离线核对（verify-build）与发布前对账。为什么必须有它：镜像里只有产物
+# （artifacts/、storage/）没有 chunks.json，Docker 构建期无从判断"产物是否与当前代码/
+# 语料/模型同源"——远程部署实测就是带着 923236fe7e4acc7c 的旧索引指纹起服务，运行期
+# 闸门（_check_chunk_freshness）到首轮检索才报错（失效原型：坏产物静默进镜像）。
+# 清单必须进 commit（.gitignore 由发布侧放行）；且只在成功收尾写 —— 失败半截绝不留清单，
+# 否则"看起来完整"的清单会把坏产物判成同源（判据恒真 + 静默）。
+INDEX_MANIFEST_JSON = os.path.join(_ARTIFACTS_DIR, "index_manifest.json")
+INDEX_MANIFEST_VERSION = 1
 EMBED_CACHE_DIR = os.path.join(_ARTIFACTS_DIR, "embeddings")
 EMBED_CACHE_ENABLED = env_bool("RAG_EMBED_CACHE", True)
 DOC_CHUNK_DIR = os.path.join(_ARTIFACTS_DIR, "docs")  # 单文档分块缓存：只重分块增/改的文档
@@ -2273,16 +2283,14 @@ def qdrant_server_version(client=None):
     return str(version)
 
 
-def lexicon_fingerprint(client=None):
-    """词表与稀疏编码器指纹；任一变 → 只需 sparse，不牵连稠密与分块。
+def _lexicon_fingerprint_parts(server_version):
+    """词表指纹的**输入清单**（单点定义）：离线可算的部分 + 调用方给的 Qdrant 服务端版本。
 
-    ★ 只哈希**真正参与运行期归一**的文件（ALIASES_FILE，load_lexicon 会读它）。
-      lexicon/stopwords.txt 运行期从不被使用 —— 停用词走 Qdrant 内置 chinese 表
-      （见 bm25_options），RAG_STOPWORDS_FILE 只服务于 python chatbot.py lexicon 自检。
-      旧写法无条件把它哈希进指纹：改这个文件检索行为一点不变，却会让闸门报"词表与索引
-      不一致"、拦住全部检索并强制跑一次 sparse（失效原型：判据与实现不同源）。
-      若将来把该文件真正下发到 bm25_options()["stopwords"]，必须把它（的内容）重新纳入
-      指纹，否则改停用词不动指纹 = 稀疏词空间静默错配。
+    拆出这个构造器的唯一理由：verify-build 要在**不连 Qdrant** 的构建期重算出**同一个**
+    指纹（服务端版本由 index_manifest 记录、作为参数传入；其余输入——别名表内容/路径、
+    BM25 选项、6 个源码单元——本地全部可读）。两侧调的是同一个构造器，不是第二套算法；
+    顺序即哈希序，改顺序/改内容都会改变所有既有索引的指纹（必须重跑 index/sparse）。
+    失效原型：构建期用"另一套近似算法"判同源，两套算法迟早分叉，闸门看起来在跑却恒真。
     """
     parts = []
     try:
@@ -2297,7 +2305,7 @@ def lexicon_fingerprint(client=None):
     # 故不再有 jieba 版本项与标点集项；选项本身仍必须进指纹（改 tokenizer 就是改词空间）。
     parts.append("bm25=" + json.dumps(bm25_options(), sort_keys=True))
     # Qdrant 服务端版本：稀疏编码器在服务端，升级它就可能换词空间（见 qdrant_server_version）。
-    parts.append("qdrant_server=" + qdrant_server_version(client))
+    parts.append("qdrant_server=" + str(server_version))
     # BM25 模型名与解析/归一链路源码同样决定稀疏词空间：漏掉会让换编码后指纹不变、
     # stages 误报 C 新鲜，稀疏索引静默错配。
     parts.append("bm25_model=" + BM25_MODEL_NAME)
@@ -2310,7 +2318,29 @@ def lexicon_fingerprint(client=None):
             parts.append(f"{name}:" + inspect.getsource(fn))  # type: ignore[arg-type]
         except (OSError, TypeError):
             parts.append(f"{name}:<unavailable>")
-    blob = "|".join(parts)
+    return parts
+
+
+def lexicon_fingerprint(client=None):
+    """词表与稀疏编码器指纹；任一变 → 只需 sparse，不牵连稠密与分块。
+
+    ★ 只哈希**真正参与运行期归一**的文件（ALIASES_FILE，load_lexicon 会读它）。
+      lexicon/stopwords.txt 运行期从不被使用 —— 停用词走 Qdrant 内置 chinese 表
+      （见 bm25_options），RAG_STOPWORDS_FILE 只服务于 python chatbot.py lexicon 自检。
+      旧写法无条件把它哈希进指纹：改这个文件检索行为一点不变，却会让闸门报"词表与索引
+      不一致"、拦住全部检索并强制跑一次 sparse（失效原型：判据与实现不同源）。
+      若将来把该文件真正下发到 bm25_options()["stopwords"]，必须把它（的内容）重新纳入
+      指纹，否则改停用词不动指纹 = 稀疏词空间静默错配。
+    """
+    blob = "|".join(_lexicon_fingerprint_parts(qdrant_server_version(client)))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _lexicon_fingerprint_offline(server_version):
+    """不连 Qdrant 重算词表指纹（verify-build 专用）：与 lexicon_fingerprint 共用同一份
+    parts 构造器（_lexicon_fingerprint_parts），只把服务端版本换成 index_manifest 记录值。
+    "离线"是指进程不建 QdrantClient —— 指纹本身仍逐字等同运行期值，才算真闸门。"""
+    blob = "|".join(_lexicon_fingerprint_parts(server_version))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
@@ -2682,6 +2712,76 @@ def _current_alias_target(client, alias=COLLECTION_ALIAS):
     except Exception as exc:
         log(f"    ⚠️  读取别名 {alias} 失败，无法判定其实际指向: {type(exc).__name__}: {exc}")
         return None
+
+
+# ── 发布契约：索引清单的读写 ──────────────────────────────────────────────────
+def _qdrant_storage_root():
+    """Qdrant 本地存储目录：与 cmd_all 启动 qdrant 时设的 QDRANT__STORAGE__STORAGE_PATH
+    **同源**（env 优先，默认 <项目根>/storage）。verify-build 完全离线，判断"集合有没有
+    随镜像带上"只能看这个目录 —— 读 Qdrant 存储布局是唯一不连服务的判据。"""
+    env_path = (os.getenv("QDRANT__STORAGE__STORAGE_PATH") or "").strip()
+    if env_path:
+        return env_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
+
+
+def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id, points, embed_model_content, qdrant_server):
+    """把本次索引的**身份**写成 artifacts/index_manifest.json（发布契约）。
+
+    只在 build_index 的**成功收尾**调用：点数不变量、维度校验、别名切换全部通过之后。
+    失败路径绝不能写 —— 半截索引若留下"看起来完整"的清单，构建期 verify-build 会把坏
+    产物判成同源（失效原型：判据恒真 + 静默），这比没有清单更坏。
+
+    每个字段都对应一类"镜像里看不出来"的失效：
+      · chunk_fingerprint：镜像里的 corpus/切分代码/嵌入模型内容必须与建索引那一份同源，
+        否则运行期闸门要到**首轮检索**才报错（远程部署事故：923236fe… 旧指纹进了镜像）。
+      · lexicon_fingerprint + qdrant_server：词表指纹把 Qdrant 服务端版本也哈希进去，
+        离线重算需要这个版本号（verify-build 不连 Qdrant），故一并记录。
+      · collection：物理集合名（别名模式带 build_id 后缀），verify-build 据此核对
+        storage/collections/<name> 是否随镜像带上。
+      · build_id/points/built_at/embed_model_content：排障时一眼定位"这份镜像是哪次构建"。
+    """
+    manifest = {
+        "manifest_version": INDEX_MANIFEST_VERSION,
+        "chunk_fingerprint": chunk_fingerprint,
+        "lexicon_fingerprint": lexicon_id,
+        "collection": collection,
+        "build_id": build_id,
+        "points": int(points),
+        "embed_model_content": embed_model_content,
+        "qdrant_server": qdrant_server,
+        "built_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
+    # 原子写（tmp + rename，与 chunks.json/meta 同款）：进程被杀不会留下半截 JSON。
+    tmp = INDEX_MANIFEST_JSON + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, INDEX_MANIFEST_JSON)
+    log(f"索引清单: {INDEX_MANIFEST_JSON}（分块指纹 {chunk_fingerprint}、集合 {collection}、{points} 点）")
+
+
+def read_index_manifest():
+    """读 index_manifest.json；缺失/损坏/版本不符都抛**具名**错误（verify-build 的判据）。
+
+    缺清单不是"跳过检查"：那是旧版 index 的产物，构建期无从判断同源（fail-closed）。
+    """
+    if not os.path.exists(INDEX_MANIFEST_JSON):
+        raise FileNotFoundError(
+            f"找不到 {INDEX_MANIFEST_JSON}：索引清单是发布契约（构建期 verify-build 靠它判断"
+            f"镜像内产物与代码/语料/模型是否同源），请先运行 python chatbot.py index 生成"
+            f"（旧版本 index 不写清单，也要重跑一次）"
+        )
+    with open(INDEX_MANIFEST_JSON, encoding="utf-8") as f:
+        manifest = json.load(f)
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"{INDEX_MANIFEST_JSON} 不是 JSON 对象（坏文件），请重跑 index")
+    if manifest.get("manifest_version") != INDEX_MANIFEST_VERSION:
+        raise RuntimeError(
+            f"{INDEX_MANIFEST_JSON} 的 manifest_version={manifest.get('manifest_version')!r}，"
+            f"当前代码是 {INDEX_MANIFEST_VERSION}，请重跑 index 重新生成清单"
+        )
+    return manifest
 
 
 def build_index():
@@ -3143,6 +3243,19 @@ def build_index():
             "lexicon_id": lexicon_id,
             "build_id": build_id[:8],
         })
+        # 发布契约：只有走到这里（点数不变量、维度、别名切换全过）才写索引清单；失败
+        # 路径一条都不写——写坏的清单会让构建期 verify-build 把坏产物判成同源。
+        # 清单写失败直接抛（index 退出码 1）：镜像里没有清单 = 构建期闸门必定拦下，
+        # 与其让坏产物上线后到首轮检索才暴露，不如在重建现场就报出来。
+        write_index_manifest(
+            chunk_fingerprint=chunk_fingerprint,
+            lexicon_id=lexicon_id,
+            collection=target_collection,
+            build_id=build_id,
+            points=written,
+            embed_model_content=_model_content_fingerprint(),
+            qdrant_server=qdrant_server_version(client),
+        )
         _gc_embed_cache_files()
         log(f"总耗时: {time.time() - t0:.1f} 秒")
     finally:
@@ -5349,6 +5462,95 @@ def _infinity_spec(root, env=None):
     return argv, None
 
 
+# ── 启动期指纹自检（cmd_all 专用，只读）──────────────────────────────────────
+def _startup_fingerprint_selfcheck(env):
+    """把运行期指纹闸门的前提**提前**打到启动日志：索引里记的分块/词表指纹 vs 当前计算值。
+
+    为什么要在启动期做：闸门（_check_chunk_freshness / _check_lexicon_consistency）只在
+    **首轮检索**才触发 —— 部署验收时日志里压根没有 "🔧 分块指纹" 行，要么等用户发一次
+    检索，要么上线后才发现旧产物进了镜像（远程部署事故：923236fe7e4acc7c 的旧索引在镜像
+    里，首问才炸）。这里在 app spawn 之后、独立守护线程里跑一遍只读核对，把期望行提前写进
+    运行日志；tools/ms_release.sh 轮询它作为确定性的发布判据（行格式与闸门日志逐字同款）。
+
+    ★ 只读，绝不自动修复：启动期自动修复/复制 storage 都是**已否决方案** —— 那会把
+      "数据与代码同源"偷换成"启动时猜一份"，问题被掩盖而不是被发现。不一致只打
+      ❌ [all] 行动话术交人工处理；异常只 warn，绝不因一次读取抖动拖垮容器
+      （"状态未知 ≠ 已知不一致"，与闸门的网络豁免同一口径）。
+    """
+    try:
+        from qdrant_client import QdrantClient
+        try:
+            port = int(env.get("QDRANT_PORT") or QDRANT_PORT)
+        except (TypeError, ValueError):
+            port = QDRANT_PORT
+        client = QdrantClient(
+            host=(env.get("QDRANT_HOST") or QDRANT_HOST),
+            port=port,
+            api_key=(env.get("QDRANT_API_KEY") or QDRANT_API_KEY) or None,
+            timeout=QDRANT_TIMEOUT,
+        )
+    except Exception as exc:
+        log(f"⚠️  [all] 启动期指纹自检：无法建立 Qdrant 客户端，跳过（不影响服务）: {type(exc).__name__}: {exc}")
+        return
+    try:
+        coll = resolve_collection_name(client)
+        try:
+            if not client.collection_exists(coll):
+                log(f"⚠️  [all] 启动期指纹自检：集合 {coll} 不存在（尚未建库），跳过比对（不阻断启动）")
+                return
+            pts, _ = client.scroll(
+                collection_name=coll, limit=1, with_payload=[CHUNK_FINGERPRINT_FIELD], with_vectors=False,
+            )
+        except Exception as exc:
+            log(f"⚠️  [all] 启动期指纹自检：读取集合 {coll} 失败，跳过（不阻断启动）: {type(exc).__name__}: {exc}")
+            return
+        if not pts:
+            log(f"⚠️  [all] 启动期指纹自检：集合 {coll} 为空（尚未入库），跳过指纹比对（不阻断启动）")
+            return
+        # 分块指纹抽首点成立：一个集合只由一次 index 写成（新集合 + 原子切别名），集合内恒一。
+        index_fp = (pts[0].payload or {}).get(CHUNK_FINGERPRINT_FIELD)
+        try:
+            current_fp = _chunking_fingerprint(_sources_fingerprint(_document_paths()))
+        except Exception as exc:
+            current_fp = None
+            log(f"⚠️  [all] 启动期指纹自检：无法计算当前切分指纹，跳过分块比对（不阻断启动）: {type(exc).__name__}: {exc}")
+        if current_fp is not None:
+            # 行格式与 _check_chunk_freshness 的闸门日志**逐字同款**：ms_release.sh 用它轮询。
+            log(f"🔧 分块指纹: 索引={index_fp} / 当前={current_fp}（一致才放行检索）")
+            if index_fp != current_fp:
+                log("❌ [all] 分块指纹不一致：索引由另一份分块产物建成，检索闸门会 fail-closed 拒绝检索。"
+                    "处置：在有同一份语料/模型的环境重跑 python chatbot.py process && python chatbot.py index，"
+                    "重建产物后重新发布（禁止容器内自动修复）。")
+        # 词表指纹不抽首点：sparse 逐页原地更新，中断/跳页会留"已更新前缀 + 旧指纹后缀"，
+        # scroll 首点恒属已更新前缀 —— 抽样必过，混合态被静默放过（与闸门共用 _distinct_lexicon_ids）。
+        try:
+            lex_ids = _distinct_lexicon_ids(client, coll)
+            current_lex = lexicon_fingerprint(client)
+        except Exception as exc:
+            log(f"⚠️  [all] 启动期指纹自检：词表指纹读取失败，跳过（不阻断启动）: {type(exc).__name__}: {exc}")
+            return
+        if not lex_ids:
+            log(f"⚠️  [all] 启动期指纹自检：集合 {coll} 内没有词表指纹（空集合/旧索引），跳过词表比对")
+            return
+        if len(lex_ids) > 1:
+            log(f"🧮 词表指纹: 索引=混合{json.dumps(dict(lex_ids), ensure_ascii=False)} / 当前={current_lex}")
+            log("❌ [all] 集合内词表指纹混合（sparse 中断/跳页残留：已更新前缀 + 旧后缀，新旧稀疏向量正混同参与融合）。"
+                "处置：重跑 python chatbot.py sparse（或重建 index）后重新发布（禁止容器内自动修复）。")
+            return
+        index_lex = lex_ids[0][0]
+        log(f"🧮 词表指纹: 索引={index_lex} / 当前={current_lex}")
+        if index_lex != current_lex:
+            log("❌ [all] 词表指纹与索引不一致：稀疏通道词空间错配，召回会静默下降。"
+                "处置：重跑 python chatbot.py sparse 对齐后重新发布（禁止容器内自动修复）。")
+    except Exception as exc:
+        log(f"⚠️  [all] 启动期指纹自检异常（不影响服务）: {type(exc).__name__}: {exc}")
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
 def cmd_all(args=None):
     """单容器入口（ModelScope）：Qdrant + Ollama + Streamlit（+http 后端时的 infinity），
     带健康等待与自愈。
@@ -5370,6 +5572,7 @@ def cmd_all(args=None):
     """
     import signal
     import subprocess
+    import threading
     import time
 
     root = os.path.dirname(os.path.abspath(__file__))
@@ -5470,6 +5673,13 @@ def cmd_all(args=None):
     except OSError as exc:
         log(f"❌ [all] 应用启动失败: {type(exc).__name__}: {exc}")
         return 1
+
+    # 启动期指纹自检（只读、后台守护线程）：app 已 spawn（不拖慢 7860 首听），把检索闸门
+    # 那条 "🔧 分块指纹" 提前写进运行日志，供发布验收轮询；不一致只打 ❌ 不修数据、不退出
+    # 容器（启动期自动修复/复制 storage 是已否决方案）。异常只 warn，不变成新的故障源。
+    threading.Thread(
+        target=_startup_fingerprint_selfcheck, args=(env,), name="fingerprint-selfcheck", daemon=True,
+    ).start()
 
     if "infinity" in specs:
         import threading
@@ -6860,6 +7070,148 @@ def cmd_stages(args=None):
     return 1 if (stale or cd_unknown) else 0
 
 
+# ── 构建期/发布前：索引清单离线自检（verify-build）──────────────────────────
+def cmd_verify_build(args=None):
+    """构建期/发布前**离线**自检：index_manifest.json vs 当前代码/语料/模型（不连 Qdrant）。
+
+    为什么必须有这一道：镜像里只有产物（artifacts/、storage/），没有 chunks.json —— Docker
+    构建期无从判断"产物是否与当前代码/语料/模型同源"。远程部署实测就是带着
+    923236fe7e4acc7c 的旧索引指纹进了镜像，运行期闸门直到**首轮检索**才报错
+    （失效原型：坏产物静默进镜像，发布验收看不出来）。Dockerfile 里的
+        RUN ["python", "chatbot.py", "verify-build"]
+    让坏产物在**构建失败**时就停住；本地发布前也可以先跑一遍。
+
+    检查项（任何一项不一致 = 打 ❌ 并退出码 1；全绿只打一行 ✅）：
+      A 分块指纹：当前怎么算就怎么算（_document_paths + _sources_fingerprint +
+        _chunking_fingerprint），与清单记录值比对 —— 覆盖"语料 / 切分配置 / 切分代码 /
+        嵌入模型内容"四类漂移；
+      B 嵌入模型内容指纹：显式单列，给排障一个精确指向（它也是 A 的输入之一）；
+      C 词表指纹：用清单记录的 Qdrant 服务端版本离线重算（_lexicon_fingerprint_offline），
+        覆盖"别名表内容 / BM25 选项 / 编码链路源码 / Qdrant 版本"漂移；
+      D 集合目录：storage/collections/<清单 collection> 必须随镜像带上（别名模式下运行期
+        读的是别名指向的物理集合，目录缺失 = 镜像里没有这份索引）。别名映射读到才核对、
+        只告警不判死：Qdrant 别名文件格式随版本变化，不能当唯一判据；
+      E 产物同代（可选）：chunks.meta.json 存在时，其分块指纹必须与清单一致 —— 防
+        "process 之后没重跑 index"这种两代产物混进同一镜像。
+    全程只读、不建 QdrantClient、不写数据。
+    """
+    problems = []
+
+    def _bad(msg):
+        problems.append(msg)
+        log(f"  ❌ {msg}")
+
+    log("[verify-build] 离线自检：index_manifest vs 当前切分/词表/模型指纹（不连 Qdrant）")
+    try:
+        manifest = read_index_manifest()
+    except Exception as exc:
+        log(f"❌ verify-build 未通过: {type(exc).__name__}: {exc}")
+        return 1
+    log(f"  清单: 集合 {manifest.get('collection')}、{manifest.get('points')} 点、"
+        f"构建于 {manifest.get('built_at')}（build_id {str(manifest.get('build_id'))[:8]}）")
+
+    # A 分块指纹（与运行期闸门、build_chunks 调同一个函数：口径不可能分叉）
+    current_fp = None
+    try:
+        current_fp = _chunking_fingerprint(_sources_fingerprint(_document_paths()))
+    except Exception as exc:
+        _bad(f"无法计算当前切分指纹（镜像内语料/模型目录不可用？）: {type(exc).__name__}: {exc}")
+    if current_fp is not None:
+        manifest_fp = manifest.get("chunk_fingerprint")
+        log(f"  🔧 分块指纹: 索引={manifest_fp} / 当前={current_fp}（构建期闸门）")
+        if manifest_fp != current_fp:
+            _bad(
+                f"分块指纹不一致（索引 {manifest_fp} / 当前 {current_fp}）：镜像内语料、切分配置、"
+                f"切分代码或嵌入模型内容与建索引那一份不同源 —— 运行期闸门会在首轮检索拒绝检索。"
+                f"请在构建环境重跑 python chatbot.py process && python chatbot.py index 后再构建镜像"
+            )
+
+    # B 嵌入模型内容指纹（A 的输入之一，单列只为排障时一眼定位）
+    current_model = _model_content_fingerprint()
+    manifest_model = manifest.get("embed_model_content")
+    log(f"  🧬 模型内容指纹: 索引={manifest_model} / 当前={current_model}")
+    if current_model == _MODEL_CONTENT_UNKNOWN:
+        _bad(f"嵌入模型目录缺失或为空（{EMBED_MODEL_PATH!r}）：镜像里没有可用权重，切分指纹无从计算")
+    elif manifest_model != current_model:
+        _bad(
+            f"嵌入模型内容指纹不一致（索引 {manifest_model} / 当前 {current_model}）：同路径换了权重/"
+            f"增删了模型文件（如 1_Pooling 池化元文件），索引向量与当前模型不同源"
+        )
+
+    # C 词表指纹：服务端版本取清单记录值 → 完全不连 Qdrant 也能重算出同一个哈希
+    manifest_lex = manifest.get("lexicon_fingerprint")
+    server_version = manifest.get("qdrant_server")
+    if not server_version:
+        _bad("index_manifest 缺少 qdrant_server 字段（旧格式清单），无法离线重算词表指纹；请重跑 index")
+    else:
+        current_lex = _lexicon_fingerprint_offline(str(server_version))
+        log(f"  🧮 词表指纹: 索引={manifest_lex} / 当前={current_lex}"
+            f"（按清单记录的 Qdrant {server_version} 离线重算）")
+        if manifest_lex != current_lex:
+            _bad(
+                f"词表指纹不一致（索引 {manifest_lex} / 当前 {current_lex}）：别名表内容、BM25 选项、"
+                f"编码链路源码或 Qdrant 服务端版本变了 —— 稀疏通道词空间错配；"
+                f"重跑 python chatbot.py sparse（并确认 Qdrant 版本与建索引时一致）"
+            )
+
+    # D 集合目录：离线能看见的"索引本体"，storage 必须随镜像带上
+    coll = str(manifest.get("collection") or "").strip()
+    if not coll:
+        _bad("index_manifest 的 collection 字段为空，无法核对集合目录")
+    else:
+        coll_dir = os.path.join(_qdrant_storage_root(), "collections", coll)
+        if os.path.isdir(coll_dir):
+            log(f"  ✅ 集合目录: {coll_dir}")
+        else:
+            _bad(
+                f"集合目录不存在: {coll_dir} —— storage/ 没随镜像带上（或 .dockerignore/commit 漏掉），"
+                f"运行期 Qdrant 找不到清单记录的集合 {coll}"
+            )
+        # 别名映射（只告警不判死）：运行期 resolve_collection_name 优先读别名，但别名文件
+        # 格式随 Qdrant 版本变化，这里把它当"能读到才核对"的辅助判据，别让辅助判据变成
+        # 构建假失败的来源。
+        alias_file = os.path.join(_qdrant_storage_root(), "aliases", "data.json")
+        try:
+            with open(alias_file, encoding="utf-8") as f:
+                aliases = json.load(f)
+        except Exception as exc:
+            log(f"  ⚠️  读不到别名文件 {alias_file}（跳过别名核对）: {type(exc).__name__}: {exc}")
+        else:
+            target = aliases.get(COLLECTION_ALIAS) if isinstance(aliases, dict) else None
+            if target == coll:
+                log(f"  ✅ 别名 {COLLECTION_ALIAS} → {coll}")
+            else:
+                log(
+                    f"  ⚠️  别名 {COLLECTION_ALIAS} 实际指向 {target!r}，与清单集合 {coll} 不同："
+                    f"运行期按别名读集合，请核对 storage 是否与清单同一次构建"
+                )
+
+    # E 产物同代（可选）：meta 在 git 白名单里、镜像里通常有；有就核对，没有只告警
+    if os.path.exists(CHUNKS_META_JSON):
+        try:
+            with open(CHUNKS_META_JSON, encoding="utf-8") as f:
+                meta_fp = json.load(f).get("fingerprint")
+        except Exception as exc:
+            log(f"  ⚠️  读不到 {CHUNKS_META_JSON}（跳过产物同代核对）: {type(exc).__name__}: {exc}")
+        else:
+            if meta_fp != manifest.get("chunk_fingerprint"):
+                _bad(
+                    f"chunks.meta.json 的分块指纹 {meta_fp} 与 index_manifest 的 "
+                    f"{manifest.get('chunk_fingerprint')} 不同代（process 之后没重跑 index，或反之）："
+                    f"同一镜像里混进了两次构建的产物"
+                )
+            else:
+                log(f"  ✅ 产物同代: {CHUNKS_META_JSON} 与清单分块指纹一致")
+    else:
+        log(f"  ⚠️  {CHUNKS_META_JSON} 不存在（跳过产物同代核对）")
+
+    if problems:
+        log(f"❌ verify-build 未通过：{len(problems)} 项不一致（见上）—— 这份镜像不要发布")
+        return 1
+    log("✅ verify-build 通过：index_manifest 与当前代码/语料/模型同源（构建期闸门）")
+    return 0
+
+
 # ── 工具：离线检索评估（evaluate）────────────────────────────────────────────
 # 与 compare-chunks 同一套工具约定：参数上收 _build_parser，命令函数只持主流程。
 # 评估对象是**生产检索链路本身**（召回 → RRF → 父块去重 → 重排），不是纸面实现重写：
@@ -7062,7 +7414,7 @@ def cmd_evaluate(args=None):
 
 
 # ── 命令分发 ──
-COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "all": cmd_all, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "embedpairs": cmd_embedpairs, "stages": cmd_stages, "evaluate": cmd_evaluate, }
+COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "all": cmd_all, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "embedpairs": cmd_embedpairs, "stages": cmd_stages, "verify-build": cmd_verify_build, "evaluate": cmd_evaluate, }
 
 
 def _build_parser():
@@ -7075,7 +7427,7 @@ def _build_parser():
     """
     parser = argparse.ArgumentParser(prog="chatbot.py", add_help=False)
     subs = parser.add_subparsers(dest="command")
-    descriptions = {"compare-chunks": "分块结果 A/B 比较", "evaluate": "离线检索评估（不依赖 Ollama）", "embedpairs": "嵌入对拍探针：本地 torch vs http 服务（cos≥0.999 准入）"}
+    descriptions = {"compare-chunks": "分块结果 A/B 比较", "evaluate": "离线检索评估（不依赖 Ollama）", "embedpairs": "嵌入对拍探针：本地 torch vs http 服务（cos≥0.999 准入）", "verify-build": "构建期/发布前离线自检：index_manifest 与当前切分/词表/模型指纹（不连 Qdrant）"}
     for name in COMMANDS:
         sub = subs.add_parser(name, add_help=True, description=descriptions.get(name))
         if name == "compare-chunks":

@@ -28,6 +28,10 @@ artifacts/*
 !artifacts/chunks.meta.json
 !artifacts/gen_tokenizer
 !artifacts/gen_tokenizer/**
+# index 成功收尾写的发布清单（chunk_fingerprint / lexicon_id / 集合名 / 分块数）：容器构建期
+# verify-build 与 tools/ms_release.sh 都把它当唯一 EXPECTED_FP 来源，**必须入仓**。它与 storage/
+# 是同一次 index 的产物，一起发布才能根治"数据落后于应用"（2026-10-31 923/350 事故）。
+!artifacts/index_manifest.json
 corpus/
 *.pkl
 

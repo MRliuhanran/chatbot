@@ -65,7 +65,8 @@ open http://127.0.0.1:8501
 | `./start.sh logs` | `tail -F` Qdrant / Ollama / Streamlit 日志 |
 | `./start.sh serve` | 只前台起 Streamlit（调试） |
 | `./start.sh process` | 分块（等价 `python chatbot.py process`） |
-| `./start.sh index` | 建索引 |
+| `./start.sh index` | 建索引（成功收尾写 `artifacts/index_manifest.json`） |
+| `./start.sh verify-build` | 构建期防呆：校验 `artifacts/index_manifest.json` 的 `chunk_fingerprint` 与当前语料/切分配置现算指纹一致（不等退出非 0；Dockerfile 与发布脚本都调它） |
 | `./start.sh sparse` | 只重建稀疏向量（换词表后） |
 | `./start.sh stages` | 四阶段新鲜度检查，给出最小重跑命令 |
 | `./start.sh lexicon` | 词表自检 |
@@ -131,29 +132,35 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 - **index 成功收尾自动 GC**：换嵌入模型或改嵌入代码后，旧的 `code_key`/模型指纹缓存文件不再被
   任何一次运行读取，index 会顺手删掉它们（`*.tmp.npz` 中断残留照旧在起手时清）。不再手工删旧 npz。
 
+`artifacts/index_manifest.json` 是索引的**发布清单**：`index` 成功收尾（点数量不变量与别名切换都通过之后）写入 `chunk_fingerprint` / `lexicon_id` / 集合名 / 分块数 / 模型内容指纹 / Qdrant 服务端版本；`verify-build` 与发布脚本以它的 `chunk_fingerprint` 为**唯一 EXPECTED_FP 来源**。它与 `storage/`、`chunks.meta.json` 是同一次 index 的产物，必须一起入仓、一起进镜像——这是部署侧“数据落后于应用”事故的根治点（见 §7）。清单缺失/读不到 = 发布前置失败，不允许“没有清单就放行”。
+
 ## 7. ModelScope 部署：一个 Dockerfile
 
 本地运行 = 源文件 + start.sh；ModelScope 运行 = **一个 Dockerfile + 一个容器**。容器内 qdrant / ollama / streamlit 三进程由 `chatbot.py all` 管理（源码里的进程管理器）；**http 后端多托一个 infinity 作为第 4 进程**（2026-10-30 起 `.env=http/http`：应用层 pip 装 `infinity-emb[torch,server]==0.0.76` + `psutil` + `optimum==1.22.0`（bettertransformer 默认开，缺 optimum → acceleration.py NameError rc=3 起即崩）+ `click==8.1.8`（typer<0.13 的解析关）+ `torch==2.7.1` 锁本，并 COPY 补齐 bge-m3 缺失的 `1_Pooling/config.json` 池化元文件——缺它 ST 引擎把路径当 HF repo id 启即崩）。`cmd_all` 按 start.sh 同构 argv 编排：app 依赖就绪后立即放量（平台健康探测打 7860），infinity 就绪由后台线程两段式探测（health → embeddings+rerank 真打一发 ≤ `RAG_INFINITY_WAIT`），未就绪 fail-closed 退出交平台重启。不依赖 compose。
 
+**镜像分两层（2026-10-31 定案，指纹事故的根治）**：base 只放“重且不常变”的二进制与模型（qdrant/ollama、python 依赖、双检索模型权重、生成模型 GGUF）；`.env`/`start.sh`/`chatbot.py`/`1_Pooling` 与**全部可变数据**（`storage/`、`corpus/`、`lexicon/`、`qdrant_config/`、`artifacts/index_manifest.json` 及同代的 `artifacts/chunks.meta.json`）在同一次发布的应用层里一起 COPY，仓库是唯一事实源。此前 base 烤了 10-28 的旧 `storage/artifacts`、应用层却只换代码 → 数据永远落后于应用：2026-10-31 远程启动期分块指纹 `索引=923236fe7e4acc7c / 当前=3502968fe6f7039e` 不一致，检索闸门 fail-closed。可变数据随应用层发布后这个结构性缺口消失，另有构建期 `verify-build` 兜底。
+
 ### 7.1 Dockerfile 约束
 
-- 所有 `RUN` 都是 **exec form**：`RUN ["pip","install",...]`，不经过 `/bin/sh -c`；
+- 所有 `RUN` 都是 **exec form 单行 JSON 数组**：`RUN ["pip","install",...]`，不经过 `/bin/sh -c`。**每个 RUN 的 JSON 数组必须写在同一行**——魔搭 dockerfile parser 会把跨行续行当成独立指令（2026-10-31 23:27 场 parse error line 20 实证）；
 - 唯一入口：`ENTRYPOINT ["python","chatbot.py","all"]`（start.sh 只作为运行期模型下载器进镜像）；
 - qdrant / ollama 二进制直接从官方镜像 COPY，不在 Dockerfile 里下载/解压；
-- 应用层只做小 delta：COPY 三配置文件 + 补 COPY `models/bge-m3/1_Pooling/config.json`（191B 池化元文件，`.dockerignore` 白名单放行）+ RUN exec-form pip 装 infinity-emb/psutil/optimum/click/torch 锁定小包组；torch 重件留在 base；
+- 层顺序固定：**base → 应用文件（.env/start.sh/chatbot.py/池化元文件）→ pip RUN → 可变数据层 → verify-build**。数据 COPY 必须在 pip RUN 之后，改数据才不会重跑 16min 级依赖层；torch 重件留在 base；
+- 数据层先 `RUN ["rm","-rf","/app/storage","/app/corpus","/app/lexicon"]` 再 COPY：`COPY 目录` 是 merge 语义，不删会留下 base 旧 segment / 已删语料，容器内现算指纹与清单永远对不上；
+- 构建最后一步 `RUN ["python","chatbot.py","verify-build"]`：清单指纹 ≠ 现算指纹直接构建失败（fail-fast，不把问题留到运行期闸门）；
 - `HEALTHCHECK` 也是 exec form（`python -c ...`）。
 
 > pip 等包管理器内部仍会执行自己的脚本，但 Dockerfile 本身没有 shell 形式的命令行。
 
 ### 7.2 构建与运行
 
-**模型三层部署（2026-10-27 最快化定案）**：① 镜像层烤权重——`fetchmodels` stage 构建期拉魔搭 CDN，组级层缓存命中即零下载（`ARG MODELS_REV` 不变即命中）；② 持久盘 `/mnt/workspace` 暖 ollama blobs（重启零拷贝）；③ 运行期兜底 `cmd_all → _ensure_runtime_models`——镜像层/持久盘任一缺失才用 `start.sh fetch-models` 补齐（缺组才下、字节级幂等，绝不启动死循环）。Running 后约 12s 可用；只有双层尽失的极端场景才先下 4.9G。
+**模型三层部署（2026-10-27 最快化定案；属于 base 的构建期，日常发布不重跑）**：① 镜像层烤权重——`fetchmodels` stage 构建期拉魔搭 CDN，组级层缓存命中即零下载（`ARG MODELS_REV` 不变即命中）；② 持久盘 `/mnt/workspace` 暖 ollama blobs（重启零拷贝）；③ 运行期兜底 `cmd_all → _ensure_runtime_models`——镜像层/持久盘任一缺失才用 `start.sh fetch-models` 补齐（缺组才下、字节级幂等，绝不启动死循环）。Running 后启动期即打印 `🔧 分块指纹`（发布脚本轮询该行做验收，上限 300s，不再靠固定 sleep 猜）；只有双层尽失的极端场景才先下 4.9G。
 
 | 资产 | 来源 |
 |---|---|
 | 检索/重排模型 | 镜像层（与本地同文件清单、逐文件字节校验）；缺失时运行期 fetch-models 补 |
 | GGUF 生成模型 | 镜像层 `/app/ollama_models`；启动后 `ollama create`（manifest 落持久盘，重启零拷贝） |
-| `artifacts/` + `storage/` | 本地已建好的分块产物与 Qdrant 数据（保证指纹一致；`artifacts/chunks.json` 只服务本地重建，不出镜像） |
+| `storage/` + `corpus/` + `lexicon/` + `qdrant_config/` + `artifacts/index_manifest.json` + `artifacts/chunks.meta.json` | **应用层 COPY**（不再是 base 快照）：本地 process/index 的同一次产物，与清单同时进镜像，指纹天然同源；`chunks.meta.json` 还让构建期 verify-build 能核对“process 与 index 同代”；`artifacts/chunks.json` 只服务本地重建，不出镜像 |
 | `ollama_models/` | 可选复用宿主机 Ollama 模型：`-v ~/.ollama/models:/app/ollama_models:ro`；否则运行期把 GGUF 落 `OLLAMA_MODELS` 再 `ollama create` |
 
 ~~~bash
@@ -173,37 +180,62 @@ docker run --rm -p 7860:7860 rag-chatbot:modelscope
 
 ### 7.3 数据更新
 
-推荐与本地一致的路径：**本地 process/index → 重新 build 镜像 → 重新部署**，这样 `artifacts/` 与 `storage/` 始终同源。
+唯一推荐路径（数据与应用永远同源，根因修复的落地步骤）：
 
-也可以进入运行中的容器执行（注意 8G 档内存，重建期间会与生成/检索争内存）：
+~~~bash
+./start.sh start            # process/index 需要 Qdrant 在跑
+./start.sh process          # 语料/切分参数变了
+./start.sh index            # 模型/内容变了；成功收尾会写 artifacts/index_manifest.json
+./start.sh verify-build     # 本地先自检（镜像构建期、发布 preflight 还会各跑一次）
+./start.sh stop             # 必须：让 Qdrant 把 WAL 刷盘，避免把运行中的 storage 打进镜像
+# storage/ 在 .gitignore 里，新索引文件必须 -f；漏了它镜像里的索引还是旧快照
+git add -f storage
+git add artifacts/index_manifest.json artifacts/chunks.json artifacts/chunks.meta.json
+git commit -m "data: 重建索引并同步 index_manifest"
+bash tools/ms_release.sh    # preflight → push → 构建 → 运行日志验收
+~~~
+
+三道闸门用**同一个判据**：`index` 写的 `chunk_fingerprint`（清单）vs 当前语料/切分配置现算指纹。任何一处不一致都在本地/构建期 fail-fast，而不是上线后由检索闸门拒服务。2026-10-31 的 923/350 事故之所以能上到远程，就是因为旧结构里“数据在 base、代码在应用层”，两者根本没有同源校验。
+
+进入运行中的容器重建**只作应急**（改的是当次容器，下次发布仍回到镜像数据；且 8G 档会与生成/检索争内存）：
 
 ~~~bash
 docker exec -it <container> python chatbot.py process
 docker exec -it <container> python chatbot.py index
+docker exec -it <container> python chatbot.py verify-build
 docker exec -it <container> python chatbot.py stages
 ~~~
 
 ### 7.4 功能、性能、效果
 
-- **功能同源**：同一份 `chatbot.py`、`.env`、`artifacts/`、`storage/`；检索/生成模型与本地同一文件清单（运行期下载+字节校验）；没有 torch/http 或 CPU/GPU 的代码分叉。
+- **功能同源**：同一份 `chatbot.py`、`.env`、`storage/`、`corpus/`、`artifacts/index_manifest.json`（全部经应用层 COPY，且数据与清单来自同一次 index）；检索/生成模型与本地同一文件清单（运行期下载+字节校验）；没有 torch/http 或 CPU/GPU 的代码分叉。
 - **效果一致**：检索模型、重排模型、生成模型、切分/索引参数都相同，质量口径一致。
 - **性能不可能完全一致**：本地是 Metal/MPS，ModelScope 是 2vCPU 纯 CPU；重排、索引、首字延迟会明显慢于本机。这是硬件差异，不是代码差异。
 - 单容器 8G 档注意 `RAG_NUM_CTX`；OOM 时 `all` 会重启被杀的子进程（与本地 start.sh 的巡检语义一致）。
 
 ### 7.5 并行
 
-- **构建并行**：`pydeps`（依赖）、`fetchmodels`（烤模型）、`assets`（语料/产物）三个 stage 互不依赖并行执行，最终 `app` 合并。
+- **构建**：`pydeps`（依赖）/ `fetchmodels`（烤模型）/ `assets` 三个 stage 只在**重烤 base** 时并行；日常发布是单 stage 的应用层：应用文件 → pip RUN（命中缓存）→ 可变数据层 → verify-build，只重打数据层。
 - **运行并行**：`chatbot.py all` 先装载模型，再并行拉起 Qdrant 与 Ollama，健康后启动 Streamlit。
 
 ### 7.6 一键发布（tools/ms_release.sh）
 
 ~~~bash
-bash tools/ms_release.sh               # push(魔搭+GitHub) → deploy → 轮询 → 运行日志验收
-bash tools/ms_release.sh --verify-only # 只对当前运行日志做验收
-bash tools/ms_release.sh --no-deploy   # 只 push 不触发构建
+bash tools/ms_release.sh                  # preflight → push(魔搭+GitHub) → deploy → 轮询 → 运行日志验收
+bash tools/ms_release.sh --verify-only    # 只对当前运行日志做验收（不 push 不 deploy）
+bash tools/ms_release.sh --no-deploy      # preflight + 只 push 不触发构建
+bash tools/ms_release.sh --skip-preflight # 应急：跳过 preflight 全部闸门（EXPECTED_FP 仍尽量从清单取）
 ~~~
 
-验收判据与部署事故复盘同源：`🔧 分块指纹` 两侧一致；`📦 [模型装载]`/`[模型落位]` 行；无 `RuntimeError` 与 ❌ 新行（storage 运行时 churn 不挡发布）。构建超时默认自动重触发一次。
+**preflight（默认开）**：① 本机 Qdrant 仍在跑则拒绝发布（提示先 `./start.sh stop`，防止把正在写的 storage 打进镜像）；② `python chatbot.py verify-build` 失败即退出；③ 从 `artifacts/index_manifest.json` 取 `chunk_fingerprint` 作 `EXPECTED_FP`，取不到即退出；④ git 追踪完整性——清单必须已跟踪、`storage/` 新索引文件必须 `git add -f`（`git push` 只送已跟踪文件，漏了镜像还是旧 storage），否则拒绝发布。
+
+**Running 后验收（轮询运行日志，默认最多 300s / 每 10s；`VERIFY_TIMEOUT` / `VERIFY_INTERVAL` 可调）**：
+
+1. 必须见到启动期 `🔧 分块指纹: 索引=… / 当前=…`（`cmd_all` 启动即打）；**到点未见 = FAIL**（不再按“未见=ABSENT”放行），两侧必须相等且索引侧 = `EXPECTED_FP`；
+2. `📦 [模型装载]` / `[模型落位]` 行；
+3. 无 `RuntimeError`、无 `❌ [all]`（启动编排失败）；infinity 就绪行尽力检查；启动期 `🧮 词表指纹` 行仅记录不阻断。
+
+构建超时默认自动重触发一次；`storage` 运行时 churn 不挡发布。
 
 ## 8. 常见问题
 
