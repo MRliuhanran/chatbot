@@ -166,41 +166,50 @@ _preflight() {
   set -e
   printf '%s\n' "${vb_out}" | tail -n 20
   if [ "${vb_rc}" -ne 0 ]; then
-    if printf '%s\n' "${vb_out}" | grep -qE "invalid choice.*verify-build|unrecognized arguments|Unknown command"; then
-      echo "⚠️ preflight②: verify-build 子命令尚未落地（chatbot.py 由另一路改动中）——本次放行；"
-      echo "   落地后此闸门自动生效（FAIL 即拦截，不再需要 --skip-preflight）。"
-    else
-      echo "❌ preflight②: verify-build 失败（rc=${vb_rc}）——本地数据与清单指纹不一致，禁止发布。"
-      echo "   按 verify-build 提示重跑 ./start.sh process / ./start.sh index（index 成功收尾会重写清单），"
-      echo "   再 ./start.sh verify-build 直到通过。"
-      echo "   （若上面输出是命令不存在/依赖缺失而非指纹不一致：先同步代码与依赖；应急可 --skip-preflight，后果自担。）"
-      exit 1
-    fi
-  else
-    echo "   ✅ preflight②: verify-build 通过（清单指纹 == 本地现算指纹）"
+    echo "❌ preflight②: verify-build 失败（rc=${vb_rc}）——本地数据与清单指纹不一致，禁止发布。"
+    echo "   按 verify-build 提示重跑 ./start.sh process / ./start.sh index（index 成功收尾会重写清单），"
+    echo "   再 ./start.sh verify-build 直到通过。"
+    echo "   （若上面输出是命令不存在/依赖缺失而非指纹不一致：先同步代码与依赖；应急可 --skip-preflight，后果自担。）"
+    exit 1
   fi
+  echo "   ✅ preflight②: verify-build 通过（清单指纹 == 本地现算指纹）"
 
   # ③ EXPECTED_FP
   _load_expected_fp
 
-  # ④ git 追踪完整性：git push 只送已跟踪文件。清单没 add → 远端 Dockerfile COPY 直接缺文件；
-  #    storage/ 被 .gitignore 忽略 → 新 collection 文件不在推送里，镜像拿到的仍是旧 storage
-  #    （检索期闸门会以 923/350 拒服务，但那已经是构建之后了）。
-  if ! git ls-files --error-unmatch artifacts/index_manifest.json >/dev/null 2>&1; then
-    echo "❌ preflight④: artifacts/index_manifest.json 未入 git（push 不会带上它，Dockerfile COPY 会失败）"
-    echo "   先 git add artifacts/index_manifest.json 并提交。"
+  # ④ git 追踪完整性（git push 只送已跟踪文件）：
+  #    a) 发布清单/同代 meta 必须已跟踪 —— 否则远端 Dockerfile COPY 直接缺文件；
+  #    b) storage/、corpus/ 被 .gitignore 忽略 → **新增文件**普通 git add 收集不到，漏了
+  #       镜像拿到的仍是旧数据（检索期闸门以指纹不一致拒服务，但那是构建之后了）；
+  #    c) 已跟踪的数据文件被**就地改写**（commit 后又跑 sparse/index upsert）→ 磁盘状态与
+  #       push 出去的内容不一致，本地 verify-build 仍绿，远端才炸。git status 抓这一类。
+  local f
+  for f in artifacts/index_manifest.json artifacts/chunks.meta.json; do
+    if ! git ls-files --error-unmatch "${f}" >/dev/null 2>&1; then
+      echo "❌ preflight④: ${f} 未入 git（push 不会带上它，Dockerfile COPY 会失败）"
+      echo "   先 git add ${f} 并提交。"
+      exit 1
+    fi
+  done
+  local tracked_dirty
+  tracked_dirty="$(git status --porcelain -- storage corpus lexicon qdrant_config 2>/dev/null | head -n 5 || true)"
+  if [ -n "${tracked_dirty}" ]; then
+    echo "❌ preflight④: 已跟踪的数据文件有未提交改动（磁盘 ≠ push 内容）"
+    printf '%s\n' "${tracked_dirty}" | sed 's/^/   /'
+    echo "   典型原因：commit 之后又跑了 sparse/index（原地 upsert）或 qdrant 还在写。"
+    echo "   发布前：./start.sh stop → 重新 process/index（或 sparse）→ 提交数据改动再发。"
     exit 1
   fi
-  local untracked_storage
-  untracked_storage="$(git ls-files --others --ignored --exclude-standard -- storage 2>/dev/null | grep -vE '^storage/[.]deleted/|/wal/' | head -n 5 || true)"
-  if [ -n "${untracked_storage}" ]; then
-    echo "❌ preflight④: storage/ 有未入 git 的新文件（storage/ 被 .gitignore 忽略，普通 git add 收集不到）"
-    printf '%s\n' "${untracked_storage}" | sed 's/^/   /'
-    echo "   这些文件不会随 git push 进构建上下文 → 镜像里的索引仍是旧快照（923/350 事故重演）。"
-    echo "   发布前：git add -f storage 并提交（先 ./start.sh stop，别把运行中 churn 一起提交）。"
+  local untracked_data
+  untracked_data="$(git ls-files --others --ignored --exclude-standard -- storage corpus lexicon qdrant_config models/bge-m3/1_Pooling 2>/dev/null | grep -vE '^storage/[.]deleted/|/wal/' | head -n 5 || true)"
+  if [ -n "${untracked_data}" ]; then
+    echo "❌ preflight④: 可变数据里有未入 git 的新文件（被 .gitignore 忽略，普通 git add 收集不到）"
+    printf '%s\n' "${untracked_data}" | sed 's/^/   /'
+    echo "   这些文件不会随 git push 进构建上下文 → 镜像里的数据仍是旧快照（923/350 事故重演）。"
+    echo "   发布前：git add -f storage corpus（先 ./start.sh stop，别把运行中 churn 一起提交）。"
     exit 1
   fi
-  echo "   ✅ preflight④: chunk 清单已跟踪、storage 新文件已入 git"
+  echo "   ✅ preflight④: 清单/同代 meta 已跟踪、数据无未提交改动、无遗漏新文件"
 }
 
 if [ "${VERIFY_ONLY}" != "1" ]; then

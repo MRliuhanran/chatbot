@@ -145,7 +145,7 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 - 所有 `RUN` 都是 **exec form 单行 JSON 数组**：`RUN ["pip","install",...]`，不经过 `/bin/sh -c`。**每个 RUN 的 JSON 数组必须写在同一行**——魔搭 dockerfile parser 会把跨行续行当成独立指令（2026-10-31 23:27 场 parse error line 20 实证）；
 - 唯一入口：`ENTRYPOINT ["python","chatbot.py","all"]`（start.sh 只作为运行期模型下载器进镜像）；
 - qdrant / ollama 二进制直接从官方镜像 COPY，不在 Dockerfile 里下载/解压；
-- 层顺序固定：**base → 应用文件（.env/start.sh/chatbot.py/池化元文件）→ pip RUN → 可变数据层 → verify-build**。数据 COPY 必须在 pip RUN 之后，改数据才不会重跑 16min 级依赖层；torch 重件留在 base；
+- 层顺序固定：**base → pip RUN → 应用文件（.env/start.sh/chatbot.py/池化元文件）→ 可变数据层 → verify-build**。应用文件与数据 COPY 都在 pip RUN 之后：改代码/改数据都不会重跑 16min 级依赖层，日常发布只重打后三层；torch 重件留在 base；
 - 数据层先 `RUN ["rm","-rf","/app/storage","/app/corpus","/app/lexicon"]` 再 COPY：`COPY 目录` 是 merge 语义，不删会留下 base 旧 segment / 已删语料，容器内现算指纹与清单永远对不上；
 - 构建最后一步 `RUN ["python","chatbot.py","verify-build"]`：清单指纹 ≠ 现算指纹直接构建失败（fail-fast，不把问题留到运行期闸门）；
 - `HEALTHCHECK` 也是 exec form（`python -c ...`）。
@@ -215,7 +215,7 @@ docker exec -it <container> python chatbot.py stages
 
 ### 7.5 并行
 
-- **构建**：`pydeps`（依赖）/ `fetchmodels`（烤模型）/ `assets` 三个 stage 只在**重烤 base** 时并行；日常发布是单 stage 的应用层：应用文件 → pip RUN（命中缓存）→ 可变数据层 → verify-build，只重打数据层。
+- **构建**：`pydeps`（依赖）/ `fetchmodels`（烤模型）/ `assets` 三个 stage 只在**重烤 base** 时并行；日常发布是单 stage：pip RUN（命中缓存）→ 应用文件层 → 可变数据层 → verify-build，只重打应用+数据层（改代码也不重装依赖）。
 - **运行并行**：`chatbot.py all` 先装载模型，再并行拉起 Qdrant 与 Ollama，健康后启动 Streamlit。
 
 ### 7.6 一键发布（tools/ms_release.sh）

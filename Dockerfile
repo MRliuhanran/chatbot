@@ -18,13 +18,6 @@ ARG BASE_IMAGE=mshub-registry.cn-zhangjiakou.cr.aliyuncs.com/modelscope-repo/ind
 FROM ${BASE_IMAGE}
 
 WORKDIR /app
-COPY .env /app/.env
-COPY start.sh /app/start.sh
-COPY chatbot.py /app/chatbot.py
-# base 烤入层（10-28）的 bge-m3 缺 ST 池化元文件——modules.json 要求 1_Pooling/config.json，
-# 缺了 infinity 的 ST 引擎把模型路径当 HF repo id → HFValidationError，rc=3 启动即崩
-# （2026-10-31 本地实证）。应用层补 191B；将来重层换 base 时此覆盖幂等可留。
-COPY models/bge-m3/1_Pooling/config.json /app/models/bge-m3/1_Pooling/config.json
 
 # http 后端依赖，一句话三块：
 #   ① [torch,server]=infinity 引擎+HTTP 面板（typer<0.13 钉死 → 配套 click==8.1.8 防
@@ -40,6 +33,18 @@ COPY models/bge-m3/1_Pooling/config.json /app/models/bge-m3/1_Pooling/config.jso
 # ⚠️ 这一行是单行 exec-form JSON 数组，**不能跨行续写**：魔搭 dockerfile parser 会把续行当成
 #    独立指令（2026-10-31 23:27 场 parse error line 20 实证）。以下所有 RUN 同此约束。
 RUN ["pip", "install", "--no-cache-dir", "-i", "https://mirrors.aliyun.com/pypi/simple/", "infinity-emb[torch,server]==0.0.76", "psutil==7.0.0", "torch==2.7.1", "optimum==1.22.0", "click==8.1.8"]
+
+# ── 应用文件层（必须在 pip RUN 之后）：改 .env / chatbot.py / start.sh 不该让上面这条
+#    16min 级的依赖层缓存失效。2026-10-31 复核：旧顺序把 COPY .env/start.sh/chatbot.py
+#    放在 pip 之前，任何代码改动都会重装依赖；数据层本来就在 pip 之后，本次把应用文件也
+#    挪过来，日常发布 = 只重打「应用层 → 数据层 → verify-build」三层。──
+COPY .env /app/.env
+COPY start.sh /app/start.sh
+COPY chatbot.py /app/chatbot.py
+# base 烤入层（10-28）的 bge-m3 缺 ST 池化元文件——modules.json 要求 1_Pooling/config.json，
+# 缺了 infinity 的 ST 引擎把模型路径当 HF repo id → HFValidationError，rc=3 启动即崩
+# （2026-10-31 本地实证）。应用层补 191B；将来重层换 base 时此覆盖幂等可留。
+COPY models/bge-m3/1_Pooling/config.json /app/models/bge-m3/1_Pooling/config.json
 
 # ── 可变数据层（必须放在 pip RUN 之后：改数据只失效本层+verify 层，不重跑 16min 级依赖层）──
 # 先删 base 里的旧快照再 COPY：COPY 目录是 merge 语义（只覆盖同名文件，不删除源端没有的文件）。

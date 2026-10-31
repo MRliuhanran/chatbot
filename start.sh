@@ -10,7 +10,8 @@
 #   ./start.sh logs              tail -F 全部日志（含 infinity，若已起）
 #   ./start.sh serve             只起 Streamlit（前台，调试用）
 #   ./start.sh process           分块（python chatbot.py process）
-#   ./start.sh index             建索引
+#   ./start.sh index             建索引（成功收尾写 artifacts/index_manifest.json）
+#   ./start.sh verify-build      构建期/发布前离线自检（index 清单 vs 当前切分/词表/模型指纹）
 #   ./start.sh sparse            重建稀疏向量
 #   ./start.sh stages            四阶段新鲜度检查
 #   ./start.sh lexicon           词表自检
@@ -513,7 +514,7 @@ case "${1:-start}" in
         tail -F "${_tail_files[@]}"
         ;;
     serve)   _ensure_infinity; exec "${PY}" chatbot.py serve ;;
-    process|index|sparse|stages|lexicon|embedpairs|compare-chunks|evaluate)
+    process|index|verify-build|sparse|stages|lexicon|embedpairs|compare-chunks|evaluate)
         _cmd="${1}"; shift
         exec "${PY}" chatbot.py "${_cmd}" "$@"
         ;;
