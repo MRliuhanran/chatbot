@@ -95,6 +95,7 @@ open http://127.0.0.1:8501
 | `RAG_TOP_K` / `RAG_RECALL_LIMIT` | 返回条数 / 每通道召回深度（重排候选不截断） |
 | `RAG_LOGIN_ENABLED` / `RAG_LOGIN_IDLE_TTL_S` | 登录门开关（本地手机号模式，无第三方 IdP）/ 闲置过期秒数（默认 3600，每次使用顺延） |
 | `RAG_MEM_GUARD` / `RAG_MEM_KILL_PCT` | 内存熔断开关 / 触发水位（默认 95%：触线中止本轮，等同"停止生成"） |
+| `RAG_QDRANT_WAIT` | 容器启动期等 Qdrant `/healthz` 的预算秒数（默认 300；新数据层首启 + 2vCPU 冷载入实测超过旧 120s） |
 | `RAG_TURN_STATS` | 单轮台账（排查性能时临时开） |
 | `RAG_BUILD_STATS` / `RAG_BUILD_STATS_FILE` | 构建台账（默认开；每轮 process/index/sparse 成功收尾各一行）/ 落盘路径（默认 `artifacts/builds.jsonl`） |
 
@@ -154,7 +155,7 @@ L6 Streamlit UI（唯一 import streamlit 的层）
 
 ### 7.2 构建与运行
 
-**模型三层部署（2026-10-27 最快化定案；属于 base 的构建期，日常发布不重跑）**：① 镜像层烤权重——`fetchmodels` stage 构建期拉魔搭 CDN，组级层缓存命中即零下载（`ARG MODELS_REV` 不变即命中）；② 持久盘 `/mnt/workspace` 暖 ollama blobs（重启零拷贝）；③ 运行期兜底 `cmd_all → _ensure_runtime_models`——镜像层/持久盘任一缺失才用 `start.sh fetch-models` 补齐（缺组才下、字节级幂等，绝不启动死循环）。Running 后启动期即打印 `🔧 分块指纹`（发布脚本轮询该行做验收，上限 300s，不再靠固定 sleep 猜）；只有双层尽失的极端场景才先下 4.9G。
+**模型三层部署（2026-10-27 最快化定案；属于 base 的构建期，日常发布不重跑）**：① 镜像层烤权重——`fetchmodels` stage 构建期拉魔搭 CDN，组级层缓存命中即零下载（`ARG MODELS_REV` 不变即命中）；② 持久盘 `/mnt/workspace` 暖 ollama blobs（重启零拷贝）；③ 运行期兜底 `cmd_all → _ensure_runtime_models`——镜像层/持久盘任一缺失才用 `start.sh fetch-models` 补齐（缺组才下、字节级幂等，绝不启动死循环）。Running 后启动期即打印 `🔧 分块指纹`（发布脚本轮询该行做验收，上限 300s，不再靠固定 sleep 猜）；只有双层尽失的极端场景才先下 4.9G。启动编排在 2026-10-31 远程 DeployFailed 后加固：**app 在依赖就绪前就 spawn**（7860 先监听，不占部署探测窗口；检索仍由指纹/词表闸门和依赖就绪门兜底），Qdrant 冷载入预算提到 `RAG_QDRANT_WAIT`（默认 300s），且 `_wait_http_ready` 会检测子进程提前退出并立刻归因，不再把「进程崩了」混进「载入慢」。
 
 | 资产 | 来源 |
 |---|---|

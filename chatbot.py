@@ -5107,13 +5107,25 @@ def _http_ready(url, timeout=1.0):
         return False
 
 
-def _wait_http_ready(name, url, timeout):
+def _wait_http_ready(name, url, timeout, proc=None):
+    """等子进程的 HTTP 就绪；可选传 proc 做**存活探测**。
+
+    proc 存在且已退出 = "永远不会就绪"：继续空等满 timeout 只会把真实死因（端口未监听、
+    进程崩了）混进超时话术里（2026-10-31 远程 DeployFailed 现场就是这样：qdrant 120s 未
+    就绪行把"进程启动期挂住/退出"与"载入慢"混成一句，二义性让人无法定向）。提前退出留
+    rc 给日志，超时与否都给出可行动的归因。
+    """
     import time
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _http_ready(url):
             log(f"[all] {name} 就绪: {url}")
             return True
+        if proc is not None:
+            rc = proc.poll()
+            if rc is not None:
+                log(f"⚠️  [all] {name} 进程已退出（rc={rc}），不再等待: {url}")
+                return False
         time.sleep(1)
     log(f"⚠️  [all] {name} {timeout}s 未就绪: {url}")
     return False
@@ -5644,12 +5656,24 @@ def cmd_all(args=None):
         if "infinity" in specs:
             # 早于 qdrant/ollama 的健康等待 spawn：torch 冷加载是启动最慢项，与它们并行。
             spawn("infinity")
+        # ⚠️ 平台部署健康探测直接打 7860：app **在依赖就绪前就 spawn**（2026-10-31
+        # 远程 DeployFailed 后的加固）。数据层随应用层入镜像后，qdrant 首启要载入新 collection，
+        # 2vCPU 冷载入可能远超旧的 120s；若等它就绪再起 app，7860 窗口会被拖到平台探测
+        # 之外（历史 23:53 场 DeployFailed 同型）。app 监听只需要端口，检索侧由运行期指纹
+        # 闸门与 qdrant/ollama 就绪门共同兜底：就绪门失败仍会退役容器。
+        spawn("app")
     except OSError as exc:
         log(f"❌ [all] 子进程启动失败: {type(exc).__name__}: {exc}")
         return 1
 
-    qdrant_ok = _wait_http_ready("qdrant", "http://127.0.0.1:6333/healthz", 120)
-    ollama_ok = _wait_http_ready("ollama", "http://127.0.0.1:11434/api/version", 120)
+    # qdrant 冷载入预算：RAG_QDRANT_WAIT（默认 300s，旧值 120s 在"新数据层首启 + 2vCPU"
+    # 场景被实证不够）。超时仍失败 → 退役容器；进程提前退出则立刻归因（见 _wait_http_ready）。
+    try:
+        _qd_wait = max(30, int((env.get("RAG_QDRANT_WAIT") or "300").strip() or "300"))
+    except ValueError:
+        _qd_wait = 300
+    qdrant_ok = _wait_http_ready("qdrant", "http://127.0.0.1:6333/healthz", _qd_wait, proc=children.get("qdrant"))
+    ollama_ok = _wait_http_ready("ollama", "http://127.0.0.1:11434/api/version", 120, proc=children.get("ollama"))
     if not (qdrant_ok and ollama_ok):
         for process in children.values():
             process.terminate()
@@ -5660,18 +5684,6 @@ def cmd_all(args=None):
         for process in children.values():
             process.terminate()
         log("❌ [all] Ollama 模型不可用，容器退出")
-        return 1
-
-    try:
-        # ⚠️ 平台部署健康探测直接打 7860：app 必须尽早监听，不能押在 infinity 就绪
-        # 之后——旧阻塞版把 7860 首听拖到 torch 双模型冷加载完成（2vCPU 数分钟），
-        # 恰好撞进部署探测窗口（23:53 场 DeployFailed、运行日志 0 行的头号嫌疑）。
-        # 改法：qdrant/ollama 就绪 → 立即放量 app（探测窗口内 7860 在线）；infinity
-        # 的就绪确认挪到后台线程（fail-loud：判定检索侧不可用就自尽容器交平台重启，
-        # 日志留 ❌ [all] 行让它被验收抓到）。
-        spawn("app")
-    except OSError as exc:
-        log(f"❌ [all] 应用启动失败: {type(exc).__name__}: {exc}")
         return 1
 
     # 启动期指纹自检（只读、后台守护线程）：app 已 spawn（不拖慢 7860 首听），把检索闸门
