@@ -787,53 +787,87 @@ def _chat_options(temperature=None, num_ctx=None, num_predict=None):
         "seed": int(GEN_SEED),
     }
     # num_gpu 只在这里组装（**必须在 options 里**，顶层同名字段 Ollama 不认）：
-    # 取"生效值"而不是原始模式串 —— auto 模式下生效值是 999，回落之后是 None。
-    _ng = _gen_num_gpu_effective()
+    # 值 = _gen_gpu_branch（auto=None 不发/引擎自调；人工档=显式值），运行期恒定。
+    _ng = _gen_gpu_branch()["num_gpu"]
     if _ng is not None:
         opts["num_gpu"] = _ng
     return opts
 
 
-# GPU 优先/回落的进程内状态（RAG_GEN_NUM_GPU=auto）。回落是**一次性**的：一旦确认这台机器
-# 起不来 GPU，本进程内所有后续请求都不再尝试，避免每次问答都白等一次失败。
-GEN_AUTO_NUM_GPU = 999
-_GEN_GPU_LOCK = threading.Lock()
-_GEN_GPU_STATE = {"fallback": False}
+# ── 算力自调：把"GPU/CPU 怎么分"整体交给 llama.cpp（组件自调，应用零经验判断）──
+# num_gpu 的语义（Ollama options，即 llama.cpp 的 n_gpu_layers）= 要塞进 GPU 的层数，是
+# **强制指令**：999 只是"比层数都大的哨兵"→ 全 GPU（装不下= OOM 报错，不是 spill）。
+# **动态自调是它的另一端：不发该字段（服务端默认 -1）**——llama.cpp 原生算法就是：
+# GPU 优先逐层装满显存（KV 按层跟随），装不下的层整层 spill 到 CPU；应用不做任何估算。
+# 历史教训（不再作为默认依据）：某 65k KV 档实测自调把 47% 的层留在 CPU——那台机器后
+# 若确认显存实则够用，由操作者显式设 999 验证/修正（人工逃生门，不是默认经验）。
+# 应用只需保证"绝不把 999 误发给纯 CPU 机器"（= 必然失败的初始化/白付一次请求延迟）：
+# auto 恒不发字段，CPU 机器与 GPU 机器由引擎同一行为自然覆盖。检测（_detect_gen_device）
+# 仅为 [gen-gpu] 日志的观测标记——行为分支不复存在。换分层=换 kernel（Metal vs CPU BLAS
+# 浮点累加顺序不同），运行期档位不翻转：自调是服务端在加载时一次定死的，中途不变。
+_GPU_DETECTED = None
+_GPU_DETECT_LOCK = threading.Lock()
 
 
-def _gen_num_gpu_effective():
-    """本次请求要发的 num_gpu；None = 不发该字段（交给 llama.cpp，纯 CPU 机上即全 CPU）。"""
-    if GEN_NUM_GPU == "auto":
-        with _GEN_GPU_LOCK:
-            if _GEN_GPU_STATE["fallback"]:
-                return None
-        return GEN_AUTO_NUM_GPU
-    return GEN_NUM_GPU
+def _detect_gen_device():
+    """环境 GPU 检测：'nvidia' / 'mps' / None。判不出就 None（宁可 CPU 档，不误报 GPU）。
 
-
-def _gen_gpu_fallback(reason):
-    """auto 模式：把 num_gpu 永久降级为"不发该字段"（进程内一次翻转，不再复位）。
-    返回 True 表示**本请求可以**用 CPU 配置重发一次 —— 首败线程翻转成功，或翻转已经
-   发生过（并发的第二个失败者：它的 ['fallback'] 已为 True 查到的是别人的翻转，但本
-    请求的失败同样源自同一个尚未回落的设备状态，也要给重试机会才不至于"并发首问必
-   有一问直接报错"）。非 auto 或非设备类失败返回 False。
+    判据刻意按"零成本优先"排序：nvidia-smi 醒着（Linux/Windows 的 CUDA 必随驱动同装）
+    直接定档；macOS 用 torch.backends.mps 判 Metal；Linux 没有 nvidia-smi 即判纯 CPU，
+    **不 import torch**——检测在 CPU 容器上零开销。
     """
-    if GEN_NUM_GPU != "auto":
-        return False
-    # ★ 只认**设备类**失败：旧判据是"任何非 200"，于是容器冷启动时模型还在后台拉取的那个
-    #   404、或一次 503，就能把 GPU 机器此后所有请求永久降级为自动分层（.env 自述 65536 档
-    #   要求 RAG_GEN_NUM_GPU=999，自动分层实测 47% 的层掉 CPU），日志还把它归因成
-    #   "生成侧 GPU 不可用"——归因错误 + 跨轮次持久污染（无复位路径）。
-    _DEVICE_HINTS = ("cuda", "out of memory", "oom", "device", "gpu", "metal", "mps", "vram", "insufficient memory")
-    if not any(_k in reason.lower() for _k in _DEVICE_HINTS):
-        log(f"⚠️  生成失败但不像设备问题（{reason}）：保持 num_gpu 不变，不做 GPU 回落")
-        return False
-    with _GEN_GPU_LOCK:
-        _was_first_fall = not _GEN_GPU_STATE["fallback"]
-        _GEN_GPU_STATE["fallback"] = True
-    if _was_first_fall:
-        log(f"⚠️  生成侧 GPU 不可用（{reason}）→ RAG_GEN_NUM_GPU=auto 回落为 CPU，本进程内不再尝试 GPU")
-    return True
+    import shutil
+    import subprocess
+    import sys
+    if shutil.which("nvidia-smi"):
+        try:
+            probe = subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=5, check=False)
+        except Exception:
+            return None
+        return "nvidia" if probe.returncode == 0 else None
+    if sys.platform == "darwin":
+        try:
+            import torch
+            return "mps" if torch.backends.mps.is_available() else None
+        except Exception:
+            return None
+    return None
+
+
+# 检测结果 → 分档标签的**字典映射**（不是 if-else 链）：新增设备类型只加一行。
+# auto（现在）对所有检测结果动作一致：num_gpu=None（不发字段，引擎自调）；差异只在
+# 日志标签。若未来需要"某设备再显式发值"，改这一行数据即可，不改逻辑。
+_GPU_BRANCH_TABLE = {
+    "nvidia": {"name": "nvidia（引擎自调：GPU 优先装满，不足层 spill 到 CPU）", "num_gpu": None},
+    "cuda":   {"name": "cuda（引擎自调：GPU 优先装满，不足层 spill 到 CPU）",   "num_gpu": None},
+    "mps":    {"name": "mps/metal（引擎自调：统一内存由 Metal 自管）",        "num_gpu": None},
+    None:     {"name": "cpu（无 GPU，纯 CPU）",                                   "num_gpu": None},
+}
+
+
+def _gen_gpu_branch():
+    """本次进程的生成分档（进程内恒定、自缓存一次）：{"name": 可读名, "num_gpu": 要发的值}。
+
+    显式 RAG_GEN_NUM_GPU（0/-1/999/整数）= 人工逃生门：值原样进请求（999=强制全 GPU，
+    装不下报错；0=全 CPU）。auto（默认）= 组件自调：num_gpu 恒为 None（不发字段），
+    llama.cpp/GPU 后端自己逐层装满显存、不足 spill 到 CPU——应用不做经验估算。
+    请求路径只读字典；检测+日志只在首个调用点发生一次，运行期档位不翻转
+    （服务端加载时一次定死，中途无翻转分支）。
+    """
+    global _GPU_DETECTED
+    if _GPU_DETECTED is None:
+        with _GPU_DETECT_LOCK:
+            if _GPU_DETECTED is None:
+                if GEN_NUM_GPU in ("auto", None):   # 空值与 auto 同义（都不发字段，见 .env 注释）
+                    _detected = _detect_gen_device()   # 只检测一次：nvidia-smi 只跑一发，日志与行为同源
+                    _GPU_DETECTED = _GPU_BRANCH_TABLE[_detected]
+                    log(f"[gen-gpu] 检测环境: {_detected!r}"
+                        f"（auto = 不发 num_gpu，引擎自调：GPU 优先装满、不足层 spill 到 CPU）")
+                else:
+                    _GPU_DETECTED = {"name": f"manual (num_gpu={GEN_NUM_GPU})", "num_gpu": GEN_NUM_GPU}
+                    log(f"[gen-gpu] 生成分档: {_GPU_DETECTED['name']}"
+                        f"（人工档位，运行期恒定）")
+    return _GPU_DETECTED
 
 
 # ── 内存熔断：唯一的水位判定（2026-10-28 定稿）────────────────────────────────
@@ -912,13 +946,8 @@ def stream_chat(messages, *, temperature=None, num_ctx=None, num_predict=None, t
         # 连接阶段始终有闸（Ollama 没起/端口不通要快速暴露），输出阶段按配置可以无限等。
         _read_timeout = STREAM_READ_TIMEOUT if STREAM_READ_TIMEOUT > 0 else None
         r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, _read_timeout), )
-        if r.status_code != 200 and _gen_gpu_fallback(f"HTTP {r.status_code} {r.text[:160]!r}"):
-            # auto 模式 + 本进程首次：去掉 num_gpu 重发一次。此刻**尚未产出任何 token**
-            # （流都还没开始读），所以不构成"生成重试"，没有任何已生成内容被丢弃。
-            # options 重新组装（而不是就地 pop）：回落状态已翻转，_chat_options 自然不再放 num_gpu。
-            r.close()
-            payload["options"] = _chat_options(temperature, num_ctx, num_predict)
-            r = _ollama_session().post( API_URL, json=payload, stream=True, timeout=(10.0, _read_timeout), )
+        # 不做"设备类失败 → 换 CPU 档重发"：分档由 _gen_gpu_branch 启动期定死，请求期
+        # 既不检测也不翻转（那是兼容旧行为里"白试一次失败才收敛"的浪费延迟路径）。
         if r.status_code != 200:
             yield EVENT_ERROR, f"HTTP {r.status_code} {r.text[:300]}"
             return
@@ -1079,14 +1108,12 @@ RERANK_MODEL_NAME = (os.getenv("RAG_RERANK_MODEL_NAME") or "bge-reranker-v2-m3")
 # 熔断没追上（采样滞后 / 瞬时分配）而被 OOM kill 时，仍由 entrypoint 进程级巡检就地重启。
 # RAG_PRELOAD=0 仍表示启动不预热（懒加载，进程自身行为，与编排无关）。
 # 生成模型的 GPU 层数（llama.cpp 的 -ngl，Ollama 暴露为 options.num_gpu）：
-#   空    = 不发该字段，由 llama.cpp 按**当时**可用显存自动分层（改造前的默认行为）
-#   0     = 全 CPU
-#   999   = 全 GPU（固定档，不回落）
-#   auto  = **GPU 优先、起不来回落 CPU**：先按 999 发；若首个请求在**产出任何 token 之前**
-#           失败（HTTP 非 200），去掉该字段重发一次，并在**本进程内**记住、之后不再尝试 GPU。
-#           这是"设备不可用"的启动级回落，不是"生成失败重试"——它发生在零 token 产出之前，
-#           不会丢弃任何已生成内容（生成仍然无长度/时间闸、不重试）。同一份 .env 因此在
-#           本地（Metal）与纯 CPU 容器（魔搭）都能用。
+#   空/auto = 不发该字段，全权交给 llama.cpp 原生动态分层：GPU 优先逐层装满显存
+#             （KV 按层跟随），装不下的层整层 spill 到 CPU——组件自调，应用零经验判断。
+#             [gen-gpu] 日志里的设备检测只作观测标签，不参与行为决策（有无 GPU 同语义）。
+#   0       = 全 CPU
+#   999     = 强制全 GPU（固定档；装不下=显式报错，不是 spill——人工逃生门）
+#   -1      = 与空/auto 等效（服务端把 -1 解释为自动）
 # **只改"谁来算"，不改数值**；但换分层 = 换 kernel（Metal vs CPU BLAS），浮点累加顺序不同，
 # 贪心解码的长答案可能不再逐字可复现 —— 要严格复现就把档位固定住、不要每轮变。
 _gpu_raw = (os.getenv("RAG_GEN_NUM_GPU") or "").strip()
@@ -1098,7 +1125,7 @@ if _gpu_raw:
         try:
             GEN_NUM_GPU = int(_gpu_raw)
         except ValueError:
-            raise ValueError(f"RAG_GEN_NUM_GPU 必须是整数或 auto（空=自动分层、0=全 CPU、999=全 GPU、auto=GPU 优先失败回落），收到 {_gpu_raw!r}") from None
+            raise ValueError(f"RAG_GEN_NUM_GPU 必须是整数或 auto（空/auto=引擎自调、0=全 CPU、999=强制全 GPU），收到 {_gpu_raw!r}") from None
         if GEN_NUM_GPU < -1:
             raise ValueError(f"RAG_GEN_NUM_GPU 不能小于 -1（-1=自动），收到 {GEN_NUM_GPU}")
 CHILD_MAX_TOKENS = env_int_min("RAG_CHILD_MAX_TOKENS", 128, 1)
@@ -2776,10 +2803,10 @@ def _gc_embed_cache_tmp():
 # 同一客户端上两个线程同时走同名 Document 就会互相 drain，实测
 # IndexError: pop from empty list（另一批表现为 422 "dense vector must not be empty"）。
 # 触发点是任何带 Document 的请求。
-# 这里只解决"多个线程共用同一个 client"的场景（检索侧双通道的稀疏分支，见
-# dual_channel_recall._sparse）；写批走 per-worker client（每个线程一份推理器），
-# 因此**不**在这把锁里 —— 否则 HTTP 往返会被串行化，4 路写批退化成 1 路。
-_QDRANT_INFERENCE_LOCK = threading.Lock()
+# 解法自始至终都是**结构化隔离而不是加锁**（锁跨 HTTP 往返 = 全局排队，与并行目标相反）：
+#   写批 → per-worker client（每个线程一份推理器，build_index/_reindex）；
+#   检索 → 会话线程专属 client（RAGEngine._sparse_client，同一既验证模式）。
+# 曾经的模块级 _QDRANT_INFERENCE_LOCK 已随"稀疏召回客户端专用化"整体删除。
 
 
 def _upsert_batch_with_retry(client: Any, collection_name: str, points: list, retries: int = 1) -> str | None:
@@ -2787,9 +2814,9 @@ def _upsert_batch_with_retry(client: Any, collection_name: str, points: list, re
     继续写只为更快暴露完整失败面 —— 末尾 write_failures 非空一律 raise、不切别名，旧集合继续服务。
     重试不睡眠：写批已并发发出，等待只会占住 worker 槽；瞬时故障立即重发反而更快。
 
-    **不持 _QDRANT_INFERENCE_LOCK**：调用方（build_index 的写批）给每个 worker 线程一个
-    自己的 client，Document 的本地拆包天然不会跨线程；在这里持锁会把 HTTP 往返也串行化，
-    4 路写批退化成 1 路（注释宣称的并发不存在）。持锁版留给共用同一 client 的调用点。"""
+    本函数不属于任何锁的临界区：调用方（build_index 的写批）给每个 worker 线程一个
+    自己的 client，Document 的本地拆包天然不会跨线程；共享 client 上包 HTTP 往返的
+    模块锁会让 4 路写批退化成 1 路，那条路已被"客户端专用化"取代——不存在了。"""
     last: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -3416,12 +3443,10 @@ def _qdrant_dense_hits(client, collection, dense_query, limit, query_filter=None
 
 
 def _qdrant_sparse_hits(client, collection, sparse_query, limit, query_filter=None, with_payload=False):
-    # 本地推理器（qdrant-client 的 ModelEmbedder）每客户端一份且内部无锁：带 Document 的
-    # 请求必须串行，否则并发时 pop(0) 竞争 -> IndexError，或两份 Document 互换（稀疏查询
-    # 拿另一路提问的文本去打分）。写入口早有这把锁，检索侧这条一直裸跑；失败又被
-    # tolerate_sparse_error 吞成"退化为纯稠密"、页面无提示（静默丢召回）。
-    with _QDRANT_INFERENCE_LOCK:
-        return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
+    # 带 Document 的请求里含本地 BM25 推理（每客户端一份、内部无锁）：client 必须是
+    # **调用方所属会话线程专属**（RAGEngine._sparse_client）——推理/缓冲天然线程私有，
+    # 不共享即无竞态，并发召回之间既无锁也无排队（原全局锁已随客户端专用化删除）。
+    return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
 
 
 def _sparse_recall_note(exc, sparse_query):
@@ -3429,18 +3454,22 @@ def _sparse_recall_note(exc, sparse_query):
     return f"稀疏通道召回失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；分词 {term_count} 个 term"
 
 
-def dual_channel_recall(client, collection, dense_query, sparse_query, limit, query_filter=None, with_payload=False, tolerate_sparse_error=False, use_dense=True, use_sparse=True):
+def dual_channel_recall(client, collection, dense_query, sparse_query, limit, query_filter=None, with_payload=False, tolerate_sparse_error=False, use_dense=True, use_sparse=True, sparse_client=None):
     from concurrent.futures import ThreadPoolExecutor
     dense_hits = []
 
     if not use_sparse:
         return (_qdrant_dense_hits(client, collection, dense_query, limit, query_filter, with_payload) if use_dense else []), [], ""
     sparse_hits = []
+    # 稀疏通道必须传专属 client（带 Document 的本地推理私有于线程）；None 一律视为违约，
+    # 当场报错而不是静默降级成共用 client（那会重现跨线程 drain —— 静默丢召回）。
+    if sparse_client is None:
+        raise RuntimeError("dual_channel_recall 需要专属稀疏 client（sparse_client），见 RAGEngine._sparse_client")
 
     # 双通道并发：两个 Qdrant 往返并行发，墙钟 = max(dense, sparse) 而非和。
     with ThreadPoolExecutor(max_workers=2) as pool:
         future_dense = pool.submit(_qdrant_dense_hits, client, collection, dense_query, limit, query_filter, with_payload) if use_dense else None
-        future_sparse = pool.submit(_qdrant_sparse_hits, client, collection, sparse_query, limit, query_filter, with_payload)
+        future_sparse = pool.submit(_qdrant_sparse_hits, sparse_client, collection, sparse_query, limit, query_filter, with_payload)
         if future_dense is not None:
             dense_hits = future_dense.result()
         try:
@@ -4289,6 +4318,7 @@ class RAGEngine:
         self._lexicon_checked = False
         self._chunk_fp_checked = False
         self._chunk_fp_logged = False  # 首次指纹比对留痕一次（部署后从日志即可判"产物是否同源"）
+        self._qdrant_sparse_tls = threading.local()   # 稀疏召回的会话线程专属 client（见 _sparse_client）
         # 加载（懒初始化）与推理分开两把锁：加载慢、推理短，共用一把会拖慢并发查询。
         # 查询侧前向/rerank 用推理锁串行（MPS 单模型不做真并行），加载持初始化锁。
         self._model_init_lock = threading.Lock()
@@ -4313,6 +4343,20 @@ class RAGEngine:
                     from qdrant_client import QdrantClient
                     self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT, )
         return self._client
+    def _sparse_client(self):
+        """稀疏召回专属 client：**每会话线程一份**（threading.local，同 _ollama_session 模式）。
+
+        带 Document 的 qdrant 请求含客户端本地推理（ModelEmbedder，每 client 一份、无锁）：
+        共用一份 = 并发串行化或互相 drain（IndexError/422）。每线程各自一份后：
+        本地推理/缓冲天然线程私有，稀疏召回之间零锁零排队（原 _QDRANT_INFERENCE_LOCK
+        已删除）。查询/稠密共用 self._client 不受影响——裸向量 query 不含本地推理。
+        """
+        c = getattr(self._qdrant_sparse_tls, "client", None)
+        if c is None:
+            from qdrant_client import QdrantClient
+            c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+            self._qdrant_sparse_tls.client = c
+        return c
     def _resolve_collection(self):
         self._collection_name = resolve_collection_name(self._get_client())
         return self._collection_name
@@ -4545,7 +4589,7 @@ class RAGEngine:
             # 墙钟收益。qdrant-client 能做的尽量交给 client（payload 随查询返回即是一例）。
             with ThreadPoolExecutor(max_workers=1) as pool:
                 sparse_future = pool.submit(
-                    _qdrant_sparse_hits, client, collection, sparse_query, RECALL_LIMIT, query_filter, True,
+                    _qdrant_sparse_hits, self._sparse_client(), collection, sparse_query, RECALL_LIMIT, query_filter, True,
                 )
                 dense_query = self._embedding_backend.embed_query(query)
                 dense_hits = _qdrant_dense_hits(client, collection, dense_query, RECALL_LIMIT, query_filter, True)
@@ -4556,7 +4600,7 @@ class RAGEngine:
         else:
             if RRF_DENSE_WEIGHT:
                 dense_query = self._embedding_backend.embed_query(query)
-            dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, with_payload=True, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, )
+            dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, with_payload=True, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, sparse_client=self._sparse_client(), )
         if note:
             _degraded(steps, note)
         _t0_fuse = time.perf_counter()
@@ -5883,9 +5927,15 @@ def _is_connection(low: str) -> bool:
     return "econnrefused" in low or "connection" in low or "timed out" in low
 
 
+def _is_device_failure(low: str) -> bool:
+    return any(k in low for k in ("cuda", "metal", "mps", "vram", "gpu", "device", "insufficient memory"))
+
+
 _GEN_FAILURE_HINTS = (
     (_is_missing_model,
      "生成模型不在 Ollama 里：看运行日志的 [entrypoint] 拉取行（后台拉取期间问答都会失败，拉完自动恢复）"),
+    (_is_device_failure,
+     "算力档位与设备实际能力不匹配（auto 不发该字段，此项多为显式 999/整数档跑不动）：改回 RAG_GEN_NUM_GPU=auto 让引擎自调，或 0 关回 CPU；驱动/显存问题则先修驱动"),
     (_is_oom,
      "生成进程被系统杀掉（内存超限）：看运行日志的 [entrypoint] [mem] 观测行；窗口已动态用满模型原生上限，持续 OOM 只能升级内存或换更小窗口的模型"),
     (_is_http_500,
@@ -6223,6 +6273,7 @@ def run_streamlit():
     # 懒加载，若预热/首查询线程抢先建了一份、脚本线程又建一份，就是"同一进程两套词表"。先
     # 赋值（值来自 cache_resource 指向的同一模块单例），其后所有懒加载都走这一个。
     _STATE = _streamlit_runtime_state()
+    _gen_gpu_branch()   # 启动期把算力分档定死并打日志（此后问答路径零检测成本）
     engine = _st_engine()
     # 会话内 TTL 缓存 count：rerun（点数不会变）直接用值，不白等网络；index 中途切别名
     # 是生效过程，TTL 过期后的新 rerun 自然取新数。"按会话只取一次"的旧缓存能骗一整个
@@ -6320,17 +6371,20 @@ def _warm_engine(engine):
             # 故预热一律 think=false、给 8 token —— 它验的是链路能出字，不是验思维链。
             # 超时取 OLLAMA_TIMEOUT（不是硬编码 180）：慢冷启动（模型后台拉取/加载）下
             # 探针等得起，才不会把"还在加载"误报成"预热未完成"。
+            _branch = _gen_gpu_branch()   # 启动/预热期定档并打一次日志，问答路径只读缓存
             _probe_options = {"num_predict": 8, "temperature": TEMPERATURE}
-            _ng_probe = _gen_num_gpu_effective()
-            if _ng_probe is not None:
-                # 让"这台机器起不起得来 GPU"在**预热期**就暴露：auto 模式下预热失败会翻转
-                # 回落状态，首个真实问答就不必再白等一次失败。
-                _probe_options["num_gpu"] = _ng_probe
+            if _branch["num_gpu"] is not None:
+                # 分档已定死（_gen_gpu_branch），探针失败**不再**翻档：预热本来就不该改变
+                # 问答路径的行为，只负责让失败尽早、显眼地出现。
+                _probe_options["num_gpu"] = _branch["num_gpu"]
             _probe_payload = { "model": MODEL, "messages": [{"role": "user", "content": ""}], "stream": False, "think": False, "options": _probe_options, }
             r = _ollama_session().post( API_URL, json=_probe_payload, timeout=TIMEOUT, )
             if r.status_code != 200:
-                _gen_gpu_fallback(f"预热 HTTP {r.status_code} {r.text[:160]!r}")
-                raise RuntimeError(f"生成模型预热失败 HTTP {r.status_code}: {r.text[:200]}")
+                raise RuntimeError(
+                    f"生成模型预热失败 HTTP {r.status_code}: {r.text[:200]}"
+                    f"（算力分档 {_branch['name']}，num_gpu={_branch['num_gpu']}；"
+                    "设备类失败时置 RAG_GEN_NUM_GPU=0 显式关回 CPU——分档不自动回退）"
+                )
             data = r.json() if r.text else {}
             _reply = ((data or {}).get("message") or {}).get("content") if isinstance(data, dict) else None
             if not (_reply or "").strip():

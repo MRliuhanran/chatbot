@@ -48,7 +48,7 @@ L1 配置/日志/硬件/运行态  →  L2 纯函数（domain）  →  L3 适配
 | Ollama HTTP 连接 | `_OLLAMA_SESSION_TLS` 线程本地（L612–L646） | 线程本地，无锁 | 线程 |
 | index/sparse 重建权 | `artifacts/.index.lock` 文件（L4232） | `O_CREAT / O_EXCL` + PID 校验 | 跨进程 |
 | 日志轮转权 | `rag.log.lock` 文件（L392） | `fcntl.flock(LOCK_EX)` | 跨进程 |
-| GPU 回落状态 | `_GEN_GPU_STATE` + `_GEN_GPU_LOCK`（L691–L693） | 互斥锁 | 进程 |
+| 算力分档缓存 | `_GPU_DETECTED` + `_GPU_DETECT_LOCK`（启动期一次） | 互斥锁 | 进程 |
 | 预热就绪标记 | `/tmp/warm_ready`（L5025–L5029） | 文件 | 进程/容器 |
 
 **为什么把"线程本地 Session"排除在 `_RuntimeState` 之外**（L490–L497）：`requests.Session` 不保证线程安全，进程级单例会让预热线程与多个会话线程共用连接池；线程本地各持一份 keep-alive 收益不减，跨线程竞争消失（L634–L646）。
@@ -282,7 +282,7 @@ flowchart TD
 | `RAG_GEN_PRESENCE_PENALTY/FREQUENCY_PENALTY` | `0.0 / 0.0` | 惩罚 | L603–L604 |
 | `RAG_GEN_REPEAT_PENALTY` | `1.1` | 贪心上唯一生效的防循环 | L605 |
 | `RAG_GEN_SEED` | `-1` | 随机种子 | L607 |
-| `RAG_GEN_NUM_GPU` | 空 | `0/999/int/auto`；auto = GPU 优先失败回落 | L941–L952、L696–L724 |
+| `RAG_GEN_NUM_GPU` | 空 | `0/999/int/auto`；auto = 引擎自调（不发字段） | `_gen_gpu_branch` |
 | `RAG_INPUT_RESERVE` | `256`（.env=0） | 从窗口扣给模板的余量 | L3148 |
 | `RAG_GEN_HISTORY_MAX_TOKENS` | `0` | 历史 token 硬上限（0=不设） | L3159 |
 | `RAG_GEN_TOKENIZER_PATH` | 空（.env=`artifacts/gen_tokenizer`） | 精确 token 计数 | L3169 |
@@ -424,7 +424,7 @@ flowchart TD
 | `RAG_INPUT_RESERVE` | `256` → `0` | 窗口全给输入（L217） |
 | `OLLAMA_TIMEOUT` | `180` → `900` | 慢冷启动可等（L253） |
 | `RAG_REPEAT_LAST_N` | `64` → `128` | 防长间隔复读（L236） |
-| `RAG_GEN_NUM_GPU` | 空 → `auto` | 本地 Metal 全 GPU；纯 CPU 容器回落（L332） |
+| `RAG_GEN_NUM_GPU` | 空 → `auto` | 不发字段 → llama.cpp 自调（Metal/CUDA 同语义） |
 | `RAG_EMBED_MODEL_PATH` | `bge-base-zh-v1.5` → `bge-m3` | 换嵌入=全量重建（L293） |
 | `RAG_RERANK_MODEL_PATH` | `bge-reranker-base` → `bge-reranker-v2-m3` | 只换目录（L295） |
 | `RAG_RERANK_TOP_K` | 已从 .env 移除 | 候选池上限已退场（2026-10-30"不用截断"） |
@@ -498,27 +498,23 @@ HW_CORES / HW_MEM_MB（契约值，显式即用，不封顶）
 
 这是"重建与服务隔离"规则**唯一还在代码里的执行点**（驻留策略本身已不做编排，见 §5）。它是 fail-closed 的：门槛设了就不放过。
 
-### 4.5 GPU 分层自动回落（`RAG_GEN_NUM_GPU=auto` 状态机）
+### 4.5 算力自调（`RAG_GEN_NUM_GPU=auto` = 引擎动态分层）
 
 ```mermaid
 stateDiagram-v2
-    [*] --> 初值999: GEN_NUM_GPU == "auto" (L691)
-    初值999 --> 请求发num_gpu: _gen_num_gpu_effective (L696-L703)
-    请求发num_gpu --> 请求发num_gpu: HTTP 200 / 正常生成
-    请求发num_gpu --> 判定失败原因: HTTP != 200 (L754)
-    判定失败原因 --> 请求发num_gpu: 不含设备类关键词（保持不降级）(L715-L718)
-    判定失败原因 --> 回落None: 含 cuda/oom/device/gpu/metal/mps/vram 等
-    回落None --> 回落None: 本进程后续请求不再发 num_gpu（L719-L724）
+    [*] --> 首次调用: _gen_gpu_branch（boot/预热）
+    首次调用 --> 不发字段: auto（num_gpu=None）
+    首次调用 --> 显式值: 人工档 RAG_GEN_NUM_GPU=0/999/整数
+    不发字段 --> 不发字段: llama.cpp 自调（GPU 优先装满、不足层 spill 到 CPU）
+    显式值 --> 显式值: 请求原样携带
 ```
 
-- 生效值：`auto` → 999；回落 → None（不发字段，交给 llama.cpp 自动分层）（L696–L703）。
-- **只认设备类失败**（L711–L718）：旧判据"任何非 200"会让容器冷启动期的 404/503 把 GPU 机器永久降级，日志还归因成"GPU 不可用"——归因错误 + 跨轮次持久污染、无复位路径。新判据要求失败原因含 `cuda/out of memory/oom/device/gpu/metal/mps/vram/insufficient memory`。
-- 回落发生在**零 token 产出之前**（流还没开始读，L754–L760），因此不构成"生成重试"，不丢已生成内容。
-- 预热期也会触发（L5007–L5015），让"这台机器起不起得来 GPU"在启动期暴露。
-- 代价（L939–L940）：换分层 = 换 kernel（Metal vs CPU BLAS），浮点累加顺序不同，贪心长答案可能不再逐字可复现；要严格复现就固定档位。
----
-
-## 5. 驻留策略（2026-10-24 定稿）
+- **策略在引擎，不在应用**：发了 `num_gpu=N` 是强制指令（999 = 全 GPU，装不下 OOM；
+  不是 spill）；不发（默认 -1）才是 llama.cpp 的原生"GPU 优先装满、不足 spill"自调。
+  应用层零经验判断、零环境分支（数值/分支胡编会回归"拿经验当策略"的旧路径）。
+- 有无 GPU 只进 `[gen-gpu]` 日志标签（观测），不改变请求行为；机器差异由引擎覆盖。
+- 人工逃生门保留：自调被实测证明保守（如历史 65k 档 47% 层掉 CPU）时，操作者显式设
+  999 验证/修正；它跑不动就是显式报错，`_GEN_FAILURE_HINTS` 设备类行给出修法。
 
 ### 5.1 结论：应用层不做任何内存编排
 
@@ -609,12 +605,12 @@ docker run → python chatbot.py all
 **引擎内部两把锁的分工**（L3694–L3697）：`_model_init_lock` 保护"是否已加载"，`_model_infer_lock` 串行化查询侧前向/rerank。注释说明理由：加载慢、推理短，共用一把会拖慢并发；MPS 单模型本来也不做真并行。
 
 **查询热路径的锁账（2026-10-30 核账）**：http 后端下一轮检索真正进锁的只有两处——
-① `_qdrant_sparse_hits` 的 `_QDRANT_INFERENCE_LOCK`（共享 client 的本地 BM25 推理器会互相
+① 稀疏召回已改会话线程专属 client（原 `_QDRANT_INFERENCE_LOCK` 的排他问题用结构消除）——共享 client 的本地 BM25 推理器会互相
 drain，多用户并发回合时的正确性防护；单用户不构成竞争）；
 ② `_STATE_LOCK`/`_ENGINE_LOCK`/`_model_init_lock` 只在进程/引擎首建或懒加载首访问那一次进，
 命中的轮次全部走无锁快路径（`_get_gen_tokenizer`、`load_lexicon` 同款：属性读原子 +
 发布后不可变 → 锁只保护首次构造）。`_model_infer_lock` 在 http 后端下从未进锁（torch
-前向专属）；`_GEN_GPU_LOCK` 只在设备类失败时进（一次性翻转）。原则：**锁不是并发实现，
+前向专属）；`_GEN_GPU_LOCK` 已随 GPU 分档改"启动期环境检测、无运行期翻转"而删除（§4.5）。原则：**锁不是并发实现，
 锁是共享可变状态的防御**——去锁的正确姿势是消灭共享（per-worker 写 client、线程本地
 Session、不可变发布），不是删掉保护本身。
 
@@ -819,7 +815,7 @@ rag_engine = logging.getLogger("rag_engine")  ─┴─ _LockedRotatingFileHandl
 | 锁文件 | `artifacts/.index.lock`、`rag.log.lock` | `/app/artifacts/.index.lock`、`/app/rag.log.lock` | L4232、L392 |
 | 健康检查 | start.sh 的 `/healthz`、`/api/version`、`/_stcore/health` | Docker `HEALTHCHECK` 只探 `/_stcore/health` | `Dockerfile:L87` |
 | 登录门 | 依 secrets/平台；`.env` 关 | secrets 被 `.dockerignore` 排除，靠平台注入 OAUTH | `.dockerignore`、L4883–L4911 |
-| 设备 | MPS/Metal 优先（`get_device`） | 纯 CPU；`RAG_GEN_NUM_GPU=auto` 回落 | L1148–L1154、L696–L724 |
+| 设备 | MPS/Metal 优先（`get_device`） | 纯 CPU；生成侧 auto=引擎自调 | L1148–L1154 |
 | 仅构建期 | 无 | 多阶段 + 无 shell RUN + 二进制 COPY + GGUF 体积校验 | `Dockerfile:L1-L88` |
 
 **Dockerfile 多阶段解读**（`Dockerfile:L10-L88`）：
@@ -850,7 +846,7 @@ rag_engine = logging.getLogger("rag_engine")  ─┴─ _LockedRotatingFileHandl
 13. **日志文件 handler 打开失败是静默降级**：`_file_handler` 返回 None 后只有 `_StdoutHandler`（L456–L464）。容器里 stdout 被收集所以不致命，但如果有人依赖 `rag.log` 做审计，需要额外确认文件已创建。
 14. **`all` 的重启计数不复位**：任何子进程反复崩溃都会稳定在 30s 退避（L4646–L4653），不会回到 2s；这是"防重启风暴"的保守选择，代价是"偶发一次崩溃后恢复变慢"。
 15. **`.env` 的"唯一来源"仍在进程环境面前让步**：容器 `ENV` 不再注入 `OLLAMA_*`（`Dockerfile:L68-L70`），但 `os.environ.copy()` 会继承平台显式注入的环境变量（`all` 的 `setdefault` 也不覆盖已存在键）。所以"平台注入盖过 .env"这条路仍然存在——`.env:L62-L67` 记录过一次因此"只改 .env 静默不生效"的事故。
-16. **`RAG_GEN_NUM_GPU` 接受 -1**：校验只要求 ≥ -1（L951–L952），-1 会原样作为 `num_gpu=-1` 发出去（L683–L685 不过滤）。当前 `.env` 用 `auto`，但若有人写 -1，语义完全交给 Ollama，属于未文档化边界。
+16. **`RAG_GEN_NUM_GPU` 接受 -1**：语义 = 发 `num_gpu=-1`（llama.cpp 自调，与 auto 不发字段等效）。不再算未文档化边界：均已定为正式语义（自调）。
 
 ---
 
@@ -871,7 +867,7 @@ rag_engine = logging.getLogger("rag_engine")  ─┴─ _LockedRotatingFileHandl
 | 生成侧配置与响应/超时 | `L570-L608` |
 | 线程本地 Session | `L612-L646` |
 | _chat_options / GPU auto 状态机 | `L660-L724` |
-| stream_chat（含 GPU 回落、读空闲/整轮超时） | `L727-L760` |
+| stream_chat（读空闲/整轮超时，无回落分支） | `L727-L760` |
 | 领域/检索/后端/分块/词表/存储配置 | `L824-L1160` |
 | 权重后台等待 | `L1162-L1194` |
 | 别名归一/停用词开关 | `L1922-L1930` |

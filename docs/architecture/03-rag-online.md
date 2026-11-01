@@ -122,31 +122,29 @@ POST {OLLAMA_BASE_URL}/api/chat   timeout=(10.0 连接, STREAM_READ_TIMEOUT 读�
 - **payload 里 think 字段**：关闭时既是一个开关，也是"生产端唯一闸门"——关闭时事件流里不存在
   EVENT_THINKING（L781-L790）。若模型没听 think=false 仍返回思维链，则按开关丢弃并告警一次。
 
-### 3.3 num_gpu=auto 的一次性回落（L689-L724）
+### 3.3 num_gpu 分档：引擎自调 + 人工逃生门（auto 默认）
 
 ```
                     RAG_GEN_NUM_GPU
                           │
         ┌─────────────────┼──────────────────┐
-        │ 空               │ 整数 (0/999/-1)  │ "auto"
-        ▼                 ▼                  ▼
-   不发 num_gpu      原样放进 options     先发 999
-   (llama.cpp 自动分层)                    │
-                                            ├─ 流开始前 HTTP 非 200
-                                            │   且错误文本含设备类关键字？
-                                            │      ├─ 否 → 不回落，直接报错
-                                            │      └─ 是 → 去掉 num_gpu 重发一次
-                                            │            并置进程级 fallback=True
-                                            │            （此后本进程不再尝试 GPU）
-                                            └─ 200 → 正常流
+        │ 空/auto          │ 整数 (0/999/-1)  │
+        ▼                 ▼
+   不发 num_gpu        原样放进 options（原值进请求）
+   (llama.cpp 自调:            999=强制全 GPU（装不下 OOM 报错）
+    GPU 优先装满、             0=全 CPU；-1 同 auto
+    不足层 spill 到 CPU,
+    KV 按层跟随；应用零估算)
 ```
 
-关键取舍（L711-L718 注释）：旧判据是"任何非 200 就回落"，于是容器冷启动时模型还在后台拉取的
-404、或一次 503，就能把 GPU 机器此后所有请求永久降级成自动分层，且日志归因成"GPU 不可用"。
-现在只认设备类关键字（cuda / out of memory / oom / device / gpu / metal / mps / vram /
-insufficient memory，L715），**回落是一次性的、发生在零 token 产出之前**，因此不构成"生成重试"，
-不会丢弃任何已生成内容。回落状态没有复位路径（进程级），这是刻意选择：避免每轮白等一次失败。
-
+- auto（默认）= **组件自调**：动态分层是 llama.cpp 的原生能力，策略全由引擎算（逐层装
+  显存、装不下 spill），应用既不估算也不换档；有无 GPU 机器同一参数语义自然覆盖。
+- 应用仅保留**观测**：`_detect_gen_device`（nvidia-smi / torch.mps）结果进 `[gen-gpu]`
+  日志标签——是"看"，不是"判"。
+- 人工逃生门：历史实测（65k KV 档自调保守留 47% 层在 CPU）证明自调并非永远最优；此时
+  由操作者显式设 999 强制全 GPU 验证。它失败=显式报错（不是 spill），修法走
+  `_GEN_FAILURE_HINTS` 的设备类行（改回 auto 或 0）。
+- 换分层 = 换 kernel（浮点累加顺序不同），运行期档位不翻转：服务端加载期一次定死。
 ### 3.4 三层时间闸
 
 | 闸 | 位置 | 默认 | 作用 | 失败表现 |
@@ -187,10 +185,12 @@ finally ──▶ r.close()
 两条路各有入口：
 
 - _qdrant_dense_hits（L2914-L2915）：query_points(using="dense")。
-- _qdrant_sparse_hits（L2918-L2924）：query_points(using="sparse")，**必须持 _QDRANT_INFERENCE_LOCK**
-  （L2435）。原因：qdrant-client 的本地推理器（ModelEmbedder）每客户端一份且内部无锁，带
-  Document 的请求并发会 pop(0) 竞争（IndexError）或两份 Document 互换——稀疏查询拿另一路提问
-  的文本去打分。写入口早就有锁，检索侧曾经裸跑，失败又被 tolerate 吞成"退化为纯稠密"，页面无提示。
+- _qdrant_sparse_hits（query_points(using="sparse")）：带 Document 的请求含客户端本地 BM25
+  推理（ModelEmbedder 每客户端一份、内部无锁，并发会 pop(0) 竞争/两份 Document 互换）。
+  解法是**结构化隔离而非锁**（2026-11-01）：稀疏通道改用会话线程专属 client
+  （RAGEngine._sparse_client，同 _ollama_session / per-worker 模式），推理/缓冲线程私有、
+  天然无竞态——曾经的模块级 `_QDRANT_INFERENCE_LOCK`（跨 HTTP 往返持锁 = 全局排队）已整体
+  删除。多用户并发召回之间零锁零排队。
 
 dual_channel_recall（L2932-L2952）是"两条都发"的兜底编排：ThreadPoolExecutor(max_workers=2)
 同时提交 dense/sparse，墙钟 = max 而非和；dense 失败会直接抛，sparse 失败在
@@ -607,7 +607,7 @@ stream_chat 的 finally → r.close()
 | 8 | payload 缺字段 | 旧索引 schema 漂移/极端坏档 | chunk_from_payload 兜默认值（文本可能为空串）；payload 随召回返回后，"按 id retrieve 缺失"这个状态点已消失 | 可能差资料 | 正常轮 | 重建 |
 | 9 | 重排异常 | torch OOM / HTTP 契约不符 | 异常上抛（无稠密兜底） | UI 报错 | 无历史、无台账 | 修环境/换后端 |
 | 10 | 检索结果为空 | 语料空/零命中/被过滤 | 照常生成（纯对话） | 正常回答 | 正常轮 | — |
-| 11 | 生成 HTTP 非 200 | 模型缺失/服务异常 | auto+设备类错 → 去 num_gpu 重发一次；否则 EVENT_ERROR | st.error + 下一步提示 | 不入历史、台账 error | 修服务/拉模型 |
+| 11 | 生成 HTTP 非 200 | 模型缺失/服务异常/设备类失败 | EVENT_ERROR（分档启动期定死，无重发分支） | st.error + 下一步提示（设备类 → RAG_GEN_NUM_GPU=0 关回 CPU） | 不入历史、台账 error | 修服务/拉模型/调分档 |
 | 12 | 流内 error 块 | Ollama 报错 | yield ERROR 后 return（不产出 done） | st.error | 不入历史、台账 error | 重试 |
 | 13 | 读空闲超时 | 300s 无新数据（.env=0 已关闭） | EVENT_ERROR"生成超时/连接中断" | st.error + 提示 | 不入历史、台账 error | 调 RAG_STREAM_READ_TIMEOUT（0=关闭） |
 | 14 | 整轮超时 | 有 chunk 但超 1800s（.env=0 已关闭） | EVENT_ERROR | st.error | 不入历史、台账 error | 调 RAG_TURN_TIMEOUT（0=关闭） |
@@ -633,7 +633,7 @@ stream_chat 的 finally → r.close()
    消费侧还有 answer_is_good 的第二道判据（L4994-L4999，唯一调用点 L5062）。
 3. **无重试、无长度闸**（L608-L609、L736-L739）：窗口是唯一上限，超窗交给服务端上下文移位；
    只把"卡死"变成显式错误（读空闲 + 整轮两道上限）。重试会带来"已生成内容怎么办"的语义问题，
-   而 GPU 回落被严格限定在"零 token 产出之前"，因此不算重试。
+   算力分档由启动期环境检测定死、运行期不翻转，请求路径没有任何重试分支。
 4. **质量一致性优先于延迟**：候选池截断机制整体退场（2026-10-30 两度拍板"不用截断"，重排
    吃下全体去重后候选，无静默也无显式的减法）。同参同果比"容器上偷偷变快"更重要。
 5. **预算先算后装、单一计数入口**：plan_generation 先算 B，build_generation_messages 再按同一
@@ -675,7 +675,7 @@ stream_chat 的 finally → r.close()
 | 查询指令前缀 | 空（裸查询嵌入） | .env:L123 |
 | 历史硬上限 | 0（不设） | .env:L210 |
 | 生成 tokenizer | artifacts/gen_tokenizer | .env:L249 |
-| num_gpu | auto（GPU 优先、失败一次回落） | .env:L332 |
+| num_gpu | auto（引擎自调，默认） | .env（GEN 分层节） |
 | 读空闲 / 整轮超时 | 300s / 1800s | .env:L256、L257 |
 | 单轮台账 | 开（artifacts/turns.jsonl） | .env:L343 |
 

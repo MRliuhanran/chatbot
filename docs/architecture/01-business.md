@@ -319,7 +319,7 @@ embed_model=./models/bge-m3  embed_model_content=23d8f4c1c39f  chunking_code=888
 | 集合别名不可用 | 直读物理集合，`index` 切别名后不自动跟随 | 启动/体检时告警 | `chatbot.py:L3005-L3027`、`chatbot.py:L4428-L4429`、`chatbot.py:L5750-L5751` |
 | 生成 tokenizer 不可用 | 退到 GGUF vocab，再退到"1 字=1 token"偏高估算 | 只降级不中断 | `chatbot.py:L3162-L3168` |
 | 预热失败 | 服务照常起，首问冷加载 | 只告警 | `chatbot.py:L5030-L5031` |
-| 模型自动 GPU 回落 | 首个请求零 token 前失败 → 去掉 `num_gpu` 重发一次，本进程记住 | 只回落到 CPU，不算"生成重试" | `chatbot.py:L930-L940`、`chatbot.py:L691-L726` |
+| 算力自调 | `auto` 不发 `num_gpu`，llama.cpp 原生 GPU 优先装满/不足 spill；检测仅作日志标签 | 应用零经验判断；运行期不翻转；人工 999/0 为逃生门 | `chatbot.py` `_gen_gpu_branch` |
 | 单轮台账写失败 | 不影响本轮 | 只告警 | `chatbot.py:L1044-L1058` |
 
 ### 7.3 观察到的文档/文案不一致（低风险，建议后续修）

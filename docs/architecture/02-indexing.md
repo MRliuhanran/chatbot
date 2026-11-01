@@ -401,7 +401,7 @@ sparse_vectors_config={"sparse": SparseVectorParams(modifier=Modifier.IDF)}
 ### 5.6 写批并发与失败处理（L2670-L2766）
 
 - 分批：`WRITE_BATCH = 1000`，`batch_starts = range(0, total, 1000)`（本仓库 22 批）。
-- **每 worker 一个 QdrantClient**（`threading.local`，L2677-L2684）：qdrant-client 的 `ModelEmbedder`（本地拆包 `Document`）是**每客户端一份且内部无锁**的，共用客户端时多线程会互相 drain `_embed_storage`（实测 `IndexError: pop from empty list` / 422 "dense vector must not be empty"）。旧修法用一把模块锁把整次 upsert（含 HTTP）串行化 → 4 路退化成 1 路。分开客户端后，本地推理天然串行、HTTP 往返真正并发。（模块级 `_QDRANT_INFERENCE_LOCK` L2435 只留给"共用同一 client"的检索侧稀疏分支。）
+- **每 worker 一个 QdrantClient**（`threading.local`，L2677-L2684）：qdrant-client 的 `ModelEmbedder`（本地拆包 `Document`）是**每客户端一份且内部无锁**的，共用客户端时多线程会互相 drain `_embed_storage`（实测 `IndexError: pop from empty list` / 422 "dense vector must not be empty"）。旧修法用一把模块锁把整次 upsert（含 HTTP）串行化 → 4 路退化成 1 路。分开客户端后，本地推理天然串行、HTTP 往返真正并发。（曾经只留给"共用同一 client"检索侧稀疏分支的模块锁，已随其改用会话线程专属 client 而整体删除。）
 - 并发度 = `INDEX_WRITE_WORKERS` 或 `qdrant_write_workers(batch_count)`；公式依据是实测的 Little 定律 + "客户端构造 points 受 GIL 限制需要额外线程搭桥"（L327-L346）。
 - 单批 `_upsert_batch_with_retry`（L2438-L2455）：失败立即重试 1 次（**不睡眠**，等待只会占住 worker 槽），仍失败返回错误串。
 - `_write_batch` 用 `except BaseException` 把一切异常转成错误串（L2692-L2705），因为"从 `fut.result()` 抛出会跳过整段 `write_failures` 收尾（不删孤儿集合、不报谁在服务、连集合名都不留）"。
