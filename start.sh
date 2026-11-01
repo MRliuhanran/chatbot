@@ -87,6 +87,28 @@ _owned_pid() {
     return 1
 }
 
+# ── 所有权策略（2026-11-01 起）───────────────────────────────────────────────
+# 本机上 Qdrant/Ollama/Streamlit 常常是"已经在跑"的（开机自启、手动起、上一次 serve 留下的）。
+# 旧行为一律 _die，结果 `./start.sh start` 在本机永远卡在 Ollama 那一步。新默认：健康的外部
+# 实例**复用**（日志写明"不管理其生命周期"），缺的才起；stop 仍只停本脚本记录过的 pid。
+# 身份风险由各自的校验兜住：Qdrant 查集合是否存在；Streamlit 查命令行是不是本项目；Ollama
+# 无数据风险。容器不走本脚本（用 python chatbot.py all 全起全管），这套策略只影响本地。
+# 回到旧的"只认自己起的"：RAG_STRICT_OWNERSHIP=1。
+_allow_external() {
+    local _what="${1}"
+    case "${RAG_STRICT_OWNERSHIP:-0}" in
+        1) _die "${_what} 有健康服务，但不是本脚本启动的；RAG_STRICT_OWNERSHIP=1 时拒绝复用（先停止外部实例，或改回 0）" ;;
+        *) return 0 ;;
+    esac
+}
+
+# 外部 Streamlit 的身份校验：健康端点只证明"有个 Streamlit"，证明不了"是我们的应用"。
+# 用进程命令行认人（与 chatbot.py cmd_serve 的 _streamlit_pids 同一判据）。
+_streamlit_is_ours() {
+    command -v pgrep >/dev/null 2>&1 || return 1
+    pgrep -f "streamlit run .*chatbot\.py" >/dev/null 2>&1
+}
+
 _wait_http() {
     local _url="${1}" _name="${2}" _pidfile="${3}" _logfile="${4}" _timeout="${5}" _i
     for _i in $(seq 1 "${_timeout}"); do
@@ -210,7 +232,16 @@ _start_qdrant() {
             _log "Qdrant 已在运行（本脚本实例，复用）"
             return 0
         fi
-        _die "6333 上有健康服务，但不是本脚本启动的 Qdrant；先停止外部实例再 start"
+        _allow_external "6333 上的 Qdrant"
+        _log "复用外部 Qdrant（${QDRANT_URL}；不管理其生命周期，stop 不会停它）"
+        _log "⚠️  外部实例的 QDRANT__* / storage 路径由它自己的启动环境决定，.env 里这几项对本实例不生效"
+        local _alias="${RAG_COLLECTION_ALIAS:-rag_current}"
+        if _http_ok "${QDRANT_URL}/collections/${_alias}"; then
+            _log "外部 Qdrant 数据面检查：集合 ${_alias} 存在"
+        else
+            _log "⚠️  外部 Qdrant 上没有集合 ${_alias}（可能是别的实例）；检索会由指纹闸门 fail-closed 拒服务"
+        fi
+        return 0
     fi
     [ -x "${QDRANT_BIN}" ] || _die "缺少 Qdrant 可执行文件: ${QDRANT_BIN}（下载后放到 .bin/qdrant/qdrant，或设 QDRANT_BIN）"
     mkdir -p "${ROOT}/storage"
@@ -229,7 +260,13 @@ _start_ollama() {
             _log "Ollama 已在运行（本脚本实例，复用；改 .env 的 OLLAMA_* 后需 stop 再 start）"
             return 0
         fi
-        _die "11434 上有健康服务，但不是本脚本启动的 Ollama；先停止外部实例再 start"
+        _allow_external "11434 上的 Ollama"
+        _log "复用外部 Ollama（${OLLAMA_URL}；不管理其生命周期，stop 不会停它）"
+        _log "⚠️  外部实例的 OLLAMA_*（KEEP_ALIVE/NUM_PARALLEL/FLASH_ATTENTION 等）由它自己的启动环境决定，.env 里这几项对本实例不生效"
+        if [ -n "${MODEL:-}" ] && ! curl -fsS --max-time 3 "${OLLAMA_URL}/api/tags" 2>/dev/null | grep -q "${MODEL%%:*}"; then
+            _log "⚠️  外部 Ollama 的模型列表里未见 ${MODEL}（首问会由应用补拉或报 404）"
+        fi
+        return 0
     fi
     command -v ollama >/dev/null 2>&1 || _die "PATH 里找不到 ollama"
     _log "启动 Ollama"
@@ -245,7 +282,12 @@ _start_app() {
             _log "应用已在运行（本脚本实例，复用；改代码/改 .env 后需 stop 再 start）"
             return 0
         fi
-        _die "${APP_PORT} 上有健康服务，但不是本脚本启动的 Streamlit；先停止外部实例再 start"
+        _allow_external "${APP_PORT} 上的 Streamlit"
+        if _streamlit_is_ours; then
+            _log "应用已在运行（本项目 Streamlit，外部启动，复用；改代码/改 .env 后需手动重启）"
+            return 0
+        fi
+        _die "${APP_PORT} 上有健康服务，但命令行里找不到本项目 Streamlit（证明不了是本应用）；先确认占用者: lsof -nP -iTCP:${APP_PORT} -sTCP:LISTEN"
     fi
     [ -f "${ROOT}/chatbot.py" ] || _die "缺少 chatbot.py"
     _log "启动 Streamlit 应用"
@@ -288,7 +330,7 @@ _status_one() {
         if [ -n "${_pid}" ]; then
             printf '✅ %-8s 健康  %s  本脚本 pid=%s\n' "${_name}" "${_url}" "${_pid}"
         else
-            printf '⚠️  %-8s 健康  %s  外部实例（start 会拒绝复用）\n' "${_name}" "${_url}"
+            printf '⚠️  %-8s 健康  %s  外部实例（复用；stop 不会停它）\n' "${_name}" "${_url}"
         fi
     else
         printf '❌ %-8s 未响应 %s\n' "${_name}" "${_url}"
