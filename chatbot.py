@@ -6361,18 +6361,33 @@ def _warm_engine(engine):
                 f"embed_batch={_profile.embed_batch} threads={_profile.threads}")
             # 词表仍要预热（别名归一是查询路径上的同步调用）；jieba 已随分词组件化整体移除
             load_lexicon()
-            # 嵌入/重排模型按后端预热：torch=加载进本进程；http=探一发小请求，让独立模型
-            # 服务容器把冷加载提前到启动期（应用进程不再驻留检索权重）。
-            if EMBED_BACKEND == "http":
-                # 真·非空探针（2026-10-30 起）：空串在部分 OpenAI 兼容实现上会 400，
-                # "已预热"信号不能建立在可能自拒的输入上。
-                engine._http_embed(["预热探针"], is_query=False)
-            else:
+            # 嵌入/重排按后端预热：http=**等 infinity 真就绪再探**（2026-11-1 运行日志
+            # 实证：预热线与 infinity 15s 冷加载赛跑——app 起监听后平台探测立刻触发
+            # 预热，第一步 /v1/embeddings 就 ConnectionError 8001，整个 try 头部夭折
+            # → 生成探针没跑、本周期 llama 零装载、首问必背冷加载）。改用与 cmd_all
+            # 同一实现的 _wait_infinity_ready 两段式：成功即 embeddings/rerank 已真打
+            # 一发（探针即预热）；失败只 warn，不把检索问题拖垮生成预热。
+            if EMBED_BACKEND == "http" or RERANK_BACKEND == "http":
+                port = (os.environ.get("RAG_INFINITY_PORT") or "").strip()
+                if not port:
+                    m = re.search(r":(\d+)", EMBED_URL)
+                    port = m.group(1) if m else "8001"
+                try:
+                    wait_budget = min(300.0, float(os.environ.get("RAG_INFINITY_WAIT") or 900))
+                except ValueError:
+                    wait_budget = 300.0
+                _ok, _el, _detail = _wait_infinity_ready(
+                    port,
+                    (os.environ.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME),
+                    (os.environ.get("RAG_RERANK_MODEL_NAME") or RERANK_MODEL_NAME),
+                    wait_budget,
+                )
+                if _ok:
+                    log(f"[预热] infinity 就绪（{_el:.0f}s），embeddings/rerank 已预热")
+                else:
+                    log(f"⚠️  [预热] infinity 未就绪({_detail})，检索预热跳过，生成预热继续")
+            if EMBED_BACKEND == "torch":
                 engine._get_embed()
-            # 重排 http 的冷启动同样提前到启动期：真请求打一发 /rerank（单候选），顺带
-            # 校验重排合同（返回条数 ≠ 候选数会当场报错——探针本身就是合同测试）。
-            if RERANK_BACKEND == "http":
-                engine._http_rerank("预热探针", ["重排预热"], 1)
             if RERANK_BACKEND == "torch":
                 engine._get_rerank()
             # 必须看状态码：对未拉取的模型 Ollama 返回 404 而 requests 不抛异常，
