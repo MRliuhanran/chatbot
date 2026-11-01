@@ -583,11 +583,18 @@ def _resource_gate(pol):
     if avail is None:
         log("⚠️  index 内存闸门：本机读不到可用内存，跳过（不影响构建）")
     elif avail < need:
-        raise RuntimeError(
-            f"可开内存 {avail}MB < 本次构建所需 {need}MB（峰值估算 {pol['embed_peak_mb']}MB + 余量，"
-            f"RAG_INDEX_MIN_FREE_MB={INDEX_MIN_FREE_MB}）：大概率 serve/infinity/Ollama 同机驻留。"
-            f"先停 serve/infinity/Ollama（Qdrant 可留）释放内存后重跑 index。"
-        )
+        if env_bool("RAG_INDEX_ALLOW_LOW_MEMORY", False):
+            log(
+                f"⚠️  内存闸门放行（RAG_INDEX_ALLOW_LOW_MEMORY=1）：可开 {avail}MB < 所需 {need}MB"
+                f"（峰值估算 {pol['embed_peak_mb']}MB）；断点续算已开启，风险自担"
+            )
+        else:
+            raise RuntimeError(
+                f"可开内存 {avail}MB < 本次构建所需 {need}MB（峰值估算 {pol['embed_peak_mb']}MB + 余量，"
+                f"RAG_INDEX_MIN_FREE_MB={INDEX_MIN_FREE_MB}）：大概率 serve/infinity/Ollama 同机驻留。"
+                f"先停 serve/infinity/Ollama（Qdrant 可留）释放内存后重跑 index；"
+                f"应急可设 RAG_INDEX_ALLOW_LOW_MEMORY=1 放行（断点续算兜底）。"
+            )
     else:
         log(f"index 内存闸门: 可开 {avail}MB ≥ 所需 {need}MB（峰值估算 {pol['embed_peak_mb']}MB）")
     power = res.get("power") or {}
@@ -3587,6 +3594,9 @@ def build_index():
             EMBED_FORCE_FP32 = False
         elif use_gpu:
             EMBED_FORCE_FP32 = True
+        # 资源闸门必须在**加载模型之前**判：模型权重占 1.1-2.2GB，加载后再看可用内存
+        # 会得出"必然不够"的假失败；同时也能在真正吃内存前 fail-fast（用户决策）。
+        _resource_gate(policy)
         tokenizer = model = None
         if use_gpu:
             try:
@@ -3638,7 +3648,6 @@ def build_index():
     embeddings = [cache.get(k) for k in keys] if cache else [None] * total
     del cache
     if missing:
-        _resource_gate(policy)
         # 分段 + 断点：每 RAG_EMBED_CHECKPOINT_CHUNKS 条落一份分片（默认 2048）。中断/被杀后
         # 下次 index 直接载入分片续算，不再让 20-90 分钟工作全丢；分片只在终态 npz 写成功
         # 后清理（写失败时保留，仍可续算）。
