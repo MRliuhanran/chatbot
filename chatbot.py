@@ -5847,6 +5847,53 @@ def cmd_all(args=None):
         target=_startup_fingerprint_selfcheck, args=(env,), name="fingerprint-selfcheck", daemon=True,
     ).start()
 
+    def _warm_resident_model():
+        """编排层自醒驻留探针（2026-11-1 新增）：boot 期把生成模型按**回合链同参**
+        驻留进 llama-server，不依赖访客——本周期实证：预热链挂在 Streamlit 脚本
+        触发上，无人访问时 get_engine() 不执行 → 预热线不启动 → llama 零装载（GIN
+        /llama 行全 0），访客首问必背冷加载。死循环结构：预热等访客触发、访客首问
+        等预热。端点/payload/参数与 app 侧 _warm 生成探针逐字同源（/api/chat +
+        num_ctx=model_context_window() 同一进程内缓存）：访客稍后到达时 app 探针
+        load 参数相同 → 不触发第二次装载（Ollama 仅在 load 参数不同时整模重载，
+        双装载死因正是探针线不带 num_ctx）。失败/超时只 warn：回合冷加载兜底，
+        不是正确性闸门。读超时 240s：32K 装载 2vCPU 实测 ~15-20s，10 倍余量。
+        """
+        import requests as _rq
+        base = ((env.get("OLLAMA_BASE_URL") or OLLAMA_BASE_URL) or "http://127.0.0.1:11434").rstrip("/")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            try:
+                if _rq.get(f"{base}/api/version", timeout=3).status_code == 200:
+                    break
+            except Exception:
+                time.sleep(1)
+        else:
+            log("⚠️  [all] 驻留探针跳过：ollama 60s 未就绪（回合冷加载兜底）")
+            return
+        try:
+            window = int(model_context_window())
+        except Exception as exc:
+            log(f"⚠️  [all] 驻留探针跳过：窗口派生失败 {type(exc).__name__}: {exc}")
+            return
+        _t0 = time.time()
+        try:
+            r = _rq.post(
+                f"{base}/api/chat",
+                json={"model": env.get("MODEL") or MODEL,
+                      "messages": [{"role": "user", "content": ""}],
+                      "stream": False, "think": False,
+                      "options": {"num_predict": 8, "temperature": TEMPERATURE,
+                                  "num_ctx": window}},
+                timeout=(10, 240),
+            )
+        except Exception as exc:
+            log(f"⚠️  [all] 驻留探针异常 {type(exc).__name__}: {exc}（不阻断，回合冷加载兜底）")
+            return
+        if r.status_code == 200:
+            log(f"[all] 生成模型已驻留（探针 {time.time() - _t0:.1f}s，num_ctx={window}）——访客首问不背冷加载")
+        else:
+            log(f"⚠️  [all] 驻留探针 HTTP {r.status_code}（不阻断，回合冷加载兜底）")
+
     if "infinity" in specs:
         import threading
         _inf = specs["infinity"]
@@ -5863,6 +5910,9 @@ def cmd_all(args=None):
             ok, elapsed, detail = _wait_infinity_ready(_inf_port, _embed_name, _rerank_name, _inf_budget)
             if ok:
                 log(f"[all] infinity 就绪: embeddings/rerank 探测通过（冷加载 {elapsed:.0f}s）")
+                # 2vCPU 串行：编排层驻留探针排在 infinity 冷加载之后，不与检索抢核；
+                # http 后端下此线程是唯一的 boot 期自醒点（不依赖访客）。
+                _warm_resident_model()
                 return
             # fail-loud：检索服务判定不可用就退役整个容器（app 可能已通过平台探测，
             # 靠日志 ❌ 行说话）；平台重启容器重试——错误能在两次重启间被看到。
@@ -5881,6 +5931,9 @@ def cmd_all(args=None):
             os._exit(1)
 
         threading.Thread(target=_watch_infinity, name="infinity-watch", daemon=True).start()
+    else:
+        # torch 后端无 infinity 冷加载竞争：驻留探针独立线程起（同样不依赖访客）。
+        threading.Thread(target=_warm_resident_model, name="ollama-warm", daemon=True).start()
 
     restarts: dict = {}
     while not stopping["value"]:
