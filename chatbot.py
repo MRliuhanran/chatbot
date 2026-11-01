@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -548,7 +549,7 @@ def build_runtime_profile() -> RuntimeProfile:
     CLI 的纯文件命令不应调用它，避免无谓的 torch 启动成本。
     """
     device = get_device()
-    use_fp16 = _float16_ok(device)
+    use_fp16 = _embed_use_fp16(device)
     return RuntimeProfile(
         device=device,
         dtype="float16" if use_fp16 else "float32",
@@ -1077,8 +1078,9 @@ PRELOAD_MODELS = env_bool("RAG_PRELOAD", True)  # api/serve 启动时后台预�
 # 检索侧嵌入后端：torch=进程内（默认）；http=现成的 OpenAI 兼容嵌入服务（compose 用
 # infinity 容器起 bge-base-zh-v1.5，而**不**是自建微服务）。http 只作用于检索查询侧与
 # 预热：process 的分块语义定界与 index 入库固定进程内 torch（换后端不改切分/嵌入代码
-# 指纹，索引无需重建）。**重排没有再拆分**：bge-reranker 没有能直接用的现成服务
-# （infinity × XLM-R 有 upstream bug），恒与 Streamlit 同进程（torch）。非法取值启动即报错。
+# 指纹，索引无需重建）。**重排同样已外置**：RAG_RERANK_BACKEND=http 时走 infinity 的
+# /v1/rerank（本地/容器默认同一实例托管 bge-m3 + bge-reranker-v2-m3），torch=进程内。
+# 非法取值启动即报错。
 EMBED_BACKEND = env_choice("RAG_EMBED_BACKEND", "torch", ("torch", "http"))
 # OpenAI 兼容 base_url：以 /v1 结尾（OpenAI SDK 惯例），客户端拼 "{url}/embeddings"。
 # infinity 的 --url-prefix /v1 与之对应；若服务端无前缀则把 RAG_EMBED_URL 设为
@@ -1206,6 +1208,13 @@ INDEX_MANIFEST_JSON = os.path.join(_ARTIFACTS_DIR, "index_manifest.json")
 INDEX_MANIFEST_VERSION = 1
 EMBED_CACHE_DIR = os.path.join(_ARTIFACTS_DIR, "embeddings")
 EMBED_CACHE_ENABLED = env_bool("RAG_EMBED_CACHE", True)
+# 入库编码精度档（RAG_EMBED_FORCE_FP32=1 = 质量优先档，消掉 fp16 量化折损）：
+# GPU（mps/cuda）默认走 fp16 计算路径（快一倍、实测 top-10 recall 0.998）；置 1 后
+# 权重/autocast/缓存精度标签全部回到 fp32（见 _embed_use_fp16 单一事实源）。
+# 注意两条兼容性约定：① precision 本来就是缓存键的一段 —— 切档只会换文件（fp16/fp32
+# 两份共存），**不会静默混用旧向量**；② 缺省设备重定为 CPU（fp32 语义最稳），显式
+# RAG_INDEX_DEVICE 锁设备则留在原设备只摘 half/autocast（MPS fp32 计算合法但慢一倍）。
+EMBED_FORCE_FP32 = env_bool("RAG_EMBED_FORCE_FP32", False)
 DOC_CHUNK_DIR = os.path.join(_ARTIFACTS_DIR, "docs")  # 单文档分块缓存：只重分块增/改的文档
 LEXICON_DIR = os.getenv("RAG_LEXICON_DIR", "./lexicon")
 WRITE_BATCH = 1000
@@ -1379,6 +1388,20 @@ def _float16_ok(device):
     return device in ("mps", "cuda")
 
 
+def _embed_use_fp16(device):
+    """嵌入计算路径的 fp16 政策（**单一事实源**）：GPU（mps/cuda）默认 fp16 权重 +
+    fp16 autocast；RAG_EMBED_FORCE_FP32=1 取消整条 fp16 计算路径 —— 权重精度（
+    load_embedding_model）、autocast（embed 调用点）、缓存精度标签（index 的 precision
+    变量）必须**同源读这里**，任何一处各写一份都会产生"标签说 fp32、算的却是 fp16"
+    的静默口径分裂（正是本仓反复点名的"两处各写一份必然分叉"原型）。
+
+    本函数**不入** _embed_code_fingerprint 源码清单：档位是运行期（环境）配置而非代码
+    变更 —— precision 已是缓存键的一个字段，切档只发生在 fp16/fp32 两份缓存文件之间，
+    改档不失效任何旧缓存、也不需要触发全量重算。
+    """
+    return _float16_ok(device) and not EMBED_FORCE_FP32
+
+
 # ── 模型加载与向量化 ──
 def _model_dir_ready(path):
     return bool(path) and os.path.isdir(path) and bool(os.listdir(path))
@@ -1421,6 +1444,8 @@ def load_embedding_model(device=None, model_path=None):
     GPU（mps/cuda）= fp16 权重：内存 2166MiB → 1083MiB，吞吐实测 28.2 块/s vs 纯 autocast
     4.63 块/s（32 块探针，量化对拍 agent 实测；余弦 0.999998、top-10 近邻 recall 0.998）。
     CPU = fp32（fp16 在 CPU 上不加速反而更慢），故容器走 CPU 时精度与语义同改造前。
+    RAG_EMBED_FORCE_FP32=1 = 质量优先档：GPU 也用 fp32 权重（消掉 fp16 量化折损，
+    代价约一倍算时）——判断走 _embed_use_fp16 单一事实源，与 autocast/缓存标签同源。
 
     注意：本函数在 _embed_code_fingerprint 的源码清单里 —— 改它会让稠密缓存文件名里的
     code_key 变化，旧向量**自动作废、不会静默复用**（这是有意的：换精度必须全量重算）。
@@ -1428,7 +1453,7 @@ def load_embedding_model(device=None, model_path=None):
     import torch
     from transformers import AutoModel, AutoTokenizer
     device = device or get_device()
-    dtype = torch.float16 if _float16_ok(device) else torch.float32
+    dtype = torch.float16 if _embed_use_fp16(device) else torch.float32
     model_path = _require_model_dir(
         model_path or EMBED_MODEL_PATH, "嵌入",
         "创空间看运行日志的 [entrypoint] 权重下载行（下载完成后再试）；"
@@ -2698,27 +2723,47 @@ def _full_embed_cache(cands):
     return next((c for c in cands if not c[3]), None)
 
 
+def _read_embed_cache_arrays(path):
+    """从 npz 读出 (keys, vectors) **原始数组**，不做任何语义校验。
+
+    运行期（_load_embed_cache）与构建期（cmd_verify_build 的嵌入缓存体检）共用这一份
+    读取入口 —— 两处各写一份必然分叉（"verify 说健康 / 运行时却读坏"的口径分裂原型）。
+    """
+    import numpy as np
+    with np.load(path, allow_pickle=False) as data:
+        keys = data["keys"].tolist()
+        vecs = data["vectors"]
+    return keys, vecs
+
+
+def _check_embed_cache_shape(keys_n, vecs, expected_dim=None):
+    """稠密缓存结构校验（二维 / 行数自洽 / 非空 / 维度与模型期望一致），不合法抛 ValueError。
+
+    错误文案有意与运行期逐字同源：同一句话在 verify-build（构建期判死）与 index（运行期
+    退化告警）里出现，排查时不会得出两个结论。
+    """
+    if vecs.ndim != 2:
+        raise ValueError(f"vectors 不是二维数组: shape={vecs.shape}")
+    if keys_n != vecs.shape[0]:
+        raise ValueError(f"keys 与 vectors 行数不一致: {keys_n} vs {vecs.shape[0]}")
+    if vecs.shape[0] == 0:
+        raise ValueError("缓存为空数组")
+    if expected_dim is not None and vecs.shape[1] != expected_dim:
+        raise ValueError(f"缓存向量维度 {vecs.shape[1]} 与模型期望的 {expected_dim} 不一致（多半是换过模型）")
+
+
 def _load_embed_cache(path, expected_dim=None):
     import numpy as np
     if not os.path.exists(path):
         return {}
     try:
-        with np.load(path, allow_pickle=False) as data:
-            keys = data["keys"].tolist()
-            vecs = data["vectors"]
+        keys, vecs = _read_embed_cache_arrays(path)
         # fp16 标签的文件现在真的存 float16（_save_embed_cache）。读侧统一升 float32：
         # 进程内的一切消费（vstack/维度校验/upsert）继续以 float32 口径工作，存储位宽
         # 只决定文件占盘；旧 float32 文件无视此分支。转完再校验，报错结论不因位宽变化。
         if vecs.dtype != np.float32:
             vecs = vecs.astype(np.float32)
-        if vecs.ndim != 2:
-            raise ValueError(f"vectors 不是二维数组: shape={vecs.shape}")
-        if len(keys) != vecs.shape[0]:
-            raise ValueError( f"keys 与 vectors 行数不一致: {len(keys)} vs {vecs.shape[0]}")
-        if vecs.shape[0] == 0:
-            raise ValueError("缓存为空数组")
-        if expected_dim is not None and vecs.shape[1] != expected_dim:
-            raise ValueError(f"缓存向量维度 {vecs.shape[1]} 与模型期望的 {expected_dim} 不一致（多半是换过模型）")
+        _check_embed_cache_shape(len(keys), vecs, expected_dim)
     except Exception as exc:
         log(f"    ⚠️  向量缓存不可用，将全量重算: {type(exc).__name__}: {exc}")
         return {}
@@ -2853,7 +2898,7 @@ def _qdrant_storage_root():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
 
 
-def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id, points, embed_model_content, qdrant_server):
+def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id, points, embed_model_content, qdrant_server, embed_precision=None):
     """把本次索引的**身份**写成 artifacts/index_manifest.json（发布契约）。
 
     只在 build_index 的**成功收尾**调用：点数不变量、维度校验、别名切换全部通过之后。
@@ -2867,6 +2912,9 @@ def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id,
         离线重算需要这个版本号（verify-build 不连 Qdrant），故一并记录。
       · collection：物理集合名（别名模式带 build_id 后缀），verify-build 据此核对
         storage/collections/<name> 是否随镜像带上。
+      · embed_precision：本次入库向量的**计算路径档位**（fp16/fp32；完整命中路径 =
+        缓存文件自身的档，重算路径 = 当次 encode 的档；corpus 清空时为 null 无从记录）。
+        verify-build 的嵌入缓存体检拿它与当前键序缓存对账 —— 精度代际不再只靠口头约定。
       · build_id/points/built_at/embed_model_content：排障时一眼定位"这份镜像是哪次构建"。
     """
     manifest = {
@@ -2877,6 +2925,7 @@ def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id,
         "build_id": build_id,
         "points": int(points),
         "embed_model_content": embed_model_content,
+        "embed_precision": embed_precision,
         "qdrant_server": qdrant_server,
         "built_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
@@ -3007,18 +3056,25 @@ def build_index():
     else:
         device = INDEX_DEVICE or get_device()
         use_gpu = device in ("mps", "cuda")
+        use_fp16 = _embed_use_fp16(device)  # 计算路径政策单一事实源（权重/autocast/标签必须同源）
+        if use_gpu and EMBED_FORCE_FP32 and not INDEX_DEVICE:
+            # 质量优先档（RAG_EMBED_FORCE_FP32=1）缺省落位：没钦定设备 → CPU fp32
+            # （fp32 语义最稳、全量约 73 分钟）；显式 RAG_INDEX_DEVICE 则留在原设备只摘
+            # half/autocast（MPS fp32 计算合法，代价约一倍算时）。
+            device, use_gpu = "cpu", False
         tokenizer = model = None
         if use_gpu:
             try:
                 tokenizer, model, _ = load_embedding_model(device=device)
-                model = model.half()
+                if use_fp16:
+                    model = model.half()
             except Exception as exc:
                 log(f"    ⚠️  {device.upper()} 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
-                tokenizer, model, use_gpu = None, None, False
+                tokenizer, model, use_gpu, use_fp16 = None, None, False, False
         if use_gpu:
             batch_size = EMBED_BATCH_SIZE or embed_batch_size(device)
-            precision = "fp16"
-            log(f"Embedding 设备: {device} (fp16, batch_size={batch_size}；{embed_batch_note(device)})")
+            precision = "fp16" if use_fp16 else "fp32"
+            log(f"Embedding 设备: {device} ({precision}, batch_size={batch_size}；{embed_batch_note(device)})")
         else:
             import torch
             tokenizer, model, device = load_embedding_model(device="cpu")
@@ -3034,7 +3090,7 @@ def build_index():
         expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
         if expected_dim is None:
             # 回退：用一次前向传播推断维度，避免缓存维度校验被绕过
-            test_vec = embed([_index_text(all_chunks[0])], tokenizer, model, device, is_query=False, autocast=use_gpu)
+            test_vec = embed([_index_text(all_chunks[0])], tokenizer, model, device, is_query=False, autocast=use_fp16)
             expected_dim = test_vec.shape[-1]
             log(f"  推断嵌入维度: {expected_dim}")
         # 该精度的缓存刚被 _inspect_embed_caches 读过（含维度校验），复用它的结论；
@@ -3052,7 +3108,7 @@ def build_index():
         batches = [missing[i:i + batch_size] for i in range(0, len(missing), batch_size)]
         for bi, idxs in enumerate(batches):
             batch_texts = [_index_text(all_chunks[i]) for i in idxs]
-            vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_gpu)
+            vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_fp16)
             if device == "mps":
                 _mps_empty_cache()
             for row, i in enumerate(idxs):
@@ -3382,6 +3438,7 @@ def build_index():
             build_id=build_id,
             points=written,
             embed_model_content=_model_content_fingerprint(),
+            embed_precision=precision,
             qdrant_server=qdrant_server_version(client),
         )
         _gc_embed_cache_files()
@@ -4230,7 +4287,7 @@ class TorchEmbeddingBackend:
             if engine._embed is None or engine._embed[1] is not model:
                 tokenizer, model, device = engine._get_embed()
             query_emb = embed([query], tokenizer, model, device, is_query=True,
-                              autocast=_float16_ok(device))
+                              autocast=_embed_use_fp16(device))
         return query_emb[0].tolist()
 
 
@@ -5583,6 +5640,9 @@ def _infinity_spec(root, env=None):
     子进程 cwd=root ⇒ 解析为 /app/models/bge-m3；落位改写产物是绝对路径，同样合法）。
     存在性校验用 abspath 对照 root，不受进程 cwd 影响。
     --device 默认 auto（容器无 GPU → cpu，与本地同语义）。
+    --dtype 默认 **显式 float32**（RAG_INFINITY_DTYPE 可覆写）：infinity 自己的 auto 在
+    CUDA 机会静默切 bf16/fp16（bf16 只剩 8 位尾数、排序漂移反而比 fp16 大），质量优先档
+    不允许服务端精度进入"不可控"——所以与 start.sh 同构地钉死，改档是显式动作。
     --no-model-warmup（2026-11-1 新增）：infinity 的 warmup calibration 每次冷启动都跑
     （batch=8 时两模型四组计时 40-80s，本地实证 10.8s+26.7s@快CPU；容器 174s 就绪里
     占大头）。检索闸门的就绪探测**本来就真打一发 embeddings/rerank**——正是预热动作，
@@ -5608,10 +5668,12 @@ def _infinity_spec(root, env=None):
     port = (scope.get("RAG_INFINITY_PORT") or "8001").strip()
     batch = (scope.get("RAG_INFINITY_BATCH") or "32").strip()
     device = (scope.get("RAG_INFINITY_DEVICE") or "auto").strip()
+    dtype = (scope.get("RAG_INFINITY_DTYPE") or "float32").strip()
     argv = [
         emb_bin, "v2",
         "--host", "127.0.0.1", "--port", port, "--url-prefix", "/v1",
         "--engine", "torch", "--device", device,
+        "--dtype", dtype,
         "--batch-size", batch,
         "--no-model-warmup",
         "--model-id", emb, "--served-model-name", scope.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME,
@@ -7173,7 +7235,7 @@ def cmd_embedpairs(args=None):
     log(f"A 侧（本地 torch，is_query=False）编码 {len(texts)} 句，首次加载权重需数十秒…")
     tokenizer, model, device = load_embedding_model()
     _t0 = time.time()
-    local = embed(texts, tokenizer, model, device, is_query=False, autocast=device in ("mps", "cuda"))
+    local = embed(texts, tokenizer, model, device, is_query=False, autocast=_embed_use_fp16(device))
     _lcl_s = time.time() - _t0
     log(f"B 侧（http {EMBED_URL}，model={EMBED_MODEL_NAME}）编码同 {len(texts)} 句…")
     _t0 = time.time()
@@ -7343,6 +7405,10 @@ def cmd_verify_build(args=None):
         只告警不判死：Qdrant 别名文件格式随版本变化，不能当唯一判据；
       E 产物同代（可选）：chunks.meta.json 存在时，其分块指纹必须与清单一致 —— 防
         "process 之后没重跑 index"这种两代产物混进同一镜像。
+      F 嵌入缓存体检（稠密向量 / 精度档，离线只读）：结构自洽（二维/行数/非空）、维度
+        与模型 config 一致、**精度标签与实际存储位宽同源**；损坏/维度错判死（运行期只会
+        整份报废并全量重算，是分钟到小时级的无谓浪费）；并把清单的 embed_precision
+        与当前键序缓存对账 —— 精度代际切换从此有构建期判据，不再只靠运行日志口头约定。
     全程只读、不建 QdrantClient、不写数据。
     """
     problems = []
@@ -7471,6 +7537,74 @@ def cmd_verify_build(args=None):
                 log(f"  ✅ 产物同代: {CHUNKS_META_JSON} 与清单分块指纹一致")
     else:
         log(f"  ⚠️  {CHUNKS_META_JSON} 不存在（跳过产物同代核对）")
+
+    # F 嵌入缓存体检（离线只读，不 import torch / 不连 Qdrant）：稠密缓存结构 + 精度档
+    # 与清单对账。为什么必须有：坏缓存的运行期表现是"⚠️ 不可用 → 全量重算"——本地是
+    # 30-73 分钟级的无谓浪费，容器内应急重建还会在 CPU 上把同样的事放慢十倍；坏产物
+    # 进了镜像就到下一次 index 才暴露（"发布成功但不能使用"同类，应在构建期拦下）。
+    # 边界声明：镜像里没有 chunks.json，无法判断"缓存是否完整覆盖本次语料"——覆盖判据
+    # 继续归 index 运行时（命中即用、不混代）；这里只拦**确定性坏**：文件在但读不出 /
+    # 结构错 / 维度错 / 精度标签与存储位宽名实不符。
+    log("[F] 嵌入缓存体检（稠密向量 / 精度档，离线只读）")
+    if not EMBED_CACHE_ENABLED:
+        log("  ⏭  RAG_EMBED_CACHE=0：缓存层整层关闭，跳过体检")
+    else:
+        _cand_paths = {p: _embed_cache_file(p) for p in _EMBED_CACHE_PRECEDENCE}
+        _good = {}  # 精度档 -> (rows, dim, store_dtype)：结构完好的现有缓存
+        for _prec in _EMBED_CACHE_PRECEDENCE:
+            _path = _cand_paths[_prec]
+            if not os.path.exists(_path):
+                continue
+            _basename = os.path.basename(_path)
+            try:
+                _keys, _vecs = _read_embed_cache_arrays(_path)
+                _check_embed_cache_shape(len(_keys), _vecs, _expected_embed_dim())
+                _good[_prec] = (int(_vecs.shape[0]), int(_vecs.shape[1]), str(_vecs.dtype))
+            except Exception as exc:
+                _bad(f"嵌入缓存[{_prec}]结构体检失败: {_basename} —— {type(exc).__name__}: {exc}"
+                     f"（下次 index 整份报废并全量重算；确认无用可直接删除该文件）")
+                continue
+            _rows, _dim, _dtype = _good[_prec]
+            _want = "float16" if _prec == "fp16" else "float32"
+            log(f"  {'✅' if _dtype == _want else '⚠️'} 嵌入缓存[{_prec}]: {_basename}（{_rows}×{_dim}，存 {_dtype}）")
+            if _dtype != _want:
+                log(f"  ⚠️  [{_prec}] 标签说 {_prec}、实际存 {_dtype}（2026-10-29 前旧实现产物；读侧统一升位仍兼容，"
+                    "只是磁盘多付一倍 —— 下次该档整份重写时自愈，不必为此单独处理）")
+        if _good:
+            _lead = next(p for p in _EMBED_CACHE_PRECEDENCE if p in _good)
+            log(f"  ✅ 缓存选择序 {_EMBED_CACHE_PRECEDENCE} → 将优先使用 [{_lead}]（两份都在也绝不混用，"
+                "任何一轮 index 的向量取自同一份文件 + 同精度补算）")
+        else:
+            _lead = None
+            log("  ⚠️  两份候选缓存都不在：npz 不入仓/不进镜像时属**正常**（容器 index 靠 storage 里既有集合，"
+                "不需要缓存）；本地发布前没有缓存 = 下次 index 将全量重算（30-73 分钟，预期内则忽略）")
+        # 死缓存扫描：不在当前键序内的 *.npz（含 *.tmp.npz 中断残留）不再被任何运行读取，
+        # 留在盘上只是死重 —— index 成功收尾的 _gc_embed_cache_files 会自动清，这里给个账。
+        if os.path.isdir(EMBED_CACHE_DIR):
+            _current_prefix = os.path.basename(_cand_paths["fp16"])[: -len("_fp16.npz")]
+            _dead = [n for n in sorted(os.listdir(EMBED_CACHE_DIR))
+                     if n.endswith(".npz") and not n.startswith(_current_prefix)]
+            if _dead:
+                _dead_mb = sum(os.path.getsize(os.path.join(EMBED_CACHE_DIR, n)) for n in _dead) / 1e6
+                log(f"  ⚠️  死缓存 {len(_dead)} 份（{_dead_mb:.0f}MB）不被任何运行读取:{_dead[:3]}"
+                    f"{'…' if len(_dead) > 3 else ''} —— 下次 index 成功收尾自动清除（无需手工）")
+        # 清单精度档对账（verify-build 判据新增字段；旧版清单只提示不判死）
+        _m_prec = manifest.get("embed_precision")
+        if not _m_prec:
+            log("  ⚠️  清单无 embed_precision 字段（旧版清单）：该字段由本次改造后的 index 写入，"
+                "重跑一次 index 后精度对账生效")
+        elif _m_prec not in _EMBED_CACHE_PRECEDENCE:
+            _bad(f"index_manifest.embed_precision 非法值 {_m_prec!r}（允许 {_EMBED_CACHE_PRECEDENCE}）"
+                 "—— 清单可能被手工改过或版本错配，重跑 index 重写")
+        elif _m_prec in _good:
+            if _lead == _m_prec:
+                log(f"  ✅ 清单精度档与缓存选择序一致（{_m_prec}）")
+            else:
+                log(f"  ⚠️  清单记录本次入库用 [{_m_prec}]，缓存选择序将优先 [{_lead}]：下次 index 会整体换代到 "
+                    f"[{_lead}]（代内自洽、代间不混 —— 两档都是同一模型的合法产出；在意代际一致可手动只留 {_m_prec} 那份）")
+        else:
+            log(f"  ⚠️  清单记录 build 用 [{_m_prec}]，当前键序下没有该档缓存（换档/换代码指纹后已被淘汰）："
+                "下次 index 将以现有可用档位计算——与已入库向量同模型同池化，embedpairs 对拍口径内")
 
     if problems:
         log(f"❌ verify-build 未通过：{len(problems)} 项不一致（见上）—— 这份镜像不要发布")

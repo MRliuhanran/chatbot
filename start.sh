@@ -141,10 +141,12 @@ _load_dotenv() {
 #     成对重复传；名字必须与 .env 的 RAG_*_MODEL_NAME 逐字一致（客户端按名调用，运行期
 #     还有合同三查兜底）；
 #   · --device auto：cuda/mps 可用即 GPU，都没有自动 CPU（"没有 GPU 的时候用 cpu"）；
+#   · --dtype 显式 float32：infinity 自身的 auto 会在 CUDA 机会静默切 bf16/fp16，
+#     查询侧精度不允许环境说了算（可覆写 RAG_INFINITY_DTYPE；与容器内 _infinity_spec 同构）；
 #   · 已健康则复用：本脚本实例（pid 文件）或外部实例（平台自管 infinity 的场景）都放行，
 #     与 Qdrant 的"拒绝外部实例"不同 —— 推理服务无状态，来源不影响检索正确性；
-#   · 端口/前缀/超时可覆写：RAG_INFINITY_PORT / RAG_INFINITY_DEVICE / RAG_INFINITY_BATCH /
-#     RAG_INFINITY_WAIT（秒；torch 首次冷加载两模型可能数分钟）。
+#   · 端口/前缀/超时可覆写：RAG_INFINITY_PORT / RAG_INFINITY_DEVICE / RAG_INFINITY_DTYPE /
+#     RAG_INFINITY_BATCH / RAG_INFINITY_WAIT（秒；torch 首次冷加载两模型可能数分钟）。
 _ensure_infinity() {
     case "${RAG_EMBED_BACKEND:-torch}/${RAG_RERANK_BACKEND:-torch}" in
         *http*) ;;
@@ -165,10 +167,15 @@ _ensure_infinity() {
     [ -d "${_emb}" ] || _die "缺少嵌入模型目录: ${_emb}（先 ./start.sh fetch-models）"
     [ -d "${_rer}" ] || _die "缺少重排模型目录: ${_rer}（先 ./start.sh fetch-models）"
     local _dev="${RAG_INFINITY_DEVICE:-auto}" _batch="${RAG_INFINITY_BATCH:-32}"
-    _log "启动 infinity：device=${_dev}（cuda/mps 可用即 GPU，无则 CPU）、batch=${_batch}、两组模型同实例"
+    # dtype 显式钉 float32（与容器内 chatbot.py _infinity_spec 同构、质量优先档）：infinity
+    # 自己的 auto 在 CUDA 机会静默切 bf16/fp16 —— bf16 只剩 8 位尾数、排序漂移比 fp16 更大，
+    # 查询侧精度不允许"环境说了算"，改档必须是显式动作（RAG_INFINITY_DTYPE 覆写）。
+    local _dtype="${RAG_INFINITY_DTYPE:-float32}"
+    _log "启动 infinity：device=${_dev}、dtype=${_dtype}、batch=${_batch}、两组模型同实例"
     nohup infinity_emb v2 \
         --host 127.0.0.1 --port "${INFINITY_PORT}" --url-prefix /v1 \
         --engine torch --device "${_dev}" \
+        --dtype "${_dtype}" \
         --batch-size "${_batch}" \
         --model-id "${_emb}" --served-model-name "${RAG_EMBED_MODEL_NAME:-bge-m3}" \
         --model-id "${_rer}" --served-model-name "${RAG_RERANK_MODEL_NAME:-bge-reranker-v2-m3}" \
