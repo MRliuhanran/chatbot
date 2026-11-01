@@ -5583,6 +5583,10 @@ def _infinity_spec(root, env=None):
     子进程 cwd=root ⇒ 解析为 /app/models/bge-m3；落位改写产物是绝对路径，同样合法）。
     存在性校验用 abspath 对照 root，不受进程 cwd 影响。
     --device 默认 auto（容器无 GPU → cpu，与本地同语义）。
+    --no-model-warmup（2026-11-1 新增）：infinity 的 warmup calibration 每次冷启动都跑
+    （batch=8 时两模型四组计时 40-80s，本地实证 10.8s+26.7s@快CPU；容器 174s 就绪里
+    占大头）。检索闸门的就绪探测**本来就真打一发 embeddings/rerank**——正是预热动作，
+    calibration 省掉后 boot 显著变短；队列计时退回缺省 4e-3 也无害（只是排队节流）。
     """
     import shutil
     if EMBED_BACKEND != "http" and RERANK_BACKEND != "http":
@@ -5609,6 +5613,7 @@ def _infinity_spec(root, env=None):
         "--host", "127.0.0.1", "--port", port, "--url-prefix", "/v1",
         "--engine", "torch", "--device", device,
         "--batch-size", batch,
+        "--no-model-warmup",
         "--model-id", emb, "--served-model-name", scope.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME,
         "--model-id", rer, "--served-model-name", scope.get("RAG_RERANK_MODEL_NAME") or RERANK_MODEL_NAME,
     ]
@@ -5627,8 +5632,7 @@ def _startup_fingerprint_selfcheck(env):
 
     ★ 只读，绝不自动修复：启动期自动修复/复制 storage 都是**已否决方案** —— 那会把
       "数据与代码同源"偷换成"启动时猜一份"，问题被掩盖而不是被发现。不一致只打
-      ❌ [all] 行动话术交人工处理；异常只 warn，绝不因一次读取抖动拖垮容器
-      （"状态未知 ≠ 已知不一致"，与闸门的网络豁免同一口径）。
+      ❌ [all] 行动话术交人工处理；异常只 warn，绝不因一次读取抖动拖垮容器      （"状态未知 ≠ 已知不一致"，与闸门的网络豁免同一口径）。
     """
     try:
         from qdrant_client import QdrantClient
@@ -5742,6 +5746,15 @@ def cmd_all(args=None):
     env.setdefault("OLLAMA_MODELS", os.path.join(root, "ollama_models"))
     env.setdefault("QDRANT_HOST", "127.0.0.1")
     env.setdefault("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    # 2026-11-1 反思实证：容器不是常驻进程，是 FC 实例每 1800s 被平台击杀一次
+    # （运行日志 "Function timed out after 1800 seconds"）。Ollama 默认 keep_alive=5m
+    # 与用户回合间隔（>5min）不匹配 → 四回合四份 llama-server 冷加载。三个驻留旋钮：
+    #   KEEP_ALIVE=-1       模型在本周期内不卸载（FC 击杀即自然回收，无泄漏面）
+    #   NUM_PARALLEL=1      KV 预留单份（32K 窗口约省 ~2G，且 llama-server 装载更快）
+    #   MAX_LOADED_MODELS=1 单模型驻留，防并行堆叠削内存
+    env.setdefault("OLLAMA_KEEP_ALIVE", "-1")
+    env.setdefault("OLLAMA_NUM_PARALLEL", "1")
+    env.setdefault("OLLAMA_MAX_LOADED_MODELS", "1")
     # 启动期装载：权重主路径=烤镜像层（Running 即用），这里只做校验+落位；
     # 镜像层/持久盘双缺失时才触发 fetch-models 兜底。失败了退出容器交平台重启，
     # 已下载字节留盘续传；就绪后 OLLAMA_MODELS 里 manifest/gguf 至少其一，下方
@@ -5834,6 +5847,39 @@ def cmd_all(args=None):
         target=_startup_fingerprint_selfcheck, args=(env,), name="fingerprint-selfcheck", daemon=True,
     ).start()
 
+    def _preheat_ollama():
+        """Ollama 模型预热：把生成模型先驻留进 llama-server 内存。
+
+        FC 1800s 周期背景（2026-11-1 实证）：默认 keep_alive=5m 与用户回合间隔
+        （>5min）不匹配，前四个回合四份 llama-server 冷加载（各 ~10-20s）。预热在
+        **infinity 就绪之后**串跑（http 后端不与冷加载抢 2vCPU 两核）；请求参数与
+        回合链对齐——num_ctx 取与 stream_chat 相同的动态派生值（Ollama 换 ctx 会
+        重载模型，参数不一致预热就白做），num_predict=1 让生成一发即回不烧时长，
+        keep_alive=-1 与服务端旋钮一致（请求级显式更稳）。失败/异常只 warn：
+        首/次回合仍可冷加载兜底，预热不是正确性闸门。
+        """
+        try:
+            window = int(model_context_window() or 0)
+        except Exception as exc:
+            log(f"⚠️  [all] ollama 预热跳过：窗口派生失败 {type(exc).__name__}: {exc}")
+            return
+        import requests
+
+        model = env.get("MODEL") or MODEL
+        try:
+            r = requests.post(
+                OLLAMA_BASE_URL + "/api/generate",
+                json={"model": model, "prompt": "预热", "stream": False, "keep_alive": -1,
+                      "options": {"num_ctx": window, "num_predict": 1}},
+                timeout=max(60, MODEL_WAIT_SECS),
+            )
+            if r.status_code == 200:
+                log(f"[all] ollama 预热完成: {model} 已驻留（num_ctx={window}, keep_alive=-1）")
+            else:
+                log(f"⚠️  [all] ollama 预热未确认: HTTP {r.status_code}（不阻断，回合冷加载兜底）")
+        except Exception as exc:
+            log(f"⚠️  [all] ollama 预热失败: {type(exc).__name__}: {exc}（不阻断，回合冷加载兜底）")
+
     if "infinity" in specs:
         import threading
         _inf = specs["infinity"]
@@ -5850,6 +5896,7 @@ def cmd_all(args=None):
             ok, elapsed, detail = _wait_infinity_ready(_inf_port, _embed_name, _rerank_name, _inf_budget)
             if ok:
                 log(f"[all] infinity 就绪: embeddings/rerank 探测通过（冷加载 {elapsed:.0f}s）")
+                _preheat_ollama()  # http 后端：模型预热排在 infinity 就绪后，不与冷加载抢 2vCPU
                 return
             # fail-loud：检索服务判定不可用就退役整个容器（app 可能已通过平台探测，
             # 靠日志 ❌ 行说话）；平台重启容器重试——错误能在两次重启间被看到。
@@ -5868,6 +5915,10 @@ def cmd_all(args=None):
             os._exit(1)
 
         threading.Thread(target=_watch_infinity, name="infinity-watch", daemon=True).start()
+    else:
+        # torch 后端无 infinity 冷加载竞争：预热立起（与生成模型驻留旋钮组合，
+        # 回合首问不再背 llama-server 冷加载）。
+        threading.Thread(target=_preheat_ollama, name="ollama-preheat", daemon=True).start()
 
     restarts: dict = {}
     while not stopping["value"]:
