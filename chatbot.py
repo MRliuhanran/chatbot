@@ -5847,39 +5847,6 @@ def cmd_all(args=None):
         target=_startup_fingerprint_selfcheck, args=(env,), name="fingerprint-selfcheck", daemon=True,
     ).start()
 
-    def _preheat_ollama():
-        """Ollama 模型预热：把生成模型先驻留进 llama-server 内存。
-
-        FC 1800s 周期背景（2026-11-1 实证）：默认 keep_alive=5m 与用户回合间隔
-        （>5min）不匹配，前四个回合四份 llama-server 冷加载（各 ~10-20s）。预热在
-        **infinity 就绪之后**串跑（http 后端不与冷加载抢 2vCPU 两核）；请求参数与
-        回合链对齐——num_ctx 取与 stream_chat 相同的动态派生值（Ollama 换 ctx 会
-        重载模型，参数不一致预热就白做），num_predict=1 让生成一发即回不烧时长，
-        keep_alive=-1 与服务端旋钮一致（请求级显式更稳）。失败/异常只 warn：
-        首/次回合仍可冷加载兜底，预热不是正确性闸门。
-        """
-        try:
-            window = int(model_context_window() or 0)
-        except Exception as exc:
-            log(f"⚠️  [all] ollama 预热跳过：窗口派生失败 {type(exc).__name__}: {exc}")
-            return
-        import requests
-
-        model = env.get("MODEL") or MODEL
-        try:
-            r = requests.post(
-                OLLAMA_BASE_URL + "/api/generate",
-                json={"model": model, "prompt": "预热", "stream": False, "keep_alive": -1,
-                      "options": {"num_ctx": window, "num_predict": 1}},
-                timeout=max(60, MODEL_WAIT_SECS),
-            )
-            if r.status_code == 200:
-                log(f"[all] ollama 预热完成: {model} 已驻留（num_ctx={window}, keep_alive=-1）")
-            else:
-                log(f"⚠️  [all] ollama 预热未确认: HTTP {r.status_code}（不阻断，回合冷加载兜底）")
-        except Exception as exc:
-            log(f"⚠️  [all] ollama 预热失败: {type(exc).__name__}: {exc}（不阻断，回合冷加载兜底）")
-
     if "infinity" in specs:
         import threading
         _inf = specs["infinity"]
@@ -5896,7 +5863,6 @@ def cmd_all(args=None):
             ok, elapsed, detail = _wait_infinity_ready(_inf_port, _embed_name, _rerank_name, _inf_budget)
             if ok:
                 log(f"[all] infinity 就绪: embeddings/rerank 探测通过（冷加载 {elapsed:.0f}s）")
-                _preheat_ollama()  # http 后端：模型预热排在 infinity 就绪后，不与冷加载抢 2vCPU
                 return
             # fail-loud：检索服务判定不可用就退役整个容器（app 可能已通过平台探测，
             # 靠日志 ❌ 行说话）；平台重启容器重试——错误能在两次重启间被看到。
@@ -5915,10 +5881,6 @@ def cmd_all(args=None):
             os._exit(1)
 
         threading.Thread(target=_watch_infinity, name="infinity-watch", daemon=True).start()
-    else:
-        # torch 后端无 infinity 冷加载竞争：预热立起（与生成模型驻留旋钮组合，
-        # 回合首问不再背 llama-server 冷加载）。
-        threading.Thread(target=_preheat_ollama, name="ollama-preheat", daemon=True).start()
 
     restarts: dict = {}
     while not stopping["value"]:
@@ -6423,7 +6385,13 @@ def _warm_engine(engine):
             # 超时取 OLLAMA_TIMEOUT（不是硬编码 180）：慢冷启动（模型后台拉取/加载）下
             # 探针等得起，才不会把"还在加载"误报成"预热未完成"。
             _branch = _gen_gpu_branch()   # 启动/预热期定档并打一次日志，问答路径只读缓存
-            _probe_options = {"num_predict": 8, "temperature": TEMPERATURE}
+            # num_ctx 与回合链同源（2026-11-1 改）：stream_chat 每问都带 num_ctx=动态窗口，
+            # 探针若按缺省 ctx 装载，KEEP_ALIVE=-1 驻留的也是错误 ctx —— 用户首问必触发
+            # 二次整模重载（运行日志实证：探针 /api/chat 12.3s 装载刚完，02:31:20.6 又起
+            # 第二份 llama-server 装载）。探针直接按同源 num_ctx 装载：单条预热线，装载即
+            # 驻留正确 ctx，首问零重载。取值失败 model_context_window 内部自带回退档。
+            _probe_options = {"num_predict": 8, "temperature": TEMPERATURE,
+                              "num_ctx": int(model_context_window())}
             if _branch["num_gpu"] is not None:
                 # 分档已定死（_gen_gpu_branch），探针失败**不再**翻档：预热本来就不该改变
                 # 问答路径的行为，只负责让失败尽早、显眼地出现。
