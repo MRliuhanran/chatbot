@@ -167,16 +167,24 @@ _ensure_infinity() {
     [ -d "${_emb}" ] || _die "缺少嵌入模型目录: ${_emb}（先 ./start.sh fetch-models）"
     [ -d "${_rer}" ] || _die "缺少重排模型目录: ${_rer}（先 ./start.sh fetch-models）"
     local _dev="${RAG_INFINITY_DEVICE:-auto}" _batch="${RAG_INFINITY_BATCH:-32}"
-    # dtype 显式钉 float32（与容器内 chatbot.py _infinity_spec 同构、质量优先档）：infinity
-    # 自己的 auto 在 CUDA 机会静默切 bf16/fp16 —— bf16 只剩 8 位尾数、排序漂移比 fp16 更大，
-    # 查询侧精度不允许"环境说了算"，改档必须是显式动作（RAG_INFINITY_DTYPE 覆写）。
+    # dtype 由本脚本**显式**传给 infinity（与容器内 chatbot.py _infinity_spec 同构）：
+    # infinity 自己的 auto 在 CUDA 机会静默切 bf16/fp16 —— bf16 只剩 8 位尾数、排序漂移比
+    # fp16 更大，查询侧精度不允许"环境说了算"，改档必须是显式动作（RAG_INFINITY_DTYPE，
+    # 缺省 float32；8G M2 现行值 float16 —— 理由与实测见 .env 该行注释）。
     local _dtype="${RAG_INFINITY_DTYPE:-float32}"
     _log "启动 infinity：device=${_dev}、dtype=${_dtype}、batch=${_batch}、两组模型同实例"
+    # --no-model-warmup（2026-11-01 补齐，与容器 _infinity_spec 同构）：infinity 的 warmup
+    # calibration 会用 batch×512 token 跑一次满前向；8G M2 上两组模型已占满 MPS 预算时，
+    # 这一步就是 "MPS allocated 7.96GB / 尝试再分配 2.02GB" 的那一次分配，进程直接启动失败
+    # （infinity.log 实证，batch=8 与 32 两次都死在这里）。就绪闸只查 /health，而就绪探测
+    # 本来就真打一发 embeddings/rerank —— 那才是真预热；省掉 calibration 后本地冷启也从
+    # ~88s 收敛到 ~48s。容器早已这么干，本地脚本此前漏传，本行把两端拉平。
     nohup infinity_emb v2 \
         --host 127.0.0.1 --port "${INFINITY_PORT}" --url-prefix /v1 \
         --engine torch --device "${_dev}" \
         --dtype "${_dtype}" \
         --batch-size "${_batch}" \
+        --no-model-warmup \
         --model-id "${_emb}" --served-model-name "${RAG_EMBED_MODEL_NAME:-bge-m3}" \
         --model-id "${_rer}" --served-model-name "${RAG_RERANK_MODEL_NAME:-bge-reranker-v2-m3}" \
         >"${INFINITY_LOG}" 2>&1 &

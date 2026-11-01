@@ -19,6 +19,12 @@ FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
+# ── 部署环境覆写（2026-11-01）：容器是纯 CPU（2vCPU），查询侧 fp16 没有算力收益（反而多一层
+#    fp16↔fp32 转换开销、个别算子未实现的风险）；.env 里的 RAG_INFINITY_DTYPE=float16 是给
+#    本地 M2（8G 统一内存、MPS 换页）用的。ENV 值进镜像后运行时 load_dotenv(override=False)
+#    不会覆盖它 → 容器恒 float32（质量优先档），本地仍按 .env 走 float16。两端差异只有这一处。
+ENV RAG_INFINITY_DTYPE=float32
+
 # http 后端依赖，一句话三块：
 #   ① [torch,server]=infinity 引擎+HTTP 面板（typer<0.13 钉死 → 配套 click==8.1.8 防
 #      未来 base 重建时 pip 现解 newer click 与 typer 0.12.5 CLI 解析不兼容
