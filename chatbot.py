@@ -192,7 +192,12 @@ def _cgroup_facts():
 
 
 def _hw_facts():
-    """(核数, 内存MB, 来源串)。环境变量优先 → cgroup → 线程族回退 → 安全回退。"""
+    """(核数, 内存MB, 来源串)。环境变量优先 → cgroup → os.cpu_count/psutil → 线程族回退。
+
+    2026-11-01：macOS 没有 /proc/cgroup，旧实现探测失败后核数写死 4、内存 None ——
+    裸跑 process 只开 1 路、index 只用 4 线程、写批退化成 1 路（实测吃过 88 分钟）。
+    这里补 os.cpu_count() 与 psutil/sysctl 总内存，让本机与 Linux 容器使用同一套事实。
+    """
     cached = _HW_PROBE.get("facts")
     if cached:
         return cached
@@ -212,12 +217,22 @@ def _hw_facts():
             mem = cg_mem
             src.append(f"cgroup→{cg_mem}MB")
     if not cores:
-        # 最后兜底：线程族也是"这台机器能用几个核"的另一份结论，直接沿用
+        # 线程族显式配置优先于自动探测：用户设了就是要用它
         for name in ("HW_THREADS", "TORCH_NUM_THREADS", "OMP_NUM_THREADS"):
             cores = _probe_positive_int(name)
             if cores:
                 src.append(f"回退 {name}={cores}")
                 break
+    if not cores:
+        detected = os.cpu_count()
+        if detected:
+            cores = int(detected)
+            src.append(f"os.cpu_count→{cores}核")
+    if not mem:
+        total = _mem_total_mb()
+        if total:
+            mem = total
+            src.append(f"psutil/sysctl→{mem}MB")
     facts_out = (max(1, int(cores)) if cores else 4, mem if mem else None, " + ".join(src) or "探测失败→安全回退(4 核/内存按紧张)")
     _HW_PROBE["facts"] = facts_out
     return facts_out
@@ -248,8 +263,9 @@ def _mem_available_mb():
       （memory.max - memory.current；v1 用 usage/limit），与宿主 MemAvailable 取 min。
       报小的失真方向是安全的：current 把可回收的 file 页也算进占用 → 头寸偏小 → gate
       倾向照卸，不会导向"误判有余量"的死亡方向。
-    · 探测不到（macOS 无 /proc 无 cgroup v2/v1 文件）返回 None —— 调用方必须按
-      "闸门不可用"跳过，而不是拿 None 当无穷大。
+    · 探测不到时返回 None —— 调用方必须按"闸门不可用"跳过，而不是拿 None 当无穷大。
+    2026-11-01：补 psutil.virtual_memory().available —— macOS 上这是唯一可用的读数，
+    没有它 index 内存闸门会在本机永远 fail-open（等于没有保护）。
     """
     readings = []
     try:
@@ -275,6 +291,11 @@ def _mem_available_mb():
             readings.append(max(0, _lim_kb - _u))
         except Exception:
             continue
+    try:
+        import psutil
+        readings.append(max(0, int(psutil.virtual_memory().available // (1024 * 1024))))
+    except Exception:
+        pass
     return min(readings) if readings else None
 
 
@@ -286,8 +307,17 @@ _WRITE_WORKER_MEM_MB = 512
 
 
 def offline_workers(mem_mb=None, unit_mb=_OFFLINE_WORKER_MEM_MB):
-    """离线池并行度 = min(核数, 可用内存 / 单路常驻)。"""
+    """离线池并行度 = min(核数, 可用内存 / 单路常驻)。
+
+    2026-11-01：内存口径从"整机总量"改为"当前可用量 - 512MB 安全垫" —— 同机还有
+    serve/infinity 时把 8 路全开会把机器压进 swap；可用量未知才退回总量。
+    """
     mem = hw_mem_mb() if mem_mb is None else mem_mb
+    if mem_mb is None:
+        avail = _mem_available_mb()
+        if avail is not None:
+            usable = max(512, avail - 512)
+            mem = min(mem, usable) if mem else usable
     by_mem = max(1, mem // unit_mb) if mem else 1
     return max(1, min(hw_cores(), by_mem))
 
@@ -354,6 +384,266 @@ def embed_batch_note(device):
     if EMBED_BATCH_SIZE:
         return f"显式 RAG_EMBED_BATCH_SIZE={EMBED_BATCH_SIZE}"
     return f"派生 device={device} {hw_report()}"
+
+
+def _mem_total_mb():
+    """整机总内存 MB：HW_MEM_MB → cgroup 限额 → psutil 总量 → macOS sysctl；失败 None。
+
+    与 hw_mem_mb() 的区别：这里是"机器有多少"，不看当前可用量；预算档（精度/批大小）
+    必须用稳定的整机事实，不能随浏览器开合而变化，否则构建与查询会得出两个 dtype。
+    """
+    env = _probe_positive_int("HW_MEM_MB")
+    if env:
+        return env
+    _, cg_mem = _cgroup_facts()
+    if cg_mem:
+        return cg_mem
+    try:
+        import psutil
+        return max(1, int(psutil.virtual_memory().total // (1024 * 1024)))
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3
+            ).stdout.strip()
+            if out.isdigit():
+                return max(1, int(out) // (1024 * 1024))
+        except Exception:
+            pass
+    return None
+
+
+_POWER_PROBE: dict = {"ts": 0.0, "state": None}
+
+
+def _detect_power():
+    """macOS 电源/低电量模式探测（30s 缓存）。非 macOS 或探测失败返回 None。"""
+    now = time.time()
+    if _POWER_PROBE.get("state") is not None and now - float(_POWER_PROBE.get("ts") or 0.0) < 30.0:
+        return _POWER_PROBE["state"]
+    state = None
+    if sys.platform == "darwin":
+        try:
+            import subprocess
+            batt = subprocess.run(
+                ["pmset", "-g", "batt"], capture_output=True, text=True, timeout=3
+            ).stdout
+            source = "battery" if "Battery Power" in batt else ("ac" if "AC Power" in batt else "unknown")
+            cfg = subprocess.run(
+                ["pmset", "-g"], capture_output=True, text=True, timeout=3
+            ).stdout
+            low = False
+            m = re.search(r"lowpowermode\s+(\d+)", cfg)
+            if m:
+                low = m.group(1) == "1"
+            state = {"source": source, "low_power": low}
+        except Exception:
+            state = None
+    _POWER_PROBE["state"] = state
+    _POWER_PROBE["ts"] = now
+    return state
+
+
+def _detect_build_device():
+    """本进程可用推理设备：mps > cuda > cpu（与 get_device 同判据，供预检独立调用）。"""
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def runtime_precision_policy(device=None, total_mb=None):
+    """**查询侧精度预算档**（也是 index 的默认目标精度）。
+
+    2026-11-01 决策：精度不再由人手工钉，而由"机器内存预算 + 设备"推导；构建期预检
+    用同一函数预测查询侧档位，不一致就在**构建启动时**失败，而不是等到首轮检索。
+      · GPU（MPS/CUDA）统一内存：<16GB → fp16（fp32 两组模型 4.4G + Ollama/应用会换页）；
+        ≥16GB → fp32（质量档可用）。
+      · CPU：恒 fp32（CPU fp16 更慢，且 CPU 上 fp32 才是既有质量口径）。
+    显式 RAG_INFINITY_DTYPE 仍是最终覆写；但构建设置不一致会被预检拦下（见 build_policy）。
+    """
+    device = device or _detect_build_device()
+    if total_mb is None:
+        total_mb = _mem_total_mb()
+    if device in ("mps", "cuda"):
+        if total_mb and int(total_mb) >= 16384:
+            return "fp32", f"GPU 统一内存 {total_mb}MB ≥ 16384MB，预算允许 fp32"
+        return "fp16", f"GPU 统一内存 {total_mb or '未知'}MB < 16384MB，预算档 fp16（fp32 会换页）"
+    return "fp32", "CPU 路径 fp32（CPU fp16 更慢且语义漂移）"
+
+
+def runtime_infinity_dtype(scope=None):
+    """infinity 的 --dtype：显式 RAG_INFINITY_DTYPE 优先；空/auto 时按内存预算档推导。"""
+    raw = ""
+    if scope is not None:
+        raw = str(scope.get("RAG_INFINITY_DTYPE") or "")
+    else:
+        raw = str(os.getenv("RAG_INFINITY_DTYPE") or "")
+    raw = raw.strip().lower()
+    if raw in ("float16", "fp16", "half"):
+        return "float16"
+    if raw in ("float32", "fp32", "float"):
+        return "float32"
+    precision, _why = runtime_precision_policy()
+    return "float16" if precision == "fp16" else "float32"
+
+
+def detect_resources():
+    """一次性汇总构建/查询都用得到的机器事实（供日志、预检、自适应参数使用）。"""
+    cores = hw_cores()
+    total = _mem_total_mb()
+    avail = _mem_available_mb()
+    device = _detect_build_device()
+    power = _detect_power()
+    try:
+        load1 = float(os.getloadavg()[0])
+    except Exception:
+        load1 = None
+    return {
+        "cores": cores,
+        "mem_total_mb": total,
+        "mem_available_mb": avail,
+        "device": device,
+        "power": power,
+        "load1": load1,
+    }
+
+
+def _estimate_embed_peak_mb(device, precision, batch):
+    """嵌入阶段峰值内存估算（含权重/激活/框架缓冲；按实测平台留出保守余量）。"""
+    if device == "mps":
+        return (1200 + 55 * batch) if precision == "fp16" else (2300 + 90 * batch)
+    if device == "cuda":
+        return (1300 + 50 * batch) if precision == "fp16" else (2400 + 90 * batch)
+    return 2200 if precision == "fp16" else 2400
+
+
+def build_policy(res=None):
+    """构建期自适应策略：设备、精度、批大小、线程、写并发一次算清并给出来源。
+
+    精度契约（本函数是唯一推导点）：
+      · 默认目标 = runtime_precision_policy()（查询侧预算档）→ 构建与查询同档；
+      · RAG_INDEX_PRECISION / RAG_EMBED_FORCE_FP32 是显式覆写，必须 RAG_ALLOW_PRECISION_OVERRIDE=1；
+      · 覆写未开时，构建立即失败（在预检里抛），不浪费一次全量重建。
+    """
+    res = res or detect_resources()
+    policy_prec, policy_reason = runtime_precision_policy(res["device"], res["mem_total_mb"])
+    override = (os.getenv("RAG_INDEX_PRECISION") or "").strip().lower()
+    if override in ("fp16", "fp32"):
+        target, target_src = override, f"RAG_INDEX_PRECISION={override}"
+    elif EMBED_FORCE_FP32:
+        target, target_src = "fp32", "RAG_EMBED_FORCE_FP32=1"
+    else:
+        target, target_src = policy_prec, "内存预算策略"
+    allow = env_bool("RAG_ALLOW_PRECISION_OVERRIDE", False)
+    device = (INDEX_DEVICE or "").strip() or res["device"]
+    if device not in ("mps", "cuda", "cpu"):
+        device = res["device"]
+    if device == "cpu" and target == "fp16":
+        target, target_src = "fp32", target_src + "（CPU 强制 fp32）"
+    batch = EMBED_BATCH_SIZE or embed_batch_size(device, res["mem_total_mb"])
+    avail = res["mem_available_mb"]
+    if avail is not None:
+        while batch > 8 and _estimate_embed_peak_mb(device, target, batch) > max(1024, avail - 1536):
+            batch //= 2
+    return {
+        "resources": res,
+        "policy_precision": policy_prec,
+        "policy_reason": policy_reason,
+        "precision": target,
+        "precision_source": target_src,
+        "allow_override": allow,
+        "device": device,
+        "batch_size": batch,
+        "threads": res["cores"],
+        "embed_peak_mb": _estimate_embed_peak_mb(device, target, batch),
+        "write_workers": INDEX_WRITE_WORKERS or qdrant_write_workers(999),
+    }
+
+
+def _resource_gate(pol):
+    """真正要跑嵌入之前的资源闸门（内存/电源/负载）。
+
+    从 index_preflight() 拆出来：完整缓存命中的 index 只写 Qdrant（秒级），不该因为电池/
+    低电量被拦；只有"确实要算向量"（missing 非空）时才需要这些前置条件。
+    """
+    res = pol["resources"]
+    avail = res["mem_available_mb"]
+    need = int(pol["embed_peak_mb"] * 1.35) + 512
+    if INDEX_MIN_FREE_MB:
+        need = max(need, INDEX_MIN_FREE_MB)
+    if avail is None:
+        log("⚠️  index 内存闸门：本机读不到可用内存，跳过（不影响构建）")
+    elif avail < need:
+        raise RuntimeError(
+            f"可开内存 {avail}MB < 本次构建所需 {need}MB（峰值估算 {pol['embed_peak_mb']}MB + 余量，"
+            f"RAG_INDEX_MIN_FREE_MB={INDEX_MIN_FREE_MB}）：大概率 serve/infinity/Ollama 同机驻留。"
+            f"先停 serve/infinity/Ollama（Qdrant 可留）释放内存后重跑 index。"
+        )
+    else:
+        log(f"index 内存闸门: 可开 {avail}MB ≥ 所需 {need}MB（峰值估算 {pol['embed_peak_mb']}MB）")
+    power = res.get("power") or {}
+    if power:
+        if power.get("low_power") and not env_bool("RAG_INDEX_ALLOW_LOW_POWER", False):
+            raise RuntimeError(
+                "低电量模式=1：CPU/GPU 被系统限频，全量构建会慢数倍。"
+                "关闭低电量模式（系统设置→电池）后重跑；或显式 RAG_INDEX_ALLOW_LOW_POWER=1 强行构建。"
+            )
+        if power.get("source") == "battery" and not env_bool("RAG_INDEX_ALLOW_BATTERY", False):
+            raise RuntimeError(
+                "电池供电：8G M2 上 GPU 有效吞吐会掉到插电的一半左右（实测 13.7 vs ~27 块/s）。"
+                "插电后重跑；或显式 RAG_INDEX_ALLOW_BATTERY=1 强行构建。"
+            )
+    if res.get("load1") is not None and res["load1"] > max(4.0, res["cores"] * 0.75):
+        log(f"⚠️  当前 load1={res['load1']:.1f} 偏高：同机有其他负载，构建墙钟会被拉长（但不会失败）")
+
+
+def index_preflight():
+    """index 构建启动预检：精度链 / 内存 / 电源 / 自适应参数，全部在**做任何工作之前**。
+
+    用户决策 2026-11-01：精度链不一致必须像"代码编译不过"一样在构建启动时失败，
+    不能跑完 88 分钟才在运行期发现；资源按机器上限自动选择，不靠人手填 HW_*。
+    """
+    res = detect_resources()
+    pol = build_policy(res)
+    power = res.get("power") or {}
+    power_txt = (
+        f"{power.get('source')} low_power={power.get('low_power')}" if power else "未知"
+    )
+    log(
+        f"[自适应] 设备={pol['device']} 核数={res['cores']} 内存={res['mem_total_mb']}MB"
+        f"(可用 {res['mem_available_mb']}MB) 电源={power_txt} 精度={pol['precision']}"
+        f"({pol['precision_source']}) batch={pol['batch_size']} 写并发={pol['write_workers']}"
+    )
+    if pol["precision"] != pol["policy_precision"] and not pol["allow_override"]:
+        raise RuntimeError(
+            f"精度链不一致（构建启动即失败）：本次要构建 {pol['precision']}（{pol['precision_source']}），"
+            f"但查询侧按内存预算只能是 {pol['policy_precision']}（{pol['policy_reason']}）。"
+            f"这会导致索引与查询不同精度、质量口径无法保证。"
+            f"处置：① 让构建跟随预算档（去掉 RAG_INDEX_PRECISION / RAG_EMBED_FORCE_FP32）；"
+            f"② 确实要强制异档，显式设 RAG_ALLOW_PRECISION_OVERRIDE=1 并同步设 RAG_INFINITY_DTYPE。"
+        )
+    return pol    # Qdrant 可达性：不要等嵌入跑完 20-90 分钟才在写入阶段发现连不上。
+    try:
+        _probe = _qdrant_client(timeout=max(5, min(QDRANT_TIMEOUT, 15)))
+        _n = len(_probe.get_collections().collections)
+        _probe.close()
+        _mode = "gRPC" if _QDRANT_GRPC_STATE.get("ok") else "HTTP"
+        log(f"Qdrant 就绪: {_n} 个集合（写入通道 {_mode}）")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Qdrant 未就绪或不可达（{QDRANT_HOST}:{QDRANT_PORT} / gRPC {QDRANT_GRPC_PORT}）："
+            f"{type(exc).__name__}: {exc}。先 ./start.sh start（或单独起 Qdrant）再跑 index。"
+        ) from exc
+    return pol
 
 
 class _StdoutHandler(logging.StreamHandler):
@@ -1169,6 +1459,11 @@ QDRANT_API_KEY = (os.getenv("QDRANT_API_KEY") or os.getenv("RAG_QDRANT_API_KEY")
 # Qdrant 客户端超时（秒）：普通查询走它，批量重建（sparse）在调用点给 2 倍。
 # 0 之前由各调用点各自写死 60/30/120 —— 有的默认、有的没设，故障表现既不透明也不一致。
 QDRANT_TIMEOUT = env_int_min("RAG_QDRANT_TIMEOUT", 60, 1)
+# Qdrant 写入通道：gRPC（2026-11-01 用户决策）。HTTP 单批 body≈24MB 已逼近
+# service.max_request_size_mb=32 的天花板；gRPC 同批约 7MB，且无 JSON 编解码开销。
+# 探测失败自动回退 HTTP（老服务端/端口未开时构建不至于失败），状态在进程内缓存。
+QDRANT_GRPC_PORT = env_int_min("RAG_QDRANT_GRPC_PORT", 6334, 1)
+QDRANT_PREFER_GRPC = env_bool("RAG_QDRANT_GRPC", True)
 # Qdrant 写批并发度（index）：0/未设 = 派生（见 qdrant_write_workers，规则来自实测 RTT +
 # Little 定律）；显式值只用来压测/限流，正常路径不该填。sparse 的页并发共用同一个派生。
 INDEX_WRITE_WORKERS = env_int_min("RAG_INDEX_WRITE_WORKERS", 0, 0)
@@ -1950,12 +2245,63 @@ def _chunk_capture_log(*parts):
 
 
 def _chunk_worker_tokenizer():
-    """worker 进程内的 tokenizer 单例（懒加载）：全部命中缓存时一个 token 都不用分。"""
+    """worker 进程内的分词器单例：Rust tokenizers 直读 tokenizer.json（不再装 transformers）。
+
+    2026-11-01 提速：旧实现每篇文档都走 HF AutoTokenizer，且 worker 冷启动要 import
+    transformers（2.4-5.7s/进程）。这里直接 tokenizers.Tokenizer 读 tokenizer.json ——
+    与 HF 同一份底层实现、逐 id 相等（实测 8 篇全篇 encode 0 差异），启动只 import
+    tokenizers；再叠一层"文本→token 数"记忆化（父/子 splitter 与合并回调会重复数同一段）。
+    tokenizers 缺失/无 tokenizer.json 时自动回退 HF，语义不变。
+    """
     tok = _CHUNK_WORKER.get("tokenizer")
-    if tok is None:
+    if tok is not None:
+        return tok
+
+    class _CachedTokenizer:
+        """最小接口：只需 encode(text, add_special_tokens=False) → 带 len 的 id 列表。"""
+
+        __slots__ = ("_encode", "_cache", "_chars", "_max_entries", "_max_chars")
+
+        def __init__(self, encode_fn):
+            self._encode = encode_fn
+            self._cache: dict = {}
+            self._chars = 0
+            self._max_entries = 200_000
+            self._max_chars = 64 * 1024 * 1024
+
+        def encode(self, text, add_special_tokens=False):
+            cached = self._cache.get(text)
+            if cached is not None:
+                return cached
+            ids = self._encode(text, add_special_tokens)
+            if len(self._cache) < self._max_entries:
+                self._cache[text] = ids
+                self._chars += len(text)
+                if self._chars > self._max_chars:
+                    self._cache.clear()
+                    self._chars = 0
+            return ids
+
+    try:
+        import tokenizers as _tokenizers
+        path = os.path.join(EMBED_MODEL_PATH, "tokenizer.json")
+        raw = _tokenizers.Tokenizer.from_file(path)
+
+        def _rust_encode(text, add_special_tokens):
+            return raw.encode(text, add_special_tokens=add_special_tokens).ids
+
+        tok = _CachedTokenizer(_rust_encode)
+        _CHUNK_WORKER["tokenizer_kind"] = "rust"
+    except Exception as exc:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
-        _CHUNK_WORKER["tokenizer"] = tok
+        hf = AutoTokenizer.from_pretrained(EMBED_MODEL_PATH)
+
+        def _hf_encode(text, add_special_tokens):
+            return hf.encode(text, add_special_tokens=add_special_tokens)
+
+        tok = _CachedTokenizer(_hf_encode)
+        _CHUNK_WORKER["tokenizer_kind"] = f"hf-fallback({type(exc).__name__})"
+    _CHUNK_WORKER["tokenizer"] = tok
     return tok
 
 
@@ -2014,6 +2360,30 @@ def _chunk_one_document(job):
         log = prev_log
 
 
+def _chunks_fast_path_meta(paths, name_of, sources_now, fingerprint):
+    """process 快路径判据：指纹未变、产物在、每篇文档缓存都在 → 连读 60MB 缓存+重写 61MB 都省掉。
+
+    只读 meta + stat 每个文档缓存（不解析 60MB JSON）；判据与全量路径共用同一套指纹
+    （meta.fingerprint 已含 config + 源 sha），缓存内容损坏由下一次真实重算兜底。
+    """
+    if not (os.path.exists(CHUNKS_JSON) and os.path.exists(CHUNKS_META_JSON)):
+        return None
+    try:
+        with open(CHUNKS_META_JSON, encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("meta_version") != CHUNKS_META_VERSION:
+            return None
+        if meta.get("fingerprint") != fingerprint or meta.get("sources") != sources_now:
+            return None
+        for p in paths:
+            cache_path = _doc_cache_path(name_of[p])
+            if not os.path.exists(cache_path) or os.path.getsize(cache_path) < 64:
+                return None
+        return meta
+    except Exception:
+        return None
+
+
 def build_chunks():
     # 上次 process 中断留下的半截 tmp（原子写靠 os.replace 收尾）：进到这里说明本轮
     # 没有别的 writer 在跑（process 单进程串行），直接清掉，不让孤儿 tmp 永久占盘。
@@ -2045,6 +2415,27 @@ def build_chunks():
     reused = 0
     failures: list = []
     total = len(paths)
+    workers = min(total, offline_workers()) if total else 1
+    # 2026-11-01 快路径：指纹与文档缓存全部命中时，旧路径仍要逐篇 json.load 60MB 再重写
+    # 61MB（实测 0.9s 里 ~83% 都是这两件事）。这里只 stat 缓存文件就收工。
+    fast_meta = _chunks_fast_path_meta(paths, name_of, sources_now, fingerprint) if total else None
+    if fast_meta is not None:
+        _gc_doc_chunks(names_now)
+        _wall_s = time.time() - t_start
+        log(f"process 快路径: 指纹未变、{total}/{total} 篇文档缓存齐全 → 跳过重算与 61MB 重写")
+        log(f"process 墙钟: {_wall_s:.1f}s（复用 {total}/{total} 篇，并行 {workers} 路；{hw_report()}）")
+        record_build_stats({
+            "stage": "process",
+            "wall_s": round(_wall_s, 3),
+            "docs": total,
+            "chunks": fast_meta.get("total_chunks"),
+            "parents": fast_meta.get("total_parents"),
+            "reused": total,
+            "workers": workers,
+            "chunks_per_s": None,
+            "fingerprint": fingerprint,
+        })
+        return 0
     # 逐文档兜底语义不变：单篇坏数据/异常只跳过自己，末尾因 failures 短路返回、不覆盖
     # chunks.json —— 残缺产物一旦入库，索引就会静默少文档。
     # per-doc 缓存判据用「分块配置指纹 + 本文档 sha」，**不是**语料级全局 fingerprint：
@@ -2058,7 +2449,15 @@ def build_chunks():
         (i, filepath, name_of[filepath], sources_now[os.path.relpath(filepath, DATA_DIR)], config_fp, total)
         for i, filepath in enumerate(paths)
     ]
-    workers = min(total, offline_workers()) if total else 1
+    # LPT 调度：大文档先发（处理时间与字节数相关性 0.98），减少 8 路池的尾部拖尾；
+    # 结果仍按 done[idx] 原下标归位，产物顺序与串行逐字节一致。
+    _doc_sizes: dict = {}
+    for _p in paths:
+        try:
+            _doc_sizes[_p] = os.path.getsize(_p)
+        except OSError:
+            _doc_sizes[_p] = 0
+    dispatch = sorted(jobs, key=lambda j: (-_doc_sizes.get(j[1], 0), j[0]))
     log(f"分块并行度: {workers} 路（{hw_report()}）；按文档分发、按原顺序收集，产物与串行逐字节一致")
     done: list = [None] * total
     cursor = 0
@@ -2097,7 +2496,7 @@ def build_chunks():
             next_job = 0
             while next_job < total or pending:
                 while next_job < total and len(pending) < workers * 2:
-                    job = jobs[next_job]
+                    job = dispatch[next_job]
                     next_job += 1
                     pending[pool.submit(_chunk_one_document, job)] = job[0]
                 finished, _ = wait(list(pending), return_when=FIRST_COMPLETED)
@@ -2788,12 +3187,97 @@ def _save_embed_cache(path, keys, matrix, precision="fp32"):
         dtype = "float16" if precision == "fp16" else "float32"
         np.savez(tmp, keys=np.array(keys, dtype="U64"), vectors=matrix.astype(dtype))
         os.replace(tmp, path)
+        return True
     except Exception as exc:
         log(f"    ⚠️  向量缓存写入失败（本次索引不受影响）: {type(exc).__name__}: {exc}")
         try:
             os.remove(tmp)  # 失败留下的半截 tmp 别占盘
         except OSError:
             pass
+        return False
+
+
+_EMBED_PART_FORMAT = 1
+
+
+def _embed_parts_dir(cache_path):
+    return cache_path[:-4] + ".parts" if cache_path.endswith(".npz") else cache_path + ".parts"
+
+
+def _load_embed_parts(cache_path, expected_dim=None):
+    """载入断点分片（index 中断后下次续算）；坏分片只删除并告警，不阻断构建。"""
+    import numpy as np
+    out: dict = {}
+    d = _embed_parts_dir(cache_path)
+    if not os.path.isdir(d):
+        return out
+    for name in sorted(os.listdir(d)):
+        if not name.endswith(".part.npz"):
+            continue
+        path = os.path.join(d, name)
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                fmt = int(np.asarray(data["format"]).reshape(-1)[0]) if "format" in data else 0
+                dim = int(np.asarray(data["dim"]).reshape(-1)[0]) if "dim" in data else 0
+                keys = data["keys"].tolist()
+                vecs = data["vectors"]
+            if fmt != _EMBED_PART_FORMAT:
+                raise ValueError(f"分片格式 {fmt} 与当前 {_EMBED_PART_FORMAT} 不一致")
+            if vecs.dtype != np.float32:
+                vecs = vecs.astype(np.float32)
+            if dim and expected_dim and dim != expected_dim:
+                raise ValueError(f"分片维度 {dim} 与模型期望 {expected_dim} 不一致")
+            _check_embed_cache_shape(len(keys), vecs, expected_dim)
+            for k, v in zip(keys, vecs):
+                out[k] = v
+        except Exception as exc:
+            log(f"    ⚠️  断点分片不可用，忽略并删除 {name}: {type(exc).__name__}: {exc}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if out:
+        log(f"断点续算载入: {len(out)} 条（{os.path.basename(d)}）")
+    return out
+
+
+def _save_embed_part(cache_path, seq, keys, embeddings, indices, precision):
+    """把一段已算向量原子落成断点分片；失败只告警，不影响本次构建。"""
+    import numpy as np
+    d = _embed_parts_dir(cache_path)
+    tmp = ""
+    try:
+        os.makedirs(d, exist_ok=True)
+        selected_keys = [keys[i] for i in indices]
+        vecs = np.vstack([np.asarray(embeddings[i], dtype="float32") for i in indices])
+        dtype = "float16" if precision == "fp16" else "float32"
+        path = os.path.join(d, f"part-{seq}.part.npz")
+        tmp = path + ".tmp.npz"
+        np.savez(
+            tmp,
+            format=np.array([_EMBED_PART_FORMAT], dtype="int32"),
+            dim=np.array([vecs.shape[1]], dtype="int32"),
+            keys=np.array(selected_keys, dtype="U64"),
+            vectors=vecs.astype(dtype),
+        )
+        os.replace(tmp, path)
+        log(f"  断点已落盘: {len(indices)} 条 → {os.path.basename(path)}")
+    except Exception as exc:
+        log(f"    ⚠️  断点分片写入失败（不影响本次构建）: {type(exc).__name__}: {exc}")
+        try:
+            if tmp:
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _gc_embed_parts(cache_path):
+    """构建成功、终态 npz 已落盘后清掉分片目录。"""
+    import shutil
+    try:
+        shutil.rmtree(_embed_parts_dir(cache_path), ignore_errors=True)
+    except Exception:
+        pass
 
 
 def _gc_embed_cache_files():
@@ -2821,6 +3305,18 @@ def _gc_embed_cache_files():
             log(f"向量缓存 GC: 当前键序 {prefix}*，删除 {len(removed)} 份不再可读的旧缓存:")
             for name in removed:
                 log(f"  - {name}")
+        # 2026-11-01：断点分片目录也按同一键序 GC（旧模型/旧代码的 *.parts 再也不会被
+        # 任何一次续算读取，不清就是永久占盘；当前键序的 fp16/fp32 分片目录保留）。
+        import shutil
+        removed_parts = []
+        for name in sorted(os.listdir(EMBED_CACHE_DIR)):
+            path = os.path.join(EMBED_CACHE_DIR, name)
+            if not name.endswith(".parts") or not os.path.isdir(path) or name.startswith(prefix):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed_parts.append(name)
+        if removed_parts:
+            log(f"断点分片 GC: 删除 {len(removed_parts)} 个旧键序分片目录")
     except Exception as exc:
         log(f"    ⚠️  向量缓存文件清理失败（不影响本次索引）: {type(exc).__name__}: {exc}")
 
@@ -2872,6 +3368,39 @@ def _upsert_batch_with_retry(client: Any, collection_name: str, points: list, re
             if attempt < retries:
                 log(f"    ⚠️  upsert 失败，立即重试（{attempt + 1}/{retries}）: {type(exc).__name__}: {exc}")
     return f"{type(last).__name__}: {last}"
+
+
+_QDRANT_GRPC_STATE: dict = {"ok": None}
+
+
+def _qdrant_client(*, timeout=None, prefer_grpc=None):
+    """构建/重建专用 Qdrant 客户端：优先 gRPC，探测失败自动回退 HTTP。
+
+    只用于写入链路（index/sparse）——在线检索客户端保持原样，避免改变查询语义。
+    gRPC 对 Document（Qdrant 内置 BM25 稀疏）由 qdrant-client 官方转换，无需改点构造。
+    """
+    from qdrant_client import QdrantClient
+    timeout = QDRANT_TIMEOUT if timeout is None else timeout
+    prefer = QDRANT_PREFER_GRPC if prefer_grpc is None else prefer_grpc
+    if prefer and _QDRANT_GRPC_STATE.get("ok") is not False:
+        try:
+            client = QdrantClient(
+                host=QDRANT_HOST,
+                port=QDRANT_PORT,
+                grpc_port=QDRANT_GRPC_PORT,
+                prefer_grpc=True,
+                api_key=QDRANT_API_KEY,
+                timeout=timeout,
+            )
+            if _QDRANT_GRPC_STATE.get("ok") is None:
+                client.get_collections()   # 真探一次：端口没开/服务端版本旧会在这里失败
+                _QDRANT_GRPC_STATE["ok"] = True
+                log(f"  Qdrant 写入通道: gRPC 127.0.0.1:{QDRANT_GRPC_PORT}")
+            return client
+        except Exception as exc:
+            _QDRANT_GRPC_STATE["ok"] = False
+            log(f"    ⚠️  Qdrant gRPC 不可用，回退 HTTP: {type(exc).__name__}: {exc}")
+    return QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=timeout)
 
 
 def _current_alias_target(client, alias=COLLECTION_ALIAS):
@@ -2979,24 +3508,10 @@ def build_index():
         SparseVectorParams,
         VectorParams,
     )
+    # 构建启动预检（用户决策 2026-11-01）：精度链 / 内存 / 电源 / 自适应参数，全部在
+    # 读语料、加载模型之前判定；不一致像"编译不过"一样当场失败，不浪费一次全量重建。
+    policy = index_preflight()
     meta = verify_chunks_freshness()
-    # 内存闸门（RAG_INDEX_MIN_FREE_MB > 0 时启用）：嵌入阶段实测峰值 ~2.2-3.0G，与
-    # serve（进程内检索模型 ~2-3G）或生成模型（131072 档 KV 预留 ≈3G + 权重 1.6G）
-    # 同机并存就会顶穿 8G —— "重建与服务的隔离规则"在这里用可开内存表达，不检测进程。
-    # macOS 探测不到 MemAvailable：闸门跳过但显式说明（不冒充"检查过了"）。
-    _free_mb = _mem_available_mb()
-    if INDEX_MIN_FREE_MB > 0:
-        if _free_mb is None:
-            log(f"⚠️  index 内存闸门：本机读不到 MemAvailable（macOS/容器外），跳过检查（门槛 {INDEX_MIN_FREE_MB}MB 未生效）")
-        elif _free_mb < INDEX_MIN_FREE_MB:
-            raise RuntimeError(
-                f"可开内存 {_free_mb}MB < 门槛 {INDEX_MIN_FREE_MB}MB（RAG_INDEX_MIN_FREE_MB）："
-                f"大概率有 serve/生成模型同机驻留。按 README §11.4 的隔离规则："
-                f"先停生成/检索侧负载再跑 index；确要强行重建请临时把 "
-                f"RAG_INDEX_MIN_FREE_MB 调低后重试（后果自担）"
-            )
-        else:
-            log(f"index 内存闸门: 可开 {_free_mb}MB ≥ 门槛 {INDEX_MIN_FREE_MB}MB")
     with open(CHUNKS_JSON, encoding="utf-8") as f:
         all_chunks = json.load(f)
         # ★ 记录键集必须与当前契约一致：改 RAG_SOURCE_FIELD 后只跑 index（没跑 process）时，
@@ -3028,6 +3543,13 @@ def build_index():
     # 不会读两遍。
     cands = _inspect_embed_caches(keys) if (EMBED_CACHE_ENABLED and total) else []
     hit = _full_embed_cache(cands)
+    target_precision = policy["precision"]
+    if hit is not None and hit[0] != target_precision:
+        log(
+            f"稠密缓存完整命中但精度 {hit[0]} ≠ 本次目标 {target_precision}"
+            f"（{policy['precision_source']}）：忽略旧档，按目标精度重算（缓存键分档，不会混用）"
+        )
+        hit = None
     if not total:
         # 空产物 =「已清空」的合法边界（corpus 被清空，见 _document_paths / build_chunks）：
         # 与正常重建同法写入 0 点新集合并切别名 —— 写出就是一个**已清空**的知识库，
@@ -3054,14 +3576,17 @@ def build_index():
         tokenizer = model = None
         log(f"稠密缓存完整命中: {os.path.basename(cache_path)}（{precision}）{len(keys)} 条 → 跳过设备选择与模型加载")
     else:
-        device = INDEX_DEVICE or get_device()
+        # 自适应策略已把设备/精度/batch 算好（policy）。这里把同一条精度决定写回
+        # EMBED_FORCE_FP32 —— 权重、autocast、缓存标签都从 _embed_use_fp16 这一处读，
+        # 不再出现"策略说 fp16、加载却 fp32"的分叉；不改指纹单元源码，旧缓存不失效。
+        global EMBED_FORCE_FP32
+        device = policy["device"]
         use_gpu = device in ("mps", "cuda")
-        use_fp16 = _embed_use_fp16(device)  # 计算路径政策单一事实源（权重/autocast/标签必须同源）
-        if use_gpu and EMBED_FORCE_FP32 and not INDEX_DEVICE:
-            # 质量优先档（RAG_EMBED_FORCE_FP32=1）缺省落位：没钦定设备 → CPU fp32
-            # （fp32 语义最稳、全量约 73 分钟）；显式 RAG_INDEX_DEVICE 则留在原设备只摘
-            # half/autocast（MPS fp32 计算合法，代价约一倍算时）。
-            device, use_gpu = "cpu", False
+        use_fp16 = policy["precision"] == "fp16"
+        if use_gpu and use_fp16:
+            EMBED_FORCE_FP32 = False
+        elif use_gpu:
+            EMBED_FORCE_FP32 = True
         tokenizer = model = None
         if use_gpu:
             try:
@@ -3069,23 +3594,24 @@ def build_index():
                 if use_fp16:
                     model = model.half()
             except Exception as exc:
-                log(f"    ⚠️  {device.upper()} 初始化失败，回退 CPU 建索引: {type(exc).__name__}: {exc}")
-                tokenizer, model, use_gpu, use_fp16 = None, None, False, False
+                raise RuntimeError(
+                    f"{device.upper()} 初始化失败，拒绝静默降级 CPU（会破坏目标精度 "
+                    f"{policy['precision']} 与查询侧一致性）: {type(exc).__name__}: {exc}。"
+                    f"排查设备/内存后重跑；确要用 CPU 请显式 RAG_INDEX_PRECISION=fp32 并同步查询侧 dtype。"
+                ) from exc
         if use_gpu:
-            batch_size = EMBED_BATCH_SIZE or embed_batch_size(device)
+            batch_size = policy["batch_size"]
             precision = "fp16" if use_fp16 else "fp32"
-            log(f"Embedding 设备: {device} ({precision}, batch_size={batch_size}；{embed_batch_note(device)})")
+            log(f"Embedding 设备: {device} ({precision}, batch_size={batch_size}；{embed_batch_note(device)}；策略={policy['precision_source']})")
         else:
             import torch
             tokenizer, model, device = load_embedding_model(device="cpu")
-            # 线程数 = **真实核数**（HW_CORES 优先，缺失才自探测，见 hw_cores）：旧写法在这里
-            # 写死 6 —— 8 核机器白丢 2 个核、16 核机器白丢 10 个，而且日志里的"6线程"还会
-            # 把"为什么是 6"包装成一个像是刻意的选择。
+            # 线程数 = **真实核数**（os.cpu_count/psutil 已补齐 macOS）：不再写死 6/4。
             _threads = hw_cores()
             torch.set_num_threads(_threads)
-            batch_size = EMBED_BATCH_SIZE or embed_batch_size(device)
+            batch_size = EMBED_BATCH_SIZE or embed_batch_size("cpu")
             precision = "fp32"
-            log(f"Embedding 设备: cpu ({_threads} 线程, batch_size={batch_size}；{embed_batch_note(device)})")
+            log(f"Embedding 设备: cpu ({_threads} 线程, batch_size={batch_size}；{embed_batch_note(device)}；策略回退)")
         cache_path = _embed_cache_file(precision)
         expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
         if expected_dim is None:
@@ -3097,6 +3623,13 @@ def build_index():
         # 没这份文件或它读坏了 → 全量待算，与旧写法 cache={} 等价。
         reuse = next((c for c in cands if c[0] == precision), None)
         cache, missing = (reuse[2], reuse[3]) if reuse else ({}, list(range(total)))
+        # 断点续算（2026-11-01）：上次中断留下的 *.parts 分片先并入缓存，只算缺口。
+        if EMBED_CACHE_ENABLED and total:
+            _resumed = _load_embed_parts(cache_path, expected_dim)
+            if _resumed:
+                cache.update(_resumed)
+                missing = [i for i, k in enumerate(keys) if k not in cache]
+                log(f"断点续算: 从分片恢复 {len(_resumed)} 条，仍需计算 {len(missing)}/{total} 条")
     # 先记条数再 del cache：后面"要不要重写缓存"的判据要用它，而缓存 dict 本身
     # （22019 个条目 ≈ 12MB）在 embeddings 取完值之后就不该再占着峰值。
     cache_entries = len(cache)
@@ -3105,18 +3638,29 @@ def build_index():
     embeddings = [cache.get(k) for k in keys] if cache else [None] * total
     del cache
     if missing:
-        batches = [missing[i:i + batch_size] for i in range(0, len(missing), batch_size)]
-        for bi, idxs in enumerate(batches):
-            batch_texts = [_index_text(all_chunks[i]) for i in idxs]
-            vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_fp16)
-            if device == "mps":
-                _mps_empty_cache()
-            for row, i in enumerate(idxs):
-                embeddings[i] = vecs[row]
-            done = min((bi + 1) * batch_size, len(missing))
-            elapsed = time.time() - t0
-            speed = done / elapsed if elapsed > 0 else 0
-            log(f"  计算进度 {done / len(missing) * 100:5.1f}% ({done}/{len(missing)}) {speed:.0f} 条/秒")
+        _resource_gate(policy)
+        # 分段 + 断点：每 RAG_EMBED_CHECKPOINT_CHUNKS 条落一份分片（默认 2048）。中断/被杀后
+        # 下次 index 直接载入分片续算，不再让 20-90 分钟工作全丢；分片只在终态 npz 写成功
+        # 后清理（写失败时保留，仍可续算）。
+        _ckpt = env_int_min("RAG_EMBED_CHECKPOINT_CHUNKS", 2048, 0)
+        segments = ([missing[i:i + _ckpt] for i in range(0, len(missing), _ckpt)]
+                    if _ckpt else [missing])
+        processed = 0
+        for _seq, seg in enumerate(segments):
+            batches = [seg[i:i + batch_size] for i in range(0, len(seg), batch_size)]
+            for idxs in batches:
+                batch_texts = [_index_text(all_chunks[i]) for i in idxs]
+                vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_fp16)
+                if device == "mps":
+                    _mps_empty_cache()
+                for row, i in enumerate(idxs):
+                    embeddings[i] = vecs[row]
+                processed += len(idxs)
+                elapsed = time.time() - t0
+                speed = processed / elapsed if elapsed > 0 else 0
+                log(f"  计算进度 {processed / len(missing) * 100:5.1f}% ({processed}/{len(missing)}) {speed:.0f} 条/秒")
+            if _ckpt and seg:
+                _save_embed_part(cache_path, f"{seg[0]:06d}-{len(seg):06d}", keys, embeddings, seg, precision)
     # 嵌入阶段墙钟到这里的分界：缓存命中路径 ≈ npz 载入时间；重算路径含全量前向。
     # 写批墙钟分开记（_write_wall），台账里两段独立可读——"慢"要能指认到哪个阶段。
     _embed_wall = time.time() - t0
@@ -3143,15 +3687,20 @@ def build_index():
             #   分块正文逐字相同（重复段落/重复标题很常见），len(keys) 就恒大于 len(cache)，
             #   判据恒真，index 每次都整份重写 npz（判据恒真式浪费，日志却写"全部命中"）。
             if missing or cache_entries != len(set(keys)):
-                _save_embed_cache(cache_path, keys, matrix, precision)
-                _cache_saved = True
-                log(f"向量缓存已更新: {cache_path}（重算 {len(missing)} 条）")
+                _cache_saved = bool(_save_embed_cache(cache_path, keys, matrix, precision))
+                if _cache_saved:
+                    log(f"向量缓存已更新: {cache_path}（重算 {len(missing)} 条）")
+                else:
+                    log("    ⚠️  向量缓存写入失败：断点分片已保留，下次 index 可续算")
             else:
                 log(f"向量缓存无需更新（{len(keys)} 条全部命中且无冗余）: {cache_path}")
+            if _cache_saved or not missing:
+                # 终态 npz 已完整：分片不再需要；写失败则保留，下次继续续算。
+                _gc_embed_parts(cache_path)
     del keys, model, tokenizer
     if device == "mps":
         _mps_empty_cache()
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+    client = _qdrant_client()
     try:
         alias_ok = USE_COLLECTION_ALIAS
         if alias_ok:
@@ -3208,7 +3757,7 @@ def build_index():
         def _worker_client():
             c = getattr(_worker_state, "client", None)
             if c is None:
-                c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+                c = _qdrant_client()
                 with _worker_clients_lock:
                     _worker_clients.append(c)
                 _worker_state.client = c
@@ -5640,9 +6189,9 @@ def _infinity_spec(root, env=None):
     子进程 cwd=root ⇒ 解析为 /app/models/bge-m3；落位改写产物是绝对路径，同样合法）。
     存在性校验用 abspath 对照 root，不受进程 cwd 影响。
     --device 默认 auto（容器无 GPU → cpu，与本地同语义）。
-    --dtype 默认 **显式 float32**（RAG_INFINITY_DTYPE 可覆写）：infinity 自己的 auto 在
-    CUDA 机会静默切 bf16/fp16（bf16 只剩 8 位尾数、排序漂移反而比 fp16 大），质量优先档
-    不允许服务端精度进入"不可控"——所以与 start.sh 同构地钉死，改档是显式动作。
+    --dtype 由 runtime_infinity_dtype() 推导（2026-11-01 用户决策"按启动时内存预算选"）：
+    显式 RAG_INFINITY_DTYPE=float16/float32 优先；空/auto 时按机器内存预算档（GPU<16G→fp16、
+    GPU≥16G→fp32、CPU→fp32），与 index 构建预检共用同一函数，保证两端同档。
     --no-model-warmup（2026-11-1 新增）：infinity 的 warmup calibration 每次冷启动都跑
     （batch=8 时两模型四组计时 40-80s，本地实证 10.8s+26.7s@快CPU；容器 174s 就绪里
     占大头）。检索闸门的就绪探测**本来就真打一发 embeddings/rerank**——正是预热动作，
@@ -5668,7 +6217,7 @@ def _infinity_spec(root, env=None):
     port = (scope.get("RAG_INFINITY_PORT") or "8001").strip()
     batch = (scope.get("RAG_INFINITY_BATCH") or "32").strip()
     device = (scope.get("RAG_INFINITY_DEVICE") or "auto").strip()
-    dtype = (scope.get("RAG_INFINITY_DTYPE") or "float32").strip()
+    dtype = runtime_infinity_dtype(scope)
     argv = [
         emb_bin, "v2",
         "--host", "127.0.0.1", "--port", port, "--url-prefix", "/v1",
@@ -5751,6 +6300,27 @@ def _startup_fingerprint_selfcheck(env):
         if not lex_ids:
             log(f"⚠️  [all] 启动期指纹自检：集合 {coll} 内没有词表指纹（空集合/旧索引），跳过词表比对")
             return
+        # 精度链自检（2026-11-01）：清单精度 = 查询侧将要使用的 dtype。构建期预检已保证同一
+        # 台机器上两者一致；这里覆盖"构建机 ≠ 运行机"的部署场景，发布日志里能直接看到结论。
+        try:
+            _mpath = os.path.join(_ARTIFACTS_DIR, "index_manifest.json")
+            _idx_prec = None
+            if os.path.exists(_mpath):
+                with open(_mpath, encoding="utf-8") as _mf:
+                    _idx_prec = json.load(_mf).get("embed_precision")
+            if EMBED_BACKEND == "http" or RERANK_BACKEND == "http":
+                _query_dtype = runtime_infinity_dtype(env)
+            else:
+                _query_dtype = "float16" if _embed_use_fp16(get_device()) else "float32"
+            _query_prec = "fp16" if _query_dtype == "float16" else "fp32"
+            if _idx_prec:
+                log(f"🧪 精度链: 索引={_idx_prec} / 查询={_query_prec}（backend={EMBED_BACKEND}/{RERANK_BACKEND}, dtype={_query_dtype}）")
+                if _idx_prec != _query_prec:
+                    log(f"❌ [all] 精度链不一致：索引={_idx_prec} 而查询={_query_prec}；"
+                        "构建与运行不在同一预算档。处置：用目标机器的内存预算档重跑 index，"
+                        "或显式 RAG_INFINITY_DTYPE 对齐后重新发布（禁止容器内自动修复）。")
+        except Exception as exc:
+            log(f"⚠️  [all] 精度链自检异常（不影响服务）: {type(exc).__name__}: {exc}")
         if len(lex_ids) > 1:
             log(f"🧮 词表指纹: 索引=混合{json.dumps(dict(lex_ids), ensure_ascii=False)} / 当前={current_lex}")
             log("❌ [all] 集合内词表指纹混合（sparse 中断/跳页残留：已更新前缀 + 旧后缀，新旧稀疏向量正混同参与融合）。"
@@ -6718,7 +7288,7 @@ def cmd_sparse(args=None):
 def _sparse_rebuild():
     from qdrant_client import QdrantClient, models
     # 批量重建会话较长：客户端给普通查询 2 倍超时，逐页 scroll 沿用 QDRANT_TIMEOUT。
-    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
+    client = _qdrant_client(timeout=QDRANT_TIMEOUT * 2)
     # strict：sparse 是**原地写**（update_vectors/set_payload 全部落在"该写的那份集合"上）。
     # 非严格版在 get_aliases 瞬时失败时会静默降级为直读物理名 —— 若本轮间别名已指向重建
     # 后的新集合，这轮 sparse 会写偏、留混合态；锁注释里的失效原型照抄。写不了就别写。
@@ -6778,7 +7348,7 @@ def _sparse_rebuild():
     def _sparse_worker_client():
         c = getattr(_sparse_worker_state, "client", None)
         if c is None:
-            c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT * 2)
+            c = _qdrant_client(timeout=QDRANT_TIMEOUT * 2)
             _sparse_worker_state.client = c
         return c
 
@@ -7307,18 +7877,27 @@ def cmd_stages(args=None):
             # 一次精度，就会与 index 的实际选择分叉（同一轮日志给出两个结论），而且预测
             # 要 import torch —— 只为读一个文件名，白花 200MB。
             cands = _inspect_embed_caches(keys)
-            hit = _full_embed_cache(cands)
-            if hit is not None:
-                precision, path, cache, _missing = hit
-                log(f"  ✅ 缓存 {os.path.basename(path)}（{precision}）：{len(cache)} 条全部命中；当前产物 0/{len(chunks)} 条需重算")
+            # 2026-11-01：index 目标精度由构建预检按内存预算决定；stages 必须用**同一决策**
+            # 判断 B，否则会出现"stages 说全新鲜、index 却按目标档全量重算"的自相矛盾。
+            _pol_prec = build_policy()["precision"]
+            target = next((c for c in cands if c[0] == _pol_prec), None)
+            hit_other = _full_embed_cache(cands)
+            if target is not None and not target[3]:
+                precision, path, cache, _missing = target
+                log(f"  ✅ 缓存 {os.path.basename(path)}（{precision}=目标档）：{len(cache)} 条全部命中；当前产物 0/{len(chunks)} 条需重算")
             else:
                 # 没有完整覆盖的那份 = index 仍要重算：不标 B 会让 A/C/D 全新鲜时打出
                 # "无需重跑"，与这一行自相矛盾（同一轮日志两个结论）。
                 stale.append("B")
-                detail = "，".join(
-                    f"{p} 缺 {len(m)}/{len(chunks)} 条" for p, _f, _c, m in cands
-                ) or "磁盘上没有任何缓存文件"
-                log(f"  ❌ 没有一份缓存完整覆盖当前产物（{detail}）-> 需要: python chatbot.py index")
+                if target is not None:
+                    detail = f"目标档 {_pol_prec} 缺 {len(target[3])}/{len(chunks)} 条"
+                elif cands:
+                    detail = f"目标档 {_pol_prec} 没有缓存文件；现有 " + "，".join(
+                        f"{p}（缺 {len(m)}/{len(chunks)}）" for p, _f, _c, m in cands
+                    )
+                else:
+                    detail = f"目标档 {_pol_prec} 与其它档都没有缓存文件"
+                log(f"  ❌ {detail} -> 需要: python chatbot.py index")
         except Exception as exc:
             # 检查失败 = B 没验证过：不置位会让 A/C/D 全新鲜时打出"无需重跑"、exit 0，
             # 而 B 正可能过期（判据恒真式假新鲜）。CD 类"未验证"与"已过期"同权计数。
