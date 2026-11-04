@@ -330,6 +330,10 @@ def embed_batch_size(device, mem_mb=None):
       MPS fp16 : bs   8    16    32    64    128
                  块/秒 13.0  12.9  11.8  12.2  10.9
                  峰值MB 2067  2067  2067  3091  3093
+      MPS fp32 : bs   8    16    32    　（2026-11-04 插电探针；本机 Ollama/serve 同驻、
+                 块/秒 20    21    19          可开内存仅 ~2.3G，按文档设
+                                                RAG_INDEX_ALLOW_LOW_MEMORY=1 放行——绝对值
+                                                含换页拖累，只取相对序：平坦 ±5%，16 仍最优）
       CPU fp32 : bs   8    16    32    64    128
                  块/秒  4.7   4.7   5.2   5.0   3.0
                  峰值MB 2174  2118  2245  2594  2100
@@ -337,6 +341,8 @@ def embed_batch_size(device, mem_mb=None):
     结论：**两边都不是越大越好**。MPS 上 16 与 8 并列最快、比 64 快 6% 且少占 1GB 显存；
     CPU 上 32 最快（每批的 python/padding 开销摊薄），而 128 在 8G 机器上因内存压力塌到
     3.0 块/秒（fp32 激活随批线性涨）。故取各设备**实测最优点**，再按"内存不足退一档"收口。
+    fp32 MPS（2026-11-04）补测确认 16 仍是最优（b8/16/32 = 20/21/19 条/秒，±5% 平坦，
+    未过 >20% 调整阈值——逻辑不改，此表为终版探针）。
     """
     mem = hw_mem_mb() if mem_mb is None else mem_mb
     if device == "mps":
@@ -638,7 +644,7 @@ def index_preflight():
             f"处置：① 让构建跟随预算档（去掉 RAG_INDEX_PRECISION / RAG_EMBED_FORCE_FP32）；"
             f"② 确实要强制异档，显式设 RAG_ALLOW_PRECISION_OVERRIDE=1 并同步设 RAG_INFINITY_DTYPE。"
         )
-    return pol    # Qdrant 可达性：不要等嵌入跑完 20-90 分钟才在写入阶段发现连不上。
+    # Qdrant 可达性：不要等嵌入跑完 20-90 分钟才在写入阶段发现连不上。
     try:
         _probe = _qdrant_client(timeout=max(5, min(QDRANT_TIMEOUT, 15)))
         _n = len(_probe.get_collections().collections)
