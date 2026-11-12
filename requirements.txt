@@ -31,13 +31,10 @@ python-dotenv==1.1.1
 torch==2.7.1
 transformers==4.53.2
 numpy==1.26.4
-# 分句。**硬依赖、无降级路径**：chatbot.py 经模块级转发壳 `segment()` 惰性加载 sentencex
-# （首次分句才 import，模块级不再 import）；语言码走 RAG_SENTENCE_LANG，默认 zh。
-# 曾经的"内置标点分句降级"会把闭合引号切给下一句且**静默**错（字符扫描不认引语边界：
-# 实测全库 24%~36% 的句子以 ” 开头，sentencex 下为 0%）。
-# 本体必须在安装清单里（此前只在注释里出现、清单缺失）：import 名 = pip 包名 sentencex，
-# 分句是 process 的硬依赖、无降级路径 —— 干净环境装完 requirements 首次分句即 ImportError。
-sentencex==1.0.30
+# 分句。**已退场（2026-11-11 全量组件审计）**：2026-10-14 组件化把分句/分块整体交给
+# semantic-text-splitter（TextSplitter 回调 token 计数切分），sentencex 经全仓库
+# 审计（*.py/*.sh）零 import 后从清单移除；当年"内置标点分句降级会把闭合引号切给
+# 下一句且静默错"的教训仍有效，实证记录在 chatbot.py 分块区注释（历史语义）。
 
 # 查询级缓存（C3 从触发制落地，2026-11-10 组件解耦）：hybrid_search 结果缓存走 cachetools
 # TTLCache（RAG_QUERY_CACHE_TTL/MAX 控制；手写缓存逻辑整体退场）。纯 py 小依赖，
@@ -111,6 +108,9 @@ referencing==0.36.2
 regex==2024.11.6
 rpds-py==0.26.0
 safetensors==0.5.3
+# scipy：pytrec-eval-terrier（ir_measures 后端，2026-11-11 D7）的传递依赖，ir_measures
+# 安装时被 pip 连带装上 —— 不锁则"快照"漏一角（容器会装构建当天最新）。
+scipy==1.15.3
 six==1.17.0
 sniffio==1.3.1
 starlette==1.2.0
@@ -129,7 +129,18 @@ semantic-text-splitter==0.33.0
 ftfy==6.3.1
 OpenCC==1.1.9
 pyahocorasick==2.3.1
-tenacity==9.1.4
+# （tenacity 曾随本批安装，2026-11-11 全量组件审计发现全仓库零 import 后移除——
+#   存量重试点全是"upsert 立即重发/别名切换验证后重试/陈旧锁接管"这类业务语义，
+#   与退避装饰器模型不适配；生成/检索侧的显式无重试是设计哲学，见 README §9。）
+
+# 评测指标（2026-11-11 组件审计收尾，用户拍板即时换）：evaluate 的 recall/hit/mrr/ndcg
+# 计分内核换 ir_measures（后端 pytrec-eval-terrier = TREC 官方 trec_eval 的 C 绑定）；
+# 折叠去重/四层粒度/Δ(gold−raw) 口径保留在 chatbot.py _eval_row_metrics 适配层，
+# run 分数严格递减绕开 pytrec_eval 的同分字典序重排（README §10.2 审计条有实证）。
+# 两包版本联动锁（ir_measures 升级会换 measure 字符串形态，适配层按 Measure 对象取值）。
+ir_measures==0.4.3
+pytrec-eval-terrier==0.5.11
+
 
 # 生成侧精确分词：主路径 = artifacts/gen_tokenizer/tokenizer.json（模型自带、带 sha 与
 # MODEL 匹配两重校验）；GGUF 走 Ollama 背后 llama.cpp 只是兜底路径。

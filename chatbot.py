@@ -2267,7 +2267,7 @@ def _chunking_config_fingerprint():
             f"也就无法判断分块/索引是否新鲜（重跑 process 与 index 都需要这个目录，"
             f"先恢复权重：本地看 RAG_EMBED_MODEL_PATH，创空间看运行日志的权重下载行）"
         )
-    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "normalize_quotes": NORMALIZE_QUOTES, "text_opencc": TEXT_OPENCC, "ftfy_fix": json.dumps(FTFY_FIX, sort_keys=True), "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content,         # 分块组件版本：升级它会改变切分边界，漏掉就会让"产物过期"不被发现（与 sentencex 同款理由）
+    payload = { "child_max_tokens": CHILD_MAX_TOKENS, "parent_max_tokens": PARENT_MAX_TOKENS, "parent_min_tokens": PARENT_MIN_TOKENS, "chunk_overlap": CHUNK_OVERLAP, "normalize_quotes": NORMALIZE_QUOTES, "text_opencc": TEXT_OPENCC, "ftfy_fix": json.dumps(FTFY_FIX, sort_keys=True), "embed_model": EMBED_MODEL_PATH, "embed_model_content": _model_content,         # 分块组件版本：升级它会改变切分边界，漏掉就会让"产物过期"不被发现（组件版本进指纹的通用理由；曾指涉已退场的 sentencex）
         "splitter": _package_version("semantic-text-splitter"), "chunking_code": _chunking_code_fingerprint(), }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16], payload
@@ -8653,9 +8653,12 @@ EVAL_LEVELS = (  # (层级名, 评测集真值键, 输出字段) —— 层级�
 )
 
 
-def _eval_load(path):
+def _eval_load(path, require_rewrite=False):
     """评测集加载：JSONL，行 = {"query": ..., "chunks"/"parents"/"sources": [...]}（真值任 1-3 层）。
 
+    require_rewrite=True（--compare-rewrite 模式）时额外要求每行有非空 "gold_rewrite"（人工
+    改写的独立完整问句，代表"改写器能做到的最好情形"），行内多余字段（如 prev_turn 上下文
+    说明）被忽略不参与检索。行内未知字段不校验，保持评测集可自注释。
     结构性错误**当场报错并带行号**，绝不静默跳过：评估集里漏标/坏行的收场若是"跳过"，
     跳几行读数就静默漂移几分，没人知道是数据坏了还是模型差了（失效原型：静默）。空白行合法。
     """
@@ -8687,7 +8690,20 @@ def _eval_load(path):
                     f"❌ 评测集第 {lineno} 行缺 query 或三层真值（chunks/parents/sources）皆无 —— "
                     "没有真值的行只会产出 0 分读数，直接报错（fail-closed）"
                 )
-            rows.append({"lineno": lineno, "query": query.strip(), "truth": truth})
+            entry = {"lineno": lineno, "query": query.strip(), "truth": truth}
+            rid = row.get("id")
+            if isinstance(rid, str) and rid.strip():
+                # 评测集自带行标识（可选）：只做透传到 per_query 明细（人工对账用），不参与计算。
+                entry["id"] = rid.strip()
+            if require_rewrite:
+                gold = row.get("gold_rewrite")
+                if not (isinstance(gold, str) and gold.strip()):
+                    sys.exit(
+                        f"❌ 评测集第 {lineno} 行缺非空 gold_rewrite —— --compare-rewrite 的"
+                        "对拍基线就是它（人工改写上限），缺了这一列 raw vs gold 无从对比（fail-closed）"
+                    )
+                entry["gold_rewrite"] = gold.strip()
+            rows.append(entry)
     if not rows:
         sys.exit(f"❌ 评测集为空: {path}")
     return rows
@@ -8696,33 +8712,44 @@ def _eval_load(path):
 def _eval_row_metrics(rank_list, rel, k):
     """单条查询在截断 k 的四个读数（二值相关度）: (recall@k, hit@k, mrr@k, ndcg@k)。
 
-    排名列表是系统**实际返回**的最终序（与在线同一份产物）；父块/来源是聚合顶层，
-    同一条真值会在多行输出里重复出现，所以先取**截断 k 行的首次出现折叠序列**，
-    再在折叠序列自身的位次上计分（原始行号在去重后不是排位，不能拿来算折扣）——
-    按出现次数记账会把同一来源的重复行算成多次命中，实测 sources 层 recall@10
-    飙到 1.5（读数必须停在 [0,1]，分层指标才能互相比较）。MRR/hit 本就是首现
-    语义，不受折叠影响。分母口径：recall 的分母是 |T|（真值集合），ndcg 的理想
-    DCG 取 min(|T|, k) —— 标准定义；截断列表短于 k（去重后父块不够）按实算，
-    不补齐不虚构。
+    计分内核 2026-11-11 起交 ir_measures/pytrec_eval（TREC 官方 trec_eval 的 C 实现，
+    全量组件审计"最后一个可外部化手写块"落地）：R@k/Success@k/RR@k/nDCG@k 与旧手写
+    公式同源定义（ndcg 理想 DCG 取 min(|T|,k)、1/log2(rank+1) 折扣、二值增益），本地
+    边界样例已逐 case 对拍。
+
+    口径保留在适配层（库只吃标准榜，不替我们做这些）：
+    · 排名列表是系统**实际返回**的最终序（与在线同一份产物）；父块/来源是聚合顶层，
+      同一条真值会在多行输出里重复出现，所以先取**截断 k 行的首次出现折叠序列**再喂库
+      （原始行号在去重后不是排位，不能拿来算折扣）——按出现次数记账会把同一来源的重复
+      行算成多次命中，实测 sources 层 recall@10 飙到 1.5（读数必须停在 [0,1]，分层指标
+      才能互相比较）。MRR/hit 本就是首现语义，不受折叠影响。
+    · 分母口径：recall 的分母是 |T|（真值集合），ndcg 的理想 DCG 取 min(|T|, k) ——
+      标准定义；截断列表短于 k（去重后父块不够）按实算，不补齐不虚构。
+    · run 分数给**严格递减**（-rank）：pytrec_eval 对同分按 docid 字典序重排（实测同分
+      [zz,d1] 会把 d1 提前、RR 0.5→1.0），折叠序本身无并列名，严格递减让库读到与真实
+      序一致的榜，tie 语义彻底不进入读数。
+    · 空榜/空真值：短路 (0,0,0,0)（旧手写口径；rel 空 = 该层无真值，调用方不该进来；
+      uniq 空 = 检索零结果）。
     """
-    import math
     seen = set()
     uniq = []   # 窗口折叠：同名顶层条目只保留第一次出现
     for v in rank_list[:k]:
         if v not in seen:
             seen.add(v)
             uniq.append(v)
-    hits = sum(1 for v in uniq if v in rel)
-    recall = hits / len(rel) if rel else 0.0
-    mrr = 0.0
-    for i, v in enumerate(uniq):
-        if v in rel:
-            mrr = 1.0 / (i + 1)
-            break
-    dcg = sum(1.0 / math.log2(i + 2) for i, v in enumerate(uniq) if v in rel)
-    idcg = sum(1.0 / math.log2(i + 2) for i in range(min(len(rel), k)))
-    ndcg = dcg / idcg if idcg else 0.0
-    return recall, 1 if hits else 0, mrr, ndcg
+    if not uniq or not rel:
+        return 0.0, 0, 0.0, 0.0
+    import ir_measures  # 惰性：evaluate 子命令才用，all/UI 路径零加载成本
+    qrels = [ir_measures.Qrel("q", docid, 1) for docid in rel]
+    run = [ir_measures.ScoredDoc("q", doc, -rank) for rank, doc in enumerate(uniq)]
+    got = {}
+    for m in ir_measures.iter_calc(
+        [x @ k for x in (ir_measures.R, ir_measures.Success, ir_measures.RR, ir_measures.nDCG)],
+        qrels, run,
+    ):
+        got[m.measure] = m.value   # Measure 实例自带 hash/eq 直接当键；字符串形态随版本漂，不用
+    return (got[ir_measures.R @ k], int(got[ir_measures.Success @ k]),
+            got[ir_measures.RR @ k], got[ir_measures.nDCG @ k])
 
 
 def cmd_evaluate(args=None):
@@ -8731,10 +8758,16 @@ def cmd_evaluate(args=None):
     前置与在线检索同一条：Qdrant 在跑且指纹闸门通过（stages 全绿；闸门 here 同样 fail-closed）。
     读数层级按真值有哪层算哪层（chunks/parents/sources），宏平均并把分母（n）写进读数。
     --rerank 换真重排链路；默认走"融合序桩"，两条数字直接对拍出重排的净收益。
+    --compare-rewrite（多轮查询改写的上限收益对拍，只测检索不算生成）：同集跑两遍，
+      raw = 行内 query（在线现状：检索永远拿本轮原始问句，指代/省略的多轮问句直接召回），
+      gold = 行内 gold_rewrite（人工改写的独立完整问句，代表"改写器能做到的最好情形"）。
+      Δ(gold−raw) 即查询改写理论上限能买回的检索质量；gold 是人工构造的可望上限，
+      不代表在线已接改写器，也不假设真实改写器能达到。
     """
     if args is None:
         args = _build_parser().parse_args(["evaluate"])
-    rows = _eval_load(args.evalset)
+    compare = bool(getattr(args, "compare_rewrite", False))
+    rows = _eval_load(args.evalset, require_rewrite=compare)
     k_list = sorted({int(k) for k in args.k})
     if not k_list or min(k_list) < 1:
         sys.exit("❌ --k 截断数必须 ≥ 1（示例: --k 1 3 5 10）")
@@ -8750,70 +8783,169 @@ def cmd_evaluate(args=None):
         f"离线评估: {len(rows)} 条查询，截断 {k_list}（深度 {depth}），"
         f"重排 {'真重排（' + RERANK_BACKEND + '）' if rerank_used else '不加载（RRF 融合序桩）'}，"
         f"嵌入 {'http 服务' if EMBED_BACKEND == 'http' else 'torch 进程内'}"
+        + ("；compare-rewrite 对拍（raw=原始 query / gold=gold_rewrite，同链路同深度各跑一遍）" if compare else "")
     )
-    cells = defaultdict(list)   # (level, k) -> [(recall, hit, mrr, ndcg), ...]
+    # cells 聚合结构沿用（ ((_真值层的输出) ...) ）：单跑 key=(level, k)，对拍 key=(variant, level, k)
+    # ——同一 defaultdict 多带一维前缀，两遍跑共用同一套 (_eval_row_metrics) 计分，不另造打分器。
+    cells = defaultdict(list)   # (level, k) -> [(recall, hit, mrr, ndcg), ...]（对拍模式前缀 variant）
     failed = 0
     per_query = []
     wall_t0 = time.perf_counter()
     for row in rows:
-        try:
-            _q_start = time.perf_counter()
-            results = engine.hybrid_search(row["query"], top_k=depth)
-            elapsed = round(time.perf_counter() - _q_start, 3)
-        except Exception as exc:
-            failed += 1
-            log(f"  ❌ #{row['lineno']} 查询失败（不计入任何指标）: {type(exc).__name__}: {exc}")
-            per_query.append({"lineno": row["lineno"], "query": row["query"],
-                              "error": f"{type(exc).__name__}: {exc}"})
-            continue
-        ranked = {out_key: [r.get(out_key, "") for r in results] for _t, _tr, out_key in EVAL_LEVELS}
-        entry = {"lineno": row["lineno"], "query": row["query"], "results": len(results),
-                 "elapsed_s": elapsed, "first_hit_rank": {}, "missed": {}}
-        marks = []
-        for level, _truth_key, out_key in EVAL_LEVELS:
-            truth = row["truth"].get(level)
-            if not truth:
-                continue   # 该层没有真值：跳过聚合，汇总里该层不会出现
-            rel = set(truth)
-            rank_list = ranked[out_key]
-            hit_ranks = [i for i, v in enumerate(rank_list, 1) if v in rel]
-            entry["first_hit_rank"][level] = hit_ranks[0] if hit_ranks else None
-            entry["missed"][level] = sorted(rel - set(rank_list))
-            if hit_ranks:
-                marks.append(f"{level}:✅r{hit_ranks[0]}")
+        # 对拍模式每行两个变体各检索一次（同链路同深度同真值，读数才能同列对拍）：
+        # raw = 在线现状（本轮原始问句直接召回），gold = 人工改写上限。异常按变体各记一次
+        # 失败，互不遮蔽：raw 失败不停 gold，gold 失败不停 raw —— 对拍读数里哪边失败都要显形。
+        variants = [("raw", row["query"])] if not compare else [
+            ("raw", row["query"]), ("gold", row["gold_rewrite"]),
+        ]
+        outcomes = {}
+        for variant, qtext in variants:
+            try:
+                _q_start = time.perf_counter()
+                outcomes[variant] = (engine.hybrid_search(qtext, top_k=depth),
+                                     round(time.perf_counter() - _q_start, 3))
+            except Exception as exc:
+                failed += 1
+                outcomes[variant] = exc    # 事后 isinstance 区分：成功=(results, elapsed)，失败=Exception
+                log(f"  ❌ #{row['lineno']}[{variant}] 查询失败（不计入任何指标）: {type(exc).__name__}: {exc}")
+        if all(isinstance(o, Exception) for o in outcomes.values()):
+            fail_entry = {"lineno": row["lineno"], "id": row.get("id"), "query": row["query"],
+                          "errors": {v: f"{type(o).__name__}: {o}" for v, o in outcomes.items()}}
+            if not compare:
+                fail_entry["error"] = next(iter(fail_entry["errors"].values()))   # 旧报告字段兼容（单变体）
+            per_query.append(fail_entry)
+            continue   # 所有变体都失败：该行无任何读数可贡献
+        # entry 顶层保持 raw 视角（旧报告结构兼容）；对拍模式的变体贴详情各自进 variants 子对象。
+        # outcomes[variant] 期望 tuple；Exception 只会在上面 all-失败分支提前 continue 前出现，
+        # 这里用 isinstance 分流即可两全（部分变体失败时成功变体照常计分）。
+        raw_pack = outcomes.get("raw")
+        entry = {"lineno": row["lineno"], "id": row.get("id"), "query": row["query"],
+                 "results": len(raw_pack[0]) if isinstance(raw_pack, tuple) else 0,
+                 "elapsed_s": raw_pack[1] if isinstance(raw_pack, tuple) else None,
+                 "first_hit_rank": {}, "missed": {}}
+        if isinstance(raw_pack, Exception):
+            entry["error"] = f"{type(raw_pack).__name__}: {raw_pack}"
+        if compare:
+            entry["gold_rewrite"] = row["gold_rewrite"]
+            entry["variants"] = {}
+        for variant, _qtext in variants:
+            outcome = outcomes.get(variant)
+            if isinstance(outcome, Exception):
+                continue   # 该变体失败：失败计数/明细已在上面落账，这里只停该变体的指标
+            results, elapsed = outcome
+            v_entry = {"results": len(results), "elapsed_s": elapsed, "first_hit_rank": {}, "missed": {}}
+            marks = []
+            for level, _truth_key, out_key in EVAL_LEVELS:
+                truth = row["truth"].get(level)
+                if not truth:
+                    continue   # 该层没有真值：跳过聚合，汇总里该层不会出现
+                rel = set(truth)
+                rank_list = [r.get(out_key, "") for r in results]
+                hit_ranks = [i for i, v in enumerate(rank_list, 1) if v in rel]
+                v_entry["first_hit_rank"][level] = hit_ranks[0] if hit_ranks else None
+                v_entry["missed"][level] = sorted(rel - set(rank_list))
+                marks.append(f"{level}:✅r{hit_ranks[0]}" if hit_ranks else f"{level}:❌")
+                for k in k_list:
+                    cells[(variant, level, k) if compare else (level, k)].append(
+                        _eval_row_metrics(rank_list, rel, k)
+                    )
+            if compare:
+                entry["variants"][variant] = v_entry
+                log(f"  #{row['lineno']:>4} [{variant:>4}] {elapsed:>6.2f}s {len(results):>2} 条  " + "  ".join(marks))
             else:
-                marks.append(f"{level}:❌")
-            for k in k_list:
-                cells[(level, k)].append(_eval_row_metrics(rank_list, rel, k))
-        log(f"  #{row['lineno']:>4} {elapsed:>6.2f}s {len(results):>2} 条  " + "  ".join(marks))
+                entry["first_hit_rank"] = v_entry["first_hit_rank"]
+                entry["missed"] = v_entry["missed"]
+                log(f"  #{row['lineno']:>4} {elapsed:>6.2f}s {len(results):>2} 条  " + "  ".join(marks))
         per_query.append(entry)
     wall = time.perf_counter() - wall_t0
-    metrics = {}
-    for level, _tk, _out in EVAL_LEVELS:
-        level_rows = []
-        for k in k_list:
-            got = cells.get((level, k))
-            if not got:
-                continue
-            level_rows.append({
-                "k": k,
-                "n": len(got),
-                "recall@k": round(sum(c[0] for c in got) / len(got), 4),
-                "hit@k": round(sum(c[1] for c in got) / len(got), 4),
-                "mrr@k": round(sum(c[2] for c in got) / len(got), 4),
-                "ndcg@k": round(sum(c[3] for c in got) / len(got), 4),
-            })
-        if level_rows:
-            metrics[level] = level_rows
-    log("排位读数（宏平均，分母 = 该层真值存在的查询数 n）:")
-    for level, level_rows in metrics.items():
-        log(f"  [{level}]")
-        log(f"    {'k':>3} {'recall':>8} {'hit':>8} {'mrr':>8} {'ndcg':>8}")
-        for r in level_rows:
-            log(
-                f"    {r['k']:>3d} {r['recall@k']:>8.4f} {r['hit@k']:>8.4f}"
-                f" {r['mrr@k']:>8.4f} {r['ndcg@k']:>8.4f}  (n={r['n']})"
-            )
+
+    def _metrics(key_of):
+        """cells → 宏平均读数表：单跑/对拍共用同一聚合（对拍只是 key 多 variant 前缀），不另造打分器。"""
+        out = {}
+        for level, _tk, _out in EVAL_LEVELS:
+            level_rows = []
+            for k in k_list:
+                got = cells.get(key_of(level, k))
+                if not got:
+                    continue
+                level_rows.append({
+                    "k": k,
+                    "n": len(got),
+                    "recall@k": round(sum(c[0] for c in got) / len(got), 4),
+                    "hit@k": round(sum(c[1] for c in got) / len(got), 4),
+                    "mrr@k": round(sum(c[2] for c in got) / len(got), 4),
+                    "ndcg@k": round(sum(c[3] for c in got) / len(got), 4),
+                })
+            if level_rows:
+                out[level] = level_rows
+        return out
+
+    if not compare:
+        metrics = _metrics(lambda level, k: (level, k))
+        log("排位读数（宏平均，分母 = 该层真值存在的查询数 n）:")
+        for level, level_rows in metrics.items():
+            log(f"  [{level}]")
+            log(f"    {'k':>3} {'recall':>8} {'hit':>8} {'mrr':>8} {'ndcg':>8}")
+            for r in level_rows:
+                log(
+                    f"    {r['k']:>3d} {r['recall@k']:>8.4f} {r['hit@k']:>8.4f}"
+                    f" {r['mrr@k']:>8.4f} {r['ndcg@k']:>8.4f}  (n={r['n']})"
+                )
+    else:
+        # 对拍输出：每层每 k 一行三段列（raw 列｜gold 列｜Δ=gold−raw 列）。终端表挑
+        # recall/mrr/ndcg（任务主读数；四元组全量进 --out 的 JSON）。Δ 是本模式的主读数：
+        # 正值 = 改写上限能买回的检索质量；接近 0 = 该项上指代/省略没有伤害检索。
+        metrics = {"raw": _metrics(lambda l, k: ("raw", l, k)),
+                   "gold": _metrics(lambda l, k: ("gold", l, k))}
+        delta = {}
+        log("对拍读数（宏平均；三段列 raw｜gold｜Δ=gold−raw；hit/n 只进 JSON 报告）:")
+        log("    （宏观读法：Δrec/Δndcg 越正 = 多轮指代查询直接召回越吃亏、改写上限收益越大）")
+        for level, _tk, _out in EVAL_LEVELS:
+            log(f"  [{level}]")
+            log(f"    {'k':>3} {'recall':>8} {'mrr':>8} {'ndcg':>8}"
+                f" {'recall':>8} {'mrr':>8} {'ndcg':>8}"
+                f" {'Δrec':>8} {'Δmrr':>8} {'Δndcg':>8}")
+            delta_rows = []
+            for k in k_list:
+                got_r = cells.get(("raw", level, k))
+                got_g = cells.get(("gold", level, k))
+                if not got_r or not got_g:
+                    continue   # 某一变体该 (层,k) 没有读数（多半是变体失败）：Δ 无从可减，跳过不猜
+
+                def _col(g, i):
+                    return sum(c[i] for c in g) / len(g)
+
+                row = {
+                    "k": k, "n": len(got_r), "n_gold": len(got_g),
+                    "recall_raw": round(_col(got_r, 0), 4), "mrr_raw": round(_col(got_r, 2), 4),
+                    "ndcg_raw": round(_col(got_r, 3), 4),
+                    "recall_gold": round(_col(got_g, 0), 4), "mrr_gold": round(_col(got_g, 2), 4),
+                    "ndcg_gold": round(_col(got_g, 3), 4),
+                    "Δrecall@k": round(_col(got_g, 0) - _col(got_r, 0), 4),
+                    "Δhit@k": round(_col(got_g, 1) - _col(got_r, 1), 4),
+                    "Δmrr@k": round(_col(got_g, 2) - _col(got_r, 2), 4),
+                    "Δndcg@k": round(_col(got_g, 3) - _col(got_r, 3), 4),
+                }
+                delta_rows.append(row)
+                log(f"    {k:>3d} {row['recall_raw']:>8.4f} {row['mrr_raw']:>8.4f} {row['ndcg_raw']:>8.4f}"
+                    f" {row['recall_gold']:>8.4f} {row['mrr_gold']:>8.4f} {row['ndcg_gold']:>8.4f}"
+                    f" {row['Δrecall@k']:>+8.4f} {row['Δmrr@k']:>+8.4f} {row['Δndcg@k']:>+8.4f}")
+            if delta_rows:
+                delta[level] = delta_rows
+        metrics["delta"] = delta
+        # 改写"零收益"行数：raw 与 gold 每层首命中排位完全一致（双 miss 也算一致）——
+        # 这些行说明该轮 query 的指代其实没伤命中，改写器对它们没有价差可赚（交回读数用）。
+        n_both = n_flat = 0
+        for e in per_query:
+            vv = e.get("variants") or {}
+            v_raw, v_gold = vv.get("raw"), vv.get("gold")
+            if not (v_raw and v_gold):
+                continue   # 某变体失败：该行不进零收益统计
+            n_both += 1
+            keys = set(v_raw["first_hit_rank"]) | set(v_gold["first_hit_rank"])
+            if all(v_raw["first_hit_rank"].get(x) == v_gold["first_hit_rank"].get(x) for x in keys):
+                n_flat += 1
+        log(f"对拍小结: 两变体都成功 {n_both}/{len(rows)} 行；其中改写零收益（每层首命中排位完全一致）{n_flat} 行")
     log(f"评估墙钟: {wall:.1f}s（{len(rows)} 条，均 {wall / len(rows):.2f}s/条；失败 {failed} 条）")
     if failed:
         log("⚠️  有查询失败：读数不完备。先 python chatbot.py stages 确认四段新鲜，修好绿灯再重跑")
@@ -8822,6 +8954,7 @@ def cmd_evaluate(args=None):
             "ts": round(time.time(), 3),
             "evalset": args.evalset,
             "rerank": rerank_used,
+            "compare_rewrite": compare,
             "k": k_list,
             "depth": depth,
             "queries": len(rows),
@@ -8871,6 +9004,7 @@ def _build_parser():
         elif name == "evaluate":
             sub.add_argument("evalset", help="评测集 JSONL：行=对象，query + chunks/parents/sources 真值数组（任 1-3 层）")
             sub.add_argument("--rerank", action="store_true", help="启用真重排（默认不加载重排器，度量 RRF 融合序）")
+            sub.add_argument("--compare-rewrite", action="store_true", help="对拍模式：每行还须有 gold_rewrite，同集跑 raw(query)/gold(改写上限)两遍并输出 Δ 读数")
             sub.add_argument("--k", type=int, nargs="+", default=(1, 3, 5, 10), help="截断集，最大值兼作检索深度（默认 1 3 5 10）")
             sub.add_argument("--out", default=None, metavar="FILE", help="把汇总与逐条明细写成 JSON 报告（tmp+replace 原子写）")
     return parser
