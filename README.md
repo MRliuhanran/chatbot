@@ -2,6 +2,11 @@
 
 本仓库是一个**本机单用户**的 RAG 问答应用：对本地 `corpus/` 的 `*.txt` 做分块、建稠密 + BM25 稀疏索引，在线用双通道召回 → RRF → 重排 → 上下文预算装配，交给 Ollama 流式生成；前端是 Streamlit。
 
+> 📁 **docs/ 目录已归档**：`docs/architecture/` 四篇架构文档（2026-11-04 定稿）整体移入
+> `docs/archive/architecture-2026-11-04/`（原样冻结，不再更新——行号与多处机制已被
+> 2026-11-10/11 的组件解耦取代）。现行架构真相 = 本 README（§5 一句话版 + §10 已了结项
+> 带证据）+ 代码本身；见 [`docs/README.md`](docs/README.md) 的取舍说明。
+
 代码与脚本按“一个 shell、一个 Python、一个 README”组织；ModelScope 部署只额外增加**一个 Dockerfile**（不使用 compose）：
 
 | 文件 | 作用 |
