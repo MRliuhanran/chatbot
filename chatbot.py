@@ -37,6 +37,13 @@ try:
     from dotenv import load_dotenv
 except ImportError as exc:
     raise ImportError("缺少依赖 python-dotenv（配置会静默退到代码默认值），安装: pip install python-dotenv") from exc
+# pydantic：D5 组件解耦把 env_int/env_float 的解析内核换成 TypeAdapter（见下方常量区）。
+# 与 dotenv 同款 try/except —— 缺包时具名报错而不是裸 ImportError 堆栈；必须在
+# load_dotenv() 这条模块级语句之前 import，否则 ruff E402（模块级代码后的 import）。
+try:
+    from pydantic import TypeAdapter, ValidationError
+except ImportError as exc:
+    raise ImportError("缺少依赖 pydantic（env_* 配置解析用，pydantic-settings 同族），安装: pip install pydantic") from exc
 load_dotenv()
 
 # ── 启动副作用 ──
@@ -53,14 +60,33 @@ del _proxy_src, _proxy_parts, _loopback
 warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum")
 
 
+# ── env_* 配置解析内核：pydantic TypeAdapter（2026-11-10 组件解耦 D5）──
+# "字符串→int/float" 的解析交给 pydantic 的 Rust 核心（pydantic-core），替换裸 int()/float()。
+# 语义实测（本机 pydantic 2.11.7 × 内建，行为矩阵 69 case 新旧对拍零漂移）：
+#   与内建全同：下划线千分位 12_3=123、首尾空白容忍 " 42 "、"12\n"、+5/-5、'.5'=0.5、
+#     '5.'=5.0、'1e3'=1000.0、nan/inf、'1e400'=inf（上溢到 inf）、'1_0.5'=10.5；
+#     一致拒绝：int 侧 12.5/0x10/'1e3'/全角+号'＋５'，float 侧 12,5/0x1p3/'＋１.５'。
+#   唯一分叉：pydantic **拒绝非 ASCII 的 Unicode 十进制数字**（全角 '１２３'、
+#     阿拉伯-印度 '٣٤٥'），而内建 int()/float() 解析它们（int('１２３')=123、
+#     float('١.٥')=1.5）—— .env 手改时全角数字是输入法事故的常见产物，旧代码静默吃下。
+#     为零漂移在 except 里垫一层内建兜底（下）；兜底也失败才抛原文案。
+# 报错类型分叉：pydantic 抛 ValidationError（是 ValueError 子类），except 捕它后翻译回
+#   原来的 ValueError 具名文案 —— 函数签名与报错文案逐字节保持（启动报错可读性契约不换）。
+_ENV_INT = TypeAdapter(int)
+_ENV_FLOAT = TypeAdapter(float)
+
+
 def env_int(name, default):
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
     try:
-        return int(raw.strip())
-    except ValueError:
-        raise ValueError(f"环境变量 {name}={raw!r} 不是合法整数") from None
+        return _ENV_INT.validate_python(raw.strip())
+    except ValidationError:
+        try:  # Unicode 数字兜底：内建 int() 比 pydantic 多吃全角/阿拉伯-印度数字（分叉见上），垫回同语义
+            return int(raw.strip())
+        except ValueError:
+            raise ValueError(f"环境变量 {name}={raw!r} 不是合法整数") from None
 
 
 def env_float(name, default):
@@ -68,9 +94,12 @@ def env_float(name, default):
     if raw is None or not raw.strip():
         return default
     try:
-        return float(raw.strip())
-    except ValueError:
-        raise ValueError(f"环境变量 {name}={raw!r} 不是合法浮点数") from None
+        return _ENV_FLOAT.validate_python(raw.strip())
+    except ValidationError:
+        try:  # 同 env_int：float() 的 Unicode 数字超集语义垫回（'١.٥'=1.5、'１２３'=123.0）
+            return float(raw.strip())
+        except ValueError:
+            raise ValueError(f"环境变量 {name}={raw!r} 不是合法浮点数") from None
 
 
 def env_int_min(name, default, minimum):
