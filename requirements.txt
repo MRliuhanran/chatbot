@@ -39,6 +39,18 @@ numpy==1.26.4
 # 分句是 process 的硬依赖、无降级路径 —— 干净环境装完 requirements 首次分句即 ImportError。
 sentencex==1.0.30
 
+# 查询级缓存（C3 从触发制落地，2026-11-10 组件解耦）：hybrid_search 结果缓存走 cachetools
+# TTLCache（RAG_QUERY_CACHE_TTL/MAX 控制；手写缓存逻辑整体退场）。纯 py 小依赖，
+# 版本 = 本机现役快照。
+cachetools==7.1.4
+# 观测采集（2026-11-10 组件解耦，OTel 核心）：RAG_OTLP_ENDPOINT 未设 = 运行时 no-op，
+# 但链路组件必须同版本锁齐（api/sdk/otlp-http 必须同 1.42.x——曾混装 api 1.45 + sdk 1.42
+# 直接 import 崩）。Logfire/任何 OTLP 后端都吃这套，不需要单独 SDK。
+opentelemetry-api==1.42.1
+opentelemetry-sdk==1.42.1
+opentelemetry-exporter-otlp-proto-http==1.42.1
+opentelemetry-proto==1.42.1
+opentelemetry-exporter-otlp-proto-common==1.42.1
 # --- 传递闭包（上述依赖解析出的间接包，同样锁定本地现役版本，56 个）---
 # 说明：pydantic 仍在此列，但身份已变 —— 不再是被批判的"直接声明"（配置走代码手写
 # env_*），而是 qdrant-client 的必需传递依赖，无法移除。scikit-learn / pydantic-settings

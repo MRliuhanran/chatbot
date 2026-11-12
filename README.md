@@ -77,6 +77,8 @@ open http://127.0.0.1:8501
 | `./start.sh lexicon` | 词表自检 |
 | `./start.sh compare-chunks A [B]` | 两份分块产物对比 |
 | `./start.sh evaluate <评测集> [...]` | 离线检索评估（Recall@k / MRR@k / nDCG@k；不依赖 Ollama，只测检索链路） |
+| `python tools/turn_stats.py` | 单轮台账摘要（`--json` / `--tail N`；读 `.env` 的 `RAG_TURN_STATS_FILE`，排查性能时临时开 `RAG_TURN_STATS=1`） |
+| `python tools/build_stats.py` | 构建台账摘要（读 `artifacts/builds.jsonl`：复用率/缓存命中/嵌入与写批墙钟） |
 
 所有命令最终都落到 `chatbot.py` 的 CLI；`start.sh` 只做服务编排与命令透传。
 
@@ -98,10 +100,14 @@ open http://127.0.0.1:8501
 | `RAG_EMBED_BACKEND` / `RAG_RERANK_BACKEND` | `http`（现行：同一 infinity 实例双模型，GPU=auto）/ `torch`（进程内降档） |
 | `RAG_EMBED_MODEL_PATH` / `RAG_RERANK_MODEL_PATH` | 本地检索模型目录 |
 | `RAG_TOP_K` / `RAG_RECALL_LIMIT` | 最终返回条数（默认 10：融合→去重→全体重排后按分数取前 10）/ 每通道召回深度（默认 10，重排候选不截断） |
+| `RAG_REWRITE` / `RAG_REWRITE_MAX_TURNS` / `RAG_REWRITE_MAX_TOKENS` | 多轮检索改写（默认 0）：RAG_REWRITE=1 且有历史时，生成模型先把本轮问与最近几轮合成一条独立完整查询再进召回（`rewrite_query`，失败退原词、失败永不阻断本轮）；进改写上下文的最大完整轮数 / 改写输出 token 上界 |
+| `RAG_SERVER_FUSION` | 检索编排服务端融合（默认 1）：双路召回 + RRF 融合 + 随交 payload = Qdrant Query API 一次调用（§10.2-D1）；0 回落客户端融合；权重非默认/深追踪自动走旧路径 |
+| `RAG_QUERY_CACHE_TTL` / `RAG_QUERY_CACHE_MAX` | 查询级缓存（cachetools TTLCache，默认 60s / 64 条；§10.2-D2）：同查询查中即零 RTT 返回；0 = 关；索引重建后 TTL 窗口内旧命中最长存留 TTL 秒 |
+| `RAG_OTLP_ENDPOINT` / `RAG_OTEL_SERVICE` | 单轮 trace 推送（OTel OTLP HTTP，未设 = 零成本 no-op，连包都不 import）：Logfire / OTel Collector / 任何 OTLP 后端通用；服务名（默认 `rag-chatbot`），与 turns 台账同口径（§10.2-D3） |
 | `RAG_LOGIN_ENABLED` / `RAG_LOGIN_IDLE_TTL_S` | 登录门开关（本地手机号模式，无第三方 IdP）/ 闲置过期秒数（默认 3600，每次使用顺延） |
 | `RAG_MEM_GUARD` / `RAG_MEM_KILL_PCT` | 内存熔断开关 / 触发水位（默认 95%：触线中止本轮，等同"停止生成"） |
 | `RAG_QDRANT_WAIT` | 容器启动期等 Qdrant `/healthz` 的预算秒数（默认 300；新数据层首启 + 2vCPU 冷载入实测超过旧 120s） |
-| `RAG_TURN_STATS` | 单轮台账（排查性能时临时开） |
+| `RAG_TURN_STATS` | 单轮台账（**常开**定档：每轮一行 ~200B，持续留证据；排查期可临时置 0 回默认） |
 | `RAG_BUILD_STATS` / `RAG_BUILD_STATS_FILE` | 构建台账（默认开；每轮 process/index/sparse 成功收尾各一行）/ 落盘路径（默认 `artifacts/builds.jsonl`） |
 
 ## 5. 架构一句话版
@@ -117,7 +123,7 @@ L5 编排：run_turn、CLI 命令
 L6 Streamlit UI（唯一 import streamlit 的层）
 ~~~
 
-在线链路：分块/词表指纹闸门 → 稠密 + 稀疏并发召回 → 加权 RRF → 按 id 回取 → 父块去重 → 全候选重排 → token 硬上界装配 → Ollama 流式生成。失败不入历史，Stop 主动断开上游流。
+在线链路：分块/词表指纹闸门 → （`RAG_REWRITE=1` 且有历史时：多轮指代改写 `rewrite_query`）→ 双路召回 + **服务端 RRF 融合**（Qdrant Query API，`RAG_SERVER_FUSION`；深追踪/非默认权重/失败兜底回落客户端 weighted_rrf）→ payload 随召回一并交付（不再有独立"回取段"）→ 父块去重 → 全候选重排 → token 硬上界装配 → Ollama 流式生成。失败不入历史，Stop 主动断开上游流（Ollama 随断连取消服务端生成，2026-11-10 实测）。同查询 TTL 缓存查中即回（`RAG_QUERY_CACHE_*`，读数与直查逐条相同）；每轮收尾在台账之外同步发 OTLP trace（`RAG_OTLP_ENDPOINT` 未设则零成本跳过）。
 
 ## 6. 数据重建与指纹
 
@@ -264,3 +270,69 @@ bash tools/ms_release.sh --skip-preflight # 应急：跳过 preflight 全部闸�
 - 生成侧不重试、不拒答、无输出长度闸（窗口是唯一上限）；这是显式设计。
 - 没有测试框架与 CI；质量靠指纹闸门、`start.sh stages` 与人工验收。检索质量可用离线评估
   `evaluate` 命令（手标评测集，只测检索链路、不依赖 Ollama），但它不是常驻的回归防线，评测集是人工维护的。
+## 10. 关注领域与缺口（基准 2026-11-10，锚函数名不锚行号）
+
+> 本节只记"盯什么、缺什么、何时动"：已了结项一句话带证据归档，不展开；随变更更新 §10.4–§10.6
+> （§10.1–§10.3 是快照）。锚点全部是当前代码里的真实符号。
+
+### 10.1 六大领域 × 现状
+
+| 领域 | 现状 |
+|---|---|
+| 模型内存 | 三闸定档：动态窗口（`model_context_window`，≤9G→32768）、`RAG_MEM_GUARD` 95% 熔断、Ollama 驻留旋钮（容器内 `OLLAMA_NUM_PARALLEL=1`）；32K 窗口单模型驻留实测 2.9G（§10.2-B3） |
+| 检索构建 | 四阶段 + 指纹 fail-closed、`index_manifest.json` 发布清单（§7）、内容哈希增量缓存（fp16/fp32 位宽同源落盘 + index 收尾自动 GC） |
+| 检索查询 | 双路召回 + 服务端 RRF 融合（Query API，§10.2-D1）→ 父块去重 → 全候选重排；同查询 TTL 缓存（§10.2-D2）；多轮指代改写已实装（默认关，§10.4） |
+| 构建优化 | fp32 质量档 + 断点续算 + 自适应资源 + GPU 满档/gRPC 写入；双边台账：`artifacts/builds.jsonl`（`python tools/build_stats.py`）与 `turns.jsonl`（`python tools/turn_stats.py`，`RAG_TURN_STATS=1` 开） |
+| 多轮上下文 | 令牌硬上界、整轮淘汰、失败不入历史；检索侧改写见 §10.4 |
+| 多用户并行 | §9 定档：松散并发（内存是唯一闸门）；隔离/配额/队列有意不做（§10.5） |
+
+### 10.2 已了结项（快照，一句话证据）
+
+- **A2 在线台账**：`RAG_TURN_STATS` → `artifacts/turns.jsonl`（run_turn 尾部 `record_turn_stats`：TTFT/tok/s/prefill 比值/上下文取舍/水位提示），摘要 `python tools/turn_stats.py`；构建侧 `RAG_BUILD_STATS` 同构。
+- **A3 检索侧评测**：`evaluate`（Recall@k/MRR@k/nDCG@k + `--compare-rewrite` raw/gold 对拍）；**生成侧"答得对不对"评测按 2026-11-10 定档不做**——若做也只是一次性功能工具（对拍 `quant_bench` 一类），不进闸门、非常驻防线。
+- **A4 生成决策记录**：§9 已落（"不重试、不拒答、无输出长度闸；这是显式设计"）。
+- **A6 Stop 服务端残留**（实测 2026-11-10，本地 minicpm5-2b）：2000 字流 6s 断开（等同 `Stop`/熔断走的 `r.close()` 路径）→ 静置 10s 探针 **3.7s 返回**（若服务端继续烧需等剩余生成时长的排队）→ **Ollama 随客户端断连取消生成**，条目关闭。
+- **A7 数据同源**：两层镜像（§7.2）使可变数据随应用层同 COPY、`index_manifest.json` 是唯一 `EXPECTED_FP` 源（`verify-build` fail-fast + 发布脚本轮询 `🔧 分块指纹` 行）→ 结构性漂移缺口消失；旧三源（`bake.env`/`fetch_models.sh`/`deploy-check.sh`）已随极简化移除（tag `backup/pre-minimal-20261025`）。
+- **C4 冷启动**：Ollama 三驻留旋钮 + 编排层自醒驻留探针（回报链 num_ctx 同源，访客到达不二次装载）+ infinity 两段式后台就绪（不做 warmup calibration）→ FC 每 1800s 强杀周期内首问零重载。
+- **B3 内存并发**（实测 2026-11-10，`ollama ps` SIZE）：ctx2048 基线 1.7G → ctx32768 **2.9G**（KV≈+1.2G，预分配在加载期完成、并发请求不翻倍内存；6.2k token prefill 17.2s、解码 31 tok/s 正常）；本地外部 Ollama **未设** `OLLAMA_NUM_PARALLEL=1`（两路并发几乎同时完成、第二路吃前缀缓存），容器内 `all` 钉 1 = 单槽排队；触线由 `MEM_GUARD` 兜底 → 条目关闭（32768 窗口 ≥1 路生成 + 全组件 ≤8G 已实测）。
+- **D1 检索编排 → Qdrant Query API 服务端融合**（2026-11-10 "拿来即用"解耦第①项）：检索三段（双通道并发 + 客户端 RRF + 按 id 回取）里的**融合段**归位存储引擎——`RAGEngine._server_fusion_points`（dense/sparse 两个 prefetch + `FusionQuery("rrf")`，payload 随交，墙钟 = embed + 1×RTT）。**验收 = 四组对拍全平**（live stub/rerank + multi_turn raw/gold × stub/rerank，全部 recall/mrr/ndcg 读数键逐个相等，0 漂移）；三档回落边界 = ① 非默认通道权重（服务端 RRF 不接受权重，告警一次走客户端融合）② `return_steps` 深追踪（保"每通道名次"可追溯，两路径互斥）③ 融合调用失败兜底纯稠密（对齐旧 `tolerate_sparse_error`；稠密真坏在兜底里照常抛 = fail-closed）。旧路径完全保留，`RAG_SERVER_FUSION=0` 随时重新对拍。
+- **D2 查询缓存 → cachetools TTLCache**（第②项）：`RAG_QUERY_CACHE_TTL/MAX`（默认 60s / 64 条，0=关）。键=(query, top_k, source)，命中 = 零 RTT 零重排（实测 **13.67s → 0.0001s**，读数与直查逐条相同）；命中值 deepcopy 快照隔离（下游改写不污染缓存）；空结果与深追踪不进缓存；cachetools 缺装 = 一次性告警后缓存退场（增收益位不是正确性依赖）；指纹闸门照常每轮先行，fail-closed 不因缓存放开。
+- **D3 观测 → OTel 核心（api/sdk/otlp-http 全家 1.42.1 锁齐）**（第③项）：`RAG_OTLP_ENDPOINT` 设了才生效——未设 = 每轮零成本 no-op（连 opentelemetry 都不 import，懒加载）；Logfire / OTel Collector / 任何 OTLP HTTP 后端**零代码**接入（Logfire 本身就是 OTel 包装，底层选 OTel 后"面板"永远只是配置项）。span `rag.turn` 与 turns 台账吃**同一份 fields**（字段单源加工不复读），起止 = `turn_start`（台账新字段）→ 收尾；全真链路冒烟：本地 OTLP 接收器收 655B protobuf span，`turn_start→ts` 差 = 检索+生成墙钟。治理记录：本机曾 api 1.45.1 + sdk 1.42.1 混装（`_ExtendedAttributes` import 崩）→ 重装锁齐 1.42.1 后通过。
+- **D6 语料格式解析器终裁 docling**（第④项，选型记录不实施）：候选 docling（IBM，MIT）vs unstructured —— 定 **docling**：① PDF/DOCX/表格版式还原强（TableFormer）且统一导出 markdown/JSON，正好接现有 `*.txt` 产物链；② 纯 python 库，无独立服务/API 形态分叉，与"进程外只有三个推理服务"的项目边界一致；③ MIT 干净。unstructured 落选：依赖链重、优先服务端/API 形态、表格还原弱。触发时的动作：requirements 加 `docling==<本地快照>`；解析入口放 build 阶段（`*.txt` 管线在解析产物之后不变）；**解析器版本升格进 `_CHUNKING_CODE_UNITS` 指纹输入**——换解析器 = 全量重建，把"同语料同产物"守住闸门里。
+- **检索读数非确定的两层噪声（2026-11-11 深反思发现）**：evaluate 连跑读数会漂——**(a) 服务端 RRF tie 决序**：Qdrant Query API 融合对并列 RRF 分（两文档各在一路 prefetch 同名次，归一化分逐位相等，实测 `0.5/0.5`）的排序不稳定，同进程连跑可互换 top1/top2（multi_turn lineno1 实测 3 连跑名次 2/2/1 交替，互换对为真值/非真值 → sources 层宏 mrr/ndcg ±0.02 级抖）；排除链 = embed 4 次逐位全等（差 0）→ 稠密路 8 次逐位全等 → 融合调用 tie 互换实锤 → 客户端 RRF 连跑两次全平（客户端按"首通道先见序"决并列 = 确定）。**(b) Qdrant 状态面偏移**：lineno9 跨天名次 3→4 但状态内三连跑全稳——tie 解释不了状态内稳定，应是 Qdrant 内部状态（如 segment 合并）改变固有名次，机制未深究。**影响与对策**：在线无感（互换文档都在最前）；**读数级对拍必须 `RAG_SERVER_FUSION=0`**（或把 tie 互换视为等价）；(b) 层在旧路径下同样存在——跨天对拍要么在同一状态窗口内完成，要么先跑已知金查询校准 Qdrant 状态再比；D1 当年"四组对拍全平"未踩抖动、结论仍成立，但"检索逐字节确定"这一对拍前提自此成文——今后任何读数对拍遇漂移，先分路定位（embed→单通道→融合）再定性，勿直接判回归。
+
+### 10.3 故障矩阵（组件 × 当前行为，全部已取证）
+
+| 组件 / 故障 | 现行为 | 凭据 |
+|---|---|---|
+| Qdrant 未起 / 崩 | 指纹与词表闸门 fail-closed 拒检索；`all` / start.sh 巡检退避重启 | 闸门 + `cmd_all` |
+| Ollama 连不上 | connect 10s → `EVENT_ERROR`，本轮不入历史 | `stream_chat` |
+| Ollama HTTP 5xx | 非 200 → `EVENT_ERROR HTTP xx`；流中 error 字段 → `[Ollama] …` | `stream_chat` |
+| Ollama 卡死 | `RAG_STREAM_READ_TIMEOUT`（默认 300s）与 `RAG_TURN_TIMEOUT`（默认 1800s）；均 0 = 不限（"只能手动停止"是显式代价） | `stream_chat` docstring |
+| 内存触线 95% | 生成中每次采样 → `EVENT_ERROR` 中止本轮（与"停止生成"同效） | `_mem_over_line` |
+| http 嵌入/重排服务故障 | `_model_http_json` 三重合同 + 嵌入三条校验（条数/模型名/维度）→ `RuntimeError` 整轮失败，`st.error` + 不入历史，**无降级**（有意 fail-closed）；`RAG_MODEL_HTTP_TIMEOUT=60s` | `_model_http_json` |
+| infinity boot 未就绪 | 两段式探测 → fail-closed 容器退出交平台重启 | `cmd_all` |
+| 应用进程崩 | `all` / start.sh 巡检就地重启 | `cmd_all` |
+
+### 10.4 A1 多轮检索改写：已实装（默认关）
+
+- **上限收益量化**（`--compare-rewrite`，2026-11-10，20 条手标指代题 raw 与 gold 各跑一遍）：ΔRecall@5 来源层 **+0.45~0.55**、父块层 +0.30~0.40、块层 +0.20~0.25（真重排自行补偿一部分但仍显著）；"改写零收益"样本仅 6~8/20。
+- **实现**：`rewrite_query`（`run_turn` 检索前置）——仅 `RAG_REWRITE=1` 且 history>0 触发（首轮零开销）；最近 `RAG_REWRITE_MAX_TURNS` 轮 + 本轮问交生成模型一次性小请求（温度 0、`num_predict` 封顶、think 关），产出独立完整查询再进 `hybrid_search`；**失败崩了 / 空输出 → 退回原词继续检索**（只告警，永不阻断本轮）；端到端冒烟：指代查询正确改写且首条来源命中（warm ≈1.4s，冷首载一次 ≈4.9s）。
+- **台账/事件**：`turns.jsonl` 加 `rewrite_used / rewrite_ms / rewrite_chars`；`retrieval` 事件带 `rewrite` 元。
+- **启用**：**留库存定档（2026-11-10）：默认 0**——`.env` 置 `RAG_REWRITE=1` 随时通电；想到它的时机 = 真实多轮使用里出现"指代问题召回很差"的体感时，可先 `evaluate --evalset evalsets/multi_turn.sample.jsonl --compare-rewrite` 复核收益再开。
+
+### 10.5 显式不做与缓发（随 §9/§10.4 定档，重议条件见各行）
+
+- **B1 会话持久化（缓发，2026-11-10 定档暂不做）**：聊天历史在 `st.session_state`（进程内存）——刷新页面/重启进程即清零，重启后还需重登；自用可接受。**触发信号：服务给他人日常使用或重启频繁时**，方案为按登录 ID 落盘（半天量级）。
+- **B4 数据面**：无文档级权限（全库对登录者可见）、无限流（`OLLAMA_NUM_PARALLEL` 与内存是闸门）、语料正文不做提示词注入防护——三者与配额/多租户一道"有意不做"。
+- **B5 日志留存**：`rag.log` 会记录用户提问与检索出的正文（10MB×3 轮转），自用可接受，未做脱敏/期限约定。
+- **排队 / 账号隔离 / 多租户**：§9"内存是唯一闸门"的背面，全是有意不做。
+
+### 10.6 触发制（记档不排期）
+
+- **C1 索引增长**：HNSW/量化/mmap 全走默认，上量再测再定量。
+- **C2 语料格式**：**已终裁 docling（§10.2-D6）**——触发（真来 pdf/docx 语料）即装即接，解析器版本入指纹链。
+- **C3 查询级缓存**：**已落地（§10.2-D2，默认开）**——`RAG_QUERY_CACHE_TTL=0` 一键回收；`turns.jsonl` 复查命中率与收益后重议。
+- **C5 上下文高级形态**（摘要压缩/选择性保留）：淘汰式够用，不做。
+- **开关档案**：`RAG_REWRITE=0` 留库存（§10.4）；`RAG_TURN_STATS=1` 常开（§10.2-A2）；`RAG_SERVER_FUSION=1`（§10.2-D1，0=恒走旧路径）；`RAG_OTLP_ENDPOINT` 未设 = 观测零成本 no-op（§10.2-D3）。
+- **D5 配置校验**：**已落地（§10.2-D5，2026-11-11）**——`env_int`/`env_float` 换 pydantic TypeAdapter 内核（pydantic-settings 家族），签名/文案逐字节不变、69 case 行为矩阵对拍全平；BaseSettings 组模型 = 触发制（.env 键位散点手写依旧够用）。

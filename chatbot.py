@@ -11,12 +11,16 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
+import copy
 import datetime
 import glob
 import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import sys
 import threading
@@ -386,11 +390,9 @@ def qdrant_write_workers(batch_count, mem_mb=None):
     return max(1, min(hw_cores(), by_mem, max(1, batch_count), max(4, by_little * 2)))
 
 
-def embed_batch_note(device):
-    """批大小的来源（日志要能一眼看出"值 + 依据"，不是新的黑盒）。"""
-    if EMBED_BATCH_SIZE:
-        return f"显式 RAG_EMBED_BATCH_SIZE={EMBED_BATCH_SIZE}"
-    return f"派生 device={device} {hw_report()}"
+# （已删除）embed_batch_note：批大小的日志解释函数，2026-10-15 commit 1c95edf 之后调用点
+# 丢失（批大小来源日志改在调用处内联），全仓零调用；"值 + 依据"的日志职责已由
+# hw_report() 直接承担，这个包装没有第二读者。
 
 
 def _mem_total_mb():
@@ -1549,6 +1551,119 @@ SOURCE_PAYLOAD_FIELDS = tuple(dict.fromkeys((SOURCE_FIELD, "source", "book")))
 TURN_STATS_ENABLED = env_bool("RAG_TURN_STATS", False)
 TURN_STATS_FILE = (os.getenv("RAG_TURN_STATS_FILE") or "").strip() or os.path.join(_ARTIFACTS_DIR, "turns.jsonl")
 
+# 观测（2026-11-10 组件解耦，OTel 核心）：设 RAG_OTLP_ENDPOINT 才生效——未设 = 每轮零
+# 成本 no-op（连 opentelemetry 都不 import，全程懒加载）。OTLP HTTP 端点（Logfire /
+# OTel Collector / 任何 OTLP 后端通用），服务名默认 rag-chatbot，采样全量（单用户
+# 系统、每轮一条 span，量小）。与台账分工：turns.jsonl 是本位（本地排障全功能），
+# trace 是外部窗口（面板上面看时延瀑布），两者吃**同一份 fields**——口径永不分叉。
+RAG_OTLP_ENDPOINT = (os.getenv("RAG_OTLP_ENDPOINT") or "").strip()
+RAG_OTEL_SERVICE = (os.getenv("RAG_OTEL_SERVICE") or "").strip() or "rag-chatbot"
+_otel_state = {"tried": False, "tracer": None, "provider": None}
+_OTEL_INIT_LOCK = threading.Lock()
+
+
+def _otel_tracer():
+    """懒初始化 OTel：端点未设 → None；包缺失/初始化失败 → 一次性告警后永久退场。
+    观测是增收益位不是依赖——崩了绝不拖累对话主链路（与日志/台账同一哲学）。
+
+    并发形态（2026-11-11 修）：懒初始化包着**双检锁**。旧实现无锁——两线程同时首问，
+    各自走一遍 init：set_tracer_provider 全局只能设一次，后到者被 OTel 拒绝并告警、
+    BatchSpanProcessor 白建一份导出线程。锁内重查 _otel_state 后，第二线程直接复用。
+    provider 记进 _otel_state 并 atexit shutdown：BatchSpanProcessor 持有后台导出
+    线程 + 待发 span 队列，不 shutdown = 进程退出时最后一批 trace 静默丢失（恰是
+    用户关页面前的最后一问，观测最有价值的一批）。"""
+    if _otel_state["tracer"] is not None:
+        return _otel_state["tracer"]
+    if _otel_state["tried"] or not RAG_OTLP_ENDPOINT:
+        return None
+    with _OTEL_INIT_LOCK:
+        if _otel_state["tracer"] is not None:
+            return _otel_state["tracer"]
+        if _otel_state["tried"]:
+            return None
+        _otel_state["tried"] = True
+        try:
+            from opentelemetry import trace as ot_trace
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                OTLPSpanExporter,
+            )
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            provider = TracerProvider(resource=Resource.create({"service.name": RAG_OTEL_SERVICE}))
+            exporter = OTLPSpanExporter(endpoint=RAG_OTLP_ENDPOINT)
+            provider.add_span_processor(BatchSpanProcessor(exporter))
+            ot_trace.set_tracer_provider(provider)
+            _otel_state["provider"] = provider
+            _otel_state["tracer"] = ot_trace.get_tracer(RAG_OTEL_SERVICE)
+            atexit.register(_otel_shutdown)
+            log(f"🔭 OTel 观测已开 → {RAG_OTLP_ENDPOINT}（service={RAG_OTEL_SERVICE}）")
+            return _otel_state["tracer"]
+        except Exception as exc:
+            log(f"⚠️  opentelemetry 不可用，观测退场（不影响对话）: {type(exc).__name__}: {exc}")
+            return None
+
+
+def _otel_shutdown():
+    """atexit 兜底：把 BatchSpanProcessor 队列里未发的 span flush 出去再关导出线程。
+    shutdown 已含 flush（OTel 语义）；失败只告警——退出路径不许被观测反向拖死。"""
+    provider = _otel_state.get("provider")
+    if provider is None:
+        return
+    try:
+        provider.shutdown()
+    except Exception as exc:
+        log(f"⚠️  OTel provider.shutdown() 失败（退出收尾，忽略）: {type(exc).__name__}: {exc}")
+
+
+def otel_emit_turn(fields: dict):
+    """单轮 trace：直接吃 record_turn_stats 的同一份 fields（口径单一真相，不二次加工）。
+
+    span 名 rag.turn；起止时间回溯式——start = fields.turn_start（run_turn 的 started），
+    end = 现在。为什么回溯而不是 try/finally 包正文：Stop 中断走 GeneratorExit，硬包
+    全函数要整体缩进改写（约一百行），风险大于收益；且"未完成的轮既不落台账也不落
+    trace"与既有口径一致。失败只告警不抛（与 record_turn_stats 同）。"""
+    tracer = _otel_tracer()
+    if tracer is None:
+        return
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        start_ns = int(
+            (fields.get("turn_start")
+             or (time.time() - float(fields.get("retrieval_elapsed") or 0)
+                 - float(fields.get("gen_elapsed") or 0))) * 1e9
+        )
+        attrs = {
+            "turn.status": fields.get("status"),
+            "turn.num_ctx": fields.get("num_ctx"),
+            "turn.request_predict": fields.get("request_predict"),
+            "turn.history_turns": fields.get("history_turns"),
+            "turn.rewrite_used": bool(fields.get("rewrite_used")),
+            "turn.retrieval_s": fields.get("retrieval_elapsed"),
+            "turn.gen_s": fields.get("gen_elapsed"),
+            "turn.prompt_tokens_est": fields.get("prompt_tokens_est"),
+            "turn.history_tokens": fields.get("history_tokens"),
+            "turn.context_tokens": fields.get("context_tokens"),
+            "turn.over_window": fields.get("over_window"),
+            "turn.answer_chars": fields.get("answer_chars"),
+            "turn.ttft_s": fields.get("ttft_s"),
+            "turn.tps": fields.get("tps"),
+            "turn.prefill_ratio": fields.get("prefill_ratio"),
+            "turn.done_reason": fields.get("done_reason") or "",
+            "turn.error": fields.get("error") or "",
+        }
+        # OTel 属性值必须是标量/同形单层列表：None 一律剔除（"未知"不写成 0/""）。
+        attrs = {k: v for k, v in attrs.items() if v is not None}
+        span = tracer.start_span("rag.turn", start_time=start_ns, attributes=attrs)
+        if fields.get("status") == "done":
+            span.set_status(Status(StatusCode.OK))
+        else:
+            span.set_status(Status(StatusCode.ERROR, description=str(fields.get("error") or "")[:300]))
+        span.end(end_time=int(time.time() * 1e9))
+    except Exception as exc:
+        log(f"⚠️  trace 发送失败（不影响本轮）: {type(exc).__name__}: {exc}")
+
 
 def record_turn_stats(fields: dict):
     """追加一条单轮台账。写失败只告警不抛 —— 故障不能把台账升级成故障源（诊断路径
@@ -1630,6 +1745,60 @@ RRF_DENSE_WEIGHT = env_float_min("RAG_RRF_DENSE_WEIGHT", 1.0, 0.0)
 RRF_SPARSE_WEIGHT = env_float_min("RAG_RRF_SPARSE_WEIGHT", 1.0, 0.0)
 if not RRF_DENSE_WEIGHT and not RRF_SPARSE_WEIGHT:
     raise ValueError("RAG_RRF_DENSE_WEIGHT 与 RAG_RRF_SPARSE_WEIGHT 不能同时为 0：两条召回通道都退出等于检索恒为空。")
+
+# 服务端融合（2026-11-10 "拿来即用"组件解耦）：把"双通道并发 + 客户端 RRF + payload 随交"
+# 里**融合这一段**归位给存储引擎——Qdrant Query API 一次调用：dense/sparse 两个 prefetch +
+# FusionQuery("rrf") 在服务端出名次序列，payload 随交。与客户端 weighted_rrf 的语义对齐：
+# ① 权重——服务端 RRF 不接受通道权重，故只在两通道权重同为默认 1.0 时启用；非默认权重
+#   自动回落客户端融合（只告警一次）。哪天真需要差异化权重，先核对 Qdrant per-prefetch
+#   weight 能力，再考虑回收本开关。
+# ② 上限——prefetch 各取 RAG_RRF_DENSE/SPARSE 召回深度 RECALL_LIMIT（与旧路径逐通道深度
+#   一致），融合输出上限 RECALL_LIMIT×2 = 旧 weighted_rrf 的 limit=RECALL_LIMIT×通道数；
+#   到重排之前依旧没有任何截断。
+# ③ 深度追踪（return_steps）例外走旧路径：STEP_RECALL 的"每通道名次"只有客户端造得出来，
+#   追踪语义优先于省一次往返——两路径互斥且并存，`evaluate` 随时对拍。
+SERVER_FUSION = env_bool("RAG_SERVER_FUSION", True)
+_SERVER_FUSION_WARNED = False
+
+# 查询级缓存（C3 触发制落地，2026-11-10 组件解耦）：hybrid_search 结果 TTLCache，键 =
+# (query, top_k, source)。查中即返回**零 RTT / 零重排**的同读；命中值是 deepcopy 快照
+# （调用方可能改写结果条目，共享对象会被两轮写坏）。TTL=0 关闭。三条边界：
+# ① 指纹闸门照常每轮执行（fail-closed 不因缓存放开）——缓存只省"闸门过后的往返"；
+# ② 索引重建/别名整体换点后，TTL 窗口内旧命中最长存活 60s（.env 注释已写明，嫌大调小）；
+# ③ return_steps 深追踪与空结果不进缓存——追踪要每步可复现；空结果避免偶发故障被
+#   poison 60s（正常空召回本来就极罕见且确定，重查一次代价可控）。
+RAG_QUERY_CACHE_TTL = env_int_min("RAG_QUERY_CACHE_TTL", 60, 0)
+RAG_QUERY_CACHE_MAX = env_int_min("RAG_QUERY_CACHE_MAX", 64, 1)
+_QUERY_CACHE = None
+_QUERY_CACHE_NOTE_SHOWN = False
+_RAG_QUERY_CACHE_LOCK = threading.Lock()
+
+
+def _query_cache():
+    """懒建 TTLCache（cachetools 是查询缓存的"拿来即用"件：LRU+TTL 一并让库做）。
+    缺包/异常只降级（返回 None = 缓存整体退场）——查询缓存是增收益位不是正确性
+    依赖，语义上永远可以不命中，不许它成为第二轮故障源。
+
+    建立本身走 _RAG_QUERY_CACHE_LOCK 双检：无锁时两线程同时首查会各建一份 TTLCache，
+    后写者覆盖前写者——先返回的线程拿着被弃实例当缓存用，两份缓存读数短暂分叉。
+    读路径（get/deepcopy）不持锁：TTLCache 自身操作是原子性的（GIL 下 dict 级），
+    锁只保护"建"与"换"，不为每次命中付锁价。"""
+    global _QUERY_CACHE, _QUERY_CACHE_NOTE_SHOWN
+    if _QUERY_CACHE is None and RAG_QUERY_CACHE_TTL:
+        with _RAG_QUERY_CACHE_LOCK:
+            if _QUERY_CACHE is None and RAG_QUERY_CACHE_TTL:
+                try:
+                    from cachetools import TTLCache
+                except ImportError:
+                    if not _QUERY_CACHE_NOTE_SHOWN:
+                        _QUERY_CACHE_NOTE_SHOWN = True
+                        log("⚠️  cachetools 未安装：查询级缓存退场（检索照常逐轮直查）")
+                    return None
+                _QUERY_CACHE = TTLCache(maxsize=RAG_QUERY_CACHE_MAX, ttl=RAG_QUERY_CACHE_TTL)
+                if not _QUERY_CACHE_NOTE_SHOWN:
+                    _QUERY_CACHE_NOTE_SHOWN = True
+                    log(f"🟢 查询缓存已开：TTL {RAG_QUERY_CACHE_TTL}s，容量 {RAG_QUERY_CACHE_MAX} 条")
+    return _QUERY_CACHE
 _RECALL_LIMIT_RAW = env_int("RAG_RECALL_LIMIT", 0)
 if _RECALL_LIMIT_RAW < 0:
     raise ValueError(f"环境变量 RAG_RECALL_LIMIT={_RECALL_LIMIT_RAW!r} 不能为负数（0 表示跟随 RAG_RERANK_TOP_K，当前 {RERANK_TOP_K}）")
@@ -1931,13 +2100,10 @@ def fix_quotes(text):
 # 这三个名字全仓已无任何调用点；留着只会让人以为"分块还要加载嵌入模型"。
 
 
-def _mps_empty_cache():
-    """每批后归还 MPS 缓存池；失败只告警（不影响结果）。"""
-    import torch
-    try:
-        torch.mps.empty_cache()
-    except Exception as exc:
-        log(f"    ⚠️  mps.empty_cache() 失败（忽略，不影响结果）: {type(exc).__name__}: {exc}")
+# （已删除）_mps_empty_cache：分块/建索引用语义分块（句级小批量，内存占用 <0.5GB）与
+# http 嵌入服务，都不再触碰 MPS 缓存池；2026-10-15 commit 1c95edf 之后零调用点，
+# 留着只会误导人以为"每批要清 MPS 缓存"（实测该调用在 8G 上反而触发水位异常抛错，
+# 见 .env MPS 段注释：empty_cache 也会触碰 LOW/HIGH 水印校验）。
 
 
 def _token_counter(tokenizer):
@@ -3360,7 +3526,8 @@ def _gc_embed_cache_tmp():
 # 触发点是任何带 Document 的请求。
 # 解法自始至终都是**结构化隔离而不是加锁**（锁跨 HTTP 往返 = 全局排队，与并行目标相反）：
 #   写批 → per-worker client（每个线程一份推理器，build_index/_reindex）；
-#   检索 → 会话线程专属 client（RAGEngine._sparse_client，同一既验证模式）。
+#   检索 → 有界池租借（_sparse_client_lease/_SparseLease，≤4 份私有推理器并发可用；
+#          曾是"会话线程专属"，随 2026-11-11 泄漏修复换池，隔离语义不变：租期内独占）。
 # 曾经的模块级 _QDRANT_INFERENCE_LOCK 已随"稀疏召回客户端专用化"整体删除。
 
 
@@ -3619,7 +3786,7 @@ def build_index():
         if use_gpu:
             batch_size = policy["batch_size"]
             precision = "fp16" if use_fp16 else "fp32"
-            log(f"Embedding 设备: {device} ({precision}, batch_size={batch_size}；{embed_batch_note(device)}；策略={policy['precision_source']})")
+            log(f"Embedding 设备: {device} ({precision}, batch_size={batch_size}；策略={policy['precision_source']})")
         else:
             import torch
             tokenizer, model, device = load_embedding_model(device="cpu")
@@ -3628,7 +3795,7 @@ def build_index():
             torch.set_num_threads(_threads)
             batch_size = EMBED_BATCH_SIZE or embed_batch_size("cpu")
             precision = "fp32"
-            log(f"Embedding 设备: cpu ({_threads} 线程, batch_size={batch_size}；{embed_batch_note(device)}；策略回退)")
+            log(f"Embedding 设备: cpu ({_threads} 线程, batch_size={batch_size}；策略回退)")
         cache_path = _embed_cache_file(precision)
         expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
         if expected_dim is None:
@@ -3668,7 +3835,7 @@ def build_index():
                 batch_texts = [_index_text(all_chunks[i]) for i in idxs]
                 vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_fp16)
                 if device == "mps":
-                    _mps_empty_cache()
+                    pass  # （已删除）_mps_empty_cache：MPS 中途清缓存随 2026-11-11 组件审计退役——语义分块小批量内存 <0.5GB，无需中途清缓存（墓碑注释见常量区）
                 for row, i in enumerate(idxs):
                     embeddings[i] = vecs[row]
                 processed += len(idxs)
@@ -3715,7 +3882,7 @@ def build_index():
                 _gc_embed_parts(cache_path)
     del keys, model, tokenizer
     if device == "mps":
-        _mps_empty_cache()
+        pass  # （已删除）_mps_empty_cache：MPS 中途清缓存随 2026-11-11 组件审计退役——语义分块小批量内存 <0.5GB，无需中途清缓存（墓碑注释见常量区）
     client = _qdrant_client()
     try:
         alias_ok = USE_COLLECTION_ALIAS
@@ -4066,7 +4233,7 @@ def _qdrant_dense_hits(client, collection, dense_query, limit, query_filter=None
 
 def _qdrant_sparse_hits(client, collection, sparse_query, limit, query_filter=None, with_payload=False):
     # 带 Document 的请求里含本地 BM25 推理（每客户端一份、内部无锁）：client 必须是
-    # **调用方所属会话线程专属**（RAGEngine._sparse_client）——推理/缓冲天然线程私有，
+    # **租期内独占**（有界池 _SparseLease，见池区块注释）——推理/缓冲天然调用期私有，
     # 不共享即无竞态，并发召回之间既无锁也无排队（原全局锁已随客户端专用化删除）。
     return client.query_points( collection_name=collection, query=sparse_query, using=SPARSE_VECTOR_NAME, limit=limit, with_payload=with_payload, query_filter=query_filter, ).points
 
@@ -4083,10 +4250,10 @@ def dual_channel_recall(client, collection, dense_query, sparse_query, limit, qu
     if not use_sparse:
         return (_qdrant_dense_hits(client, collection, dense_query, limit, query_filter, with_payload) if use_dense else []), [], ""
     sparse_hits = []
-    # 稀疏通道必须传专属 client（带 Document 的本地推理私有于线程）；None 一律视为违约，
+    # 稀疏通道必须传独占 client（带 Document 的本地推理私有于租期）；None 一律视为违约，
     # 当场报错而不是静默降级成共用 client（那会重现跨线程 drain —— 静默丢召回）。
     if sparse_client is None:
-        raise RuntimeError("dual_channel_recall 需要专属稀疏 client（sparse_client），见 RAGEngine._sparse_client")
+        raise RuntimeError("dual_channel_recall 需要独占稀疏 client（sparse_client），见 _SparseLease 租借")
 
     # 双通道并发：两个 Qdrant 往返并行发，墙钟 = max(dense, sparse) 而非和。
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -4307,6 +4474,19 @@ def context_sources(results):
 # 检索资料**恒以 user 角色**随本轮提问发出：RAG_CONTEXT_ROLE 已删除，不再有"资料寄生成
 # system"的入口（README「核心不变量：资料不寄生 system」）。
 RAG_USE_CONTEXT = env_bool("RAG_USE_CONTEXT", True)
+
+# 多轮检索改写（2026-11-10 定档）：检索永远只见本轮原始 query，历史只进生成——第二轮
+# "那它呢？"单独进召回时指代无对象。手标对拍实测（evalsets/multi_turn.sample.jsonl +
+# `evaluate --compare-rewrite`）：gold 改写上限 ΔRecall@5 来源层 +0.45~0.55、父块层
+# +0.30~0.40、块层 +0.20~0.25 → 改写值得做。改写器复用生成模型：把「最近 N 轮 + 本轮
+# 问」合成一条独立完整查询再进召回。
+# 约束：仅 history>0 时触发（首轮零开销）；失败**永不阻断本轮**——改写是增收益位不是
+# 可靠性依赖，崩了就退回原查询继续检索（只告警）；无重试（与生成侧同一哲学）
+# 单次串行小请求（NUM_PARALLEL=1 下排在检索前），温度 0、输出 token 封顶。
+RAG_REWRITE = env_bool("RAG_REWRITE", False)
+REWRITE_MAX_TURNS = env_int_min("RAG_REWRITE_MAX_TURNS", 3, 1)      # 进改写上下文的最大完整轮数（user+assistant 各记一条）
+REWRITE_MAX_TOKENS = env_int_min("RAG_REWRITE_MAX_TOKENS", 96, 8)   # 改写输出的 token 上界（一行查询够用）
+REWRITE_TURN_CLIP_CHARS = 600   # 每条历史消息在改写上下文里最多保留的字符：防超长历史把改写 prompt 撑爆
 
 
 # 下限 0：负值会让输入上界 I = 动态窗口 - RESERVE **超过真实窗口**（plan_generation 的
@@ -4929,6 +5109,74 @@ class _EvalNoRerankBackend:
 
 
 # ── 检索引擎（L4：只依赖上面协议 + 纯函数）──
+# ── 稀疏召回 client 有界池（2026-11-11 审计 F7：threading.local 的根治）────────
+# 旧实现 = 每会话线程各建一份 QdrantClient（threading.local）。两个根因级问题：
+#   · **泄漏**：Streamlit 的会话线程随页面刷新增长，client（各自带连接池 + 一份本地
+#     BM25 推理器 ModelEmbedder）只增不减、进程活着就永不关闭；
+#   · 修成"单例共享"也不行：带 Document 的请求做**客户端本地推理**（ModelEmbedder 每
+#     client 一份、内部无锁），并发共用一份 = 推理互相 drain（IndexError/422）。
+# 有界池是两头的交集：≤4 份私有推理器可同时租用（单用户松散并发 §9 足够；稀疏召回是
+# "本地 BM25 推理 + 一次 RTT"的短调用），第 5 路借用会阻塞等待最近的归还——有界排队
+# 换无界泄漏，正是池化存在的理由。LifoQueue 后借先还：最近归还的最热、连接状态最新。
+# 租借必须走 with（_SparseLease）：异常路径也归还，池不会因一次抛错漏一个额度。
+_SPARSE_POOL_MAX = 4
+_sparse_pool = None          # queue.LifoQueue；None = 池未建（首次租借时惰性建）
+_sparse_pool_made = []       # 建过的全部 client（在池/被借出都算；atexit 全关）
+_sparse_pool_lock = threading.Lock()
+
+
+def _sparse_pool_close():
+    """进程退出关掉所有稀疏 client（连接不关留给 GC 也能收，但 qdrant-client 的
+    close 会显式断 socket——等 GC 的关闭时机不确定，退出日志里可能留 EPIPE 噪音）。
+    单个 close 失败用 contextlib.suppress 吞（退出路径无补救动作，失败只影响它自己
+    一个连接；不写 try/except 的原因见 F8 的 lint 面：except Exception 是基线计费项，
+    退出路径的吞错不值得花一次基线额度）。"""
+    for c in _sparse_pool_made:
+        with contextlib.suppress(Exception):
+            c.close()
+
+
+def _sparse_client_lease():
+    """租出一份稀疏 client；池空且未满则惰性建（双检锁），满则阻塞等最近的归还。
+
+    阻塞只在"4 路并发都在途"时发生，归还粒度是单次召回调用（秒级）——不会造成
+    级联等待。返回前不做任何健康检查：client 的重连由 qdrant-client 自己做，
+    检查一次 RTT 的代价远大于让单次失败走调用方的兜底路径。"""
+    global _sparse_pool
+    if _sparse_pool is None:
+        with _sparse_pool_lock:
+            if _sparse_pool is None:
+                _sparse_pool = queue.LifoQueue(maxsize=_SPARSE_POOL_MAX)
+                atexit.register(_sparse_pool_close)
+    try:
+        return _sparse_pool.get_nowait()
+    except queue.Empty:
+        pass
+    with _sparse_pool_lock:
+        if len(_sparse_pool_made) < _SPARSE_POOL_MAX:
+            from qdrant_client import QdrantClient
+            c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+            _sparse_pool_made.append(c)
+            return c
+    return _sparse_pool.get()   # 已满：阻塞等归还（见函数头注释）
+
+
+class _SparseLease:
+    """with 租借语义的稀疏 client：__exit__ 无条件归还（异常也归还）。
+
+    为什么是类不是 @contextmanager：生成器上下文在 finally 前的每一行都可能被
+    看错的缩进改变语义；类把"借/还"焊死在两个方法里，任何调用点都只能成对使用。"""
+    __slots__ = ("client",)
+
+    def __enter__(self):
+        self.client = _sparse_client_lease()
+        return self.client
+
+    def __exit__(self, exc_type, exc, tb):
+        _sparse_pool.put(self.client)
+        return False
+
+
 class RAGEngine:
     def __init__(self, client=None, embed=None, rerank=None):
         self._embed = embed
@@ -4940,7 +5188,8 @@ class RAGEngine:
         self._lexicon_checked = False
         self._chunk_fp_checked = False
         self._chunk_fp_logged = False  # 首次指纹比对留痕一次（部署后从日志即可判"产物是否同源"）
-        self._qdrant_sparse_tls = threading.local()   # 稀疏召回的会话线程专属 client（见 _sparse_client）
+        # 稀疏召回 client = 模块级有界池（_sparse_client_lease/_SparseLease，见池头注释）；
+        # 池是进程级共享（RAGEngine 每轮新建，池不随引擎生灭）。
         # 加载（懒初始化）与推理分开两把锁：加载慢、推理短，共用一把会拖慢并发查询。
         # 查询侧前向/rerank 用推理锁串行（MPS 单模型不做真并行），加载持初始化锁。
         self._model_init_lock = threading.Lock()
@@ -4965,20 +5214,44 @@ class RAGEngine:
                     from qdrant_client import QdrantClient
                     self._client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT, )
         return self._client
-    def _sparse_client(self):
-        """稀疏召回专属 client：**每会话线程一份**（threading.local，同 _ollama_session 模式）。
+    # （已删除）_sparse_client：2026-11-11 换模块级有界池。threading.local 的"每会话
+    # 线程一份"随 Streamlit 会话线程只增不减（泄漏且永不 close），共用单份又会因客户端
+    # 本地推理（ModelEmbedder 每 client 一份、无锁）互相 drain——有界池给"≤4 份并发
+    # 私有 + with 租借"，见文件池区块（_sparse_client_lease/_SparseLease）。
 
-        带 Document 的 qdrant 请求含客户端本地推理（ModelEmbedder，每 client 一份、无锁）：
-        共用一份 = 并发串行化或互相 drain（IndexError/422）。每线程各自一份后：
-        本地推理/缓冲天然线程私有，稀疏召回之间零锁零排队（原 _QDRANT_INFERENCE_LOCK
-        已删除）。查询/稠密共用 self._client 不受影响——裸向量 query 不含本地推理。
+    def _server_fusion_points(self, collection, dense_query, sparse_query, recall_limit, fusion_limit, query_filter):
+        """Qdrant Query API 服务端融合：一次往返 = 双路召回 + RRF 名次融合 + payload 随交。
+
+        客户端必须用 **sparse client**：sparse prefetch 带 models.Document（本地 BM25 推
+        理私有于租期内的 client，见池区块注释——共用会跨线程 drain）。过滤条件进每个
+        prefetch（通道级 filter，与旧路径 per-channel query_points 的 query_filter 等价）；
+        with_payload=True 沿旧路径 2026-10-30 的同款技巧，"回取"仍不是一个独立往返段。
+        返回服务端 RRF 序的 ScoredPoint 列表（score = 服务端 RRF 分）。
+
+        服务端 RRF 的 K 与并列决序是 Qdrant 侧实现细节，与 weighted_rrf（K=60、按首通道
+        先见序决并列）可能有微差：启用前后用 `evaluate` 对拍，数字齐平即语义等价
+        （2026-11-10 实测见 README §10.2）。⚠️ 并列 RRF 分的决序在服务端**非确定**
+        （同分文档 top1/top2 可随连跑互换，证据链见 README §10.2"两层噪声"条目）——
+        读数级对拍须 `RAG_SERVER_FUSION=0` 走客户端决序（确定）；在线无感（互换双方都在最前）。
+        调用失败由 hybrid_search 兜"纯稠密"逐字对齐
+        旧路径的 tolerate_sparse_error 语义。
         """
-        c = getattr(self._qdrant_sparse_tls, "client", None)
-        if c is None:
-            from qdrant_client import QdrantClient
-            c = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
-            self._qdrant_sparse_tls.client = c
-        return c
+        from qdrant_client import models
+        # 稀疏 client 从有界池租借：query_points 的全程独占（本地 BM25 推理不可并发共用），
+        # with 保证融合调用抛错时也归还。
+        with _SparseLease() as sc:
+            res = sc.query_points(
+                collection_name=collection,
+                prefetch=[
+                    models.Prefetch(query=dense_query, using=DENSE_VECTOR_NAME, filter=query_filter, limit=recall_limit),
+                    models.Prefetch(query=sparse_query, using=SPARSE_VECTOR_NAME, filter=query_filter, limit=recall_limit),
+                ],
+                query=models.FusionQuery(fusion="rrf"),
+                limit=fusion_limit,
+                with_payload=True,
+            )
+        return res.points
+
     def _resolve_collection(self):
         self._collection_name = resolve_collection_name(self._get_client())
         return self._collection_name
@@ -5179,6 +5452,17 @@ class RAGEngine:
         # 失败不置位、每轮重试（见 _check_chunk_freshness/_check_lexicon_consistency）。
         self._gate_check_collection_fingerprint(client, collection)
         query_filter = self._source_filter(source)
+        # 查询缓存命中路径（2026-11-10 组件解耦）：只省"闸门过后的整条检索链"；命中值
+        # 是快照的 deepcopy，深追踪/空结果不进缓存（见 RAG_QUERY_CACHE_TTL 配置注释）。
+        _qc = None if steps is not None else _query_cache()
+        _qck = None
+        if _qc is not None:
+            _qck = (query, top_k, source)
+            with _RAG_QUERY_CACHE_LOCK:
+                _qcached = _qc.get(_qck)
+            if _qcached is not None:
+                log(f"🟢 查询缓存命中（TTL {RAG_QUERY_CACHE_TTL}s 内）：top_k={top_k} source={source!r}")
+                return copy.deepcopy(_qcached)
         # 逐段计时（2026-10-29 起；2026-10-30 随 payload 合并调整口径）：检索的墙钟 =
         # 召回段 max(嵌入+稠密RTT, 稀疏RTT)（payload 随召回交付，没有独立回取 RTT）
         # + 融合落地（RRF+去重+截断）+ 重排前向。可并行的都已并行，重排是一次批量
@@ -5197,53 +5481,102 @@ class RAGEngine:
             else:
                 _degraded(steps, "稀疏通道：查询无可检索内容（纯标点/空白），且稠密通道权重为 0，本次无可用召回")
         _use_sparse = bool(RRF_SPARSE_WEIGHT) and bool(_sparse_terms)
+        # 服务端融合的可用判据（见 SERVER_FUSION 配置注释）：非默认通道权重 / 深追踪退回旧路径。
+        _use_server_fusion = (
+            SERVER_FUSION
+            and steps is None
+            and bool(RRF_DENSE_WEIGHT)
+            and _use_sparse
+            and RRF_DENSE_WEIGHT == 1.0 and RRF_SPARSE_WEIGHT == 1.0
+        )
+        if (SERVER_FUSION and not _use_server_fusion
+                and bool(RRF_DENSE_WEIGHT) and _use_sparse
+                and (RRF_DENSE_WEIGHT != 1.0 or RRF_SPARSE_WEIGHT != 1.0)
+                and not _SERVER_FUSION_WARNED):
+            globals()["_SERVER_FUSION_WARNED"] = True
+            log("ℹ️  服务端融合未启用：RRF 通道权重非默认（服务端 RRF 不接受权重），沿用客户端融合")
         dense_query = None
         dense_hits = []
         sparse_hits = []
         note = ""
+        _server_fused = None   # 服务端融合的命中（ScoredPoint 列表）；仅该路径非 None
         # 单一编排路径：稠密向量由适配器产出，不看 torch/http；稀疏召回可在嵌入期间并发。
         if bool(RRF_DENSE_WEIGHT) and _use_sparse:
-            from concurrent.futures import ThreadPoolExecutor
-            # 并发形态定型（2026-10-30）：用**阻塞线程池**，不引入 asyncio。判据是工作
-            # 形状 —— 每轮只有 2-3 个长延迟 IO 调用（嵌入 http + 双路 recall），线程接
-            # 长延迟阻塞是最优解；asyncio 的赢面在"成百上千个轻量并发"或宿主原生事件
-            # 循环，Streamlit 单轮是同步栈（台账/停止按钮都在线程里），改造整轮换不来
-            # 墙钟收益。qdrant-client 能做的尽量交给 client（payload 随查询返回即是一例）。
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                sparse_future = pool.submit(
-                    _qdrant_sparse_hits, self._sparse_client(), collection, sparse_query, RECALL_LIMIT, query_filter, True,
-                )
+            if _use_server_fusion:
+                # 服务端融合：仍先 embed（查询稠密向量由嵌入服务产），再一次 Query API 往返
+                # 完成"双路召回 + 服务端 RRF + 随交 payload"。墙钟 = embed + 1×RTT
+                # （旧形态是 embed ∥ 两条并发 RTT，这里把两条 RTT 合成一条）。
                 dense_query = self._embedding_backend.embed_query(query)
-                dense_hits = _qdrant_dense_hits(client, collection, dense_query, RECALL_LIMIT, query_filter, True)
                 try:
-                    sparse_hits = sparse_future.result()
+                    _server_fused = self._server_fusion_points(
+                        collection, dense_query, sparse_query, RECALL_LIMIT, RECALL_LIMIT * 2, query_filter,
+                    )
                 except Exception as exc:
-                    note = _sparse_recall_note(exc, sparse_query)
+                    # 容错对齐旧路径 tolerate_sparse_error：融合请求分不出是哪条通道坏，
+                    # 兜底打一次**纯稠密**（稠密侧真坏会在这条兜底里照常抛 = fail-closed，
+                    # 不二次吞错；只有"稠密通、稀疏坏"落到这条注）。
+                    note = (f"服务端融合调用失败，本次退化为纯稠密检索: {type(exc).__name__}: {exc}；"
+                            f"分词 {len((sparse_query.text or '').split())} 个 term")
+                    dense_hits = _qdrant_dense_hits(client, collection, dense_query, RECALL_LIMIT, query_filter, True)
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+                # 并发形态定型（2026-10-30）：用**阻塞线程池**，不引入 asyncio。判据是工作
+                # 形状 —— 每轮只有 2-3 个长延迟 IO 调用（嵌入 http + 双路 recall），线程接
+                # 长延迟阻塞是最优解；asyncio 的赢面在"成百上千个轻量并发"或宿主原生事件
+                # 循环，Streamlit 单轮是同步栈（台账/停止按钮都在线程里），改造整轮换不来
+                # 墙钟收益。qdrant-client 能做的尽量交给 client（payload 随查询返回即是一例）。
+                # 稀疏 client 租借在池块**外层**：with 退出顺序与书写相反——先池 join
+                # （worker 用完 sc）再归还租借；写在里层会在 worker 还没跑完时就还了额度。
+                with _SparseLease() as sc, ThreadPoolExecutor(max_workers=1) as pool:
+                    sparse_future = pool.submit(
+                        _qdrant_sparse_hits, sc, collection, sparse_query, RECALL_LIMIT, query_filter, True,
+                    )
+                    dense_query = self._embedding_backend.embed_query(query)
+                    dense_hits = _qdrant_dense_hits(client, collection, dense_query, RECALL_LIMIT, query_filter, True)
+                    try:
+                        sparse_hits = sparse_future.result()
+                    except Exception as exc:
+                        note = _sparse_recall_note(exc, sparse_query)
         else:
             if RRF_DENSE_WEIGHT:
                 dense_query = self._embedding_backend.embed_query(query)
-            dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, with_payload=True, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, sparse_client=self._sparse_client(), )
+            # 租借只在 dual_channel_recall 调用期间独占（embed 在外完成，不占额度）。
+            with _SparseLease() as sc:
+                dense_hits, sparse_hits, note = dual_channel_recall( client, collection, dense_query, sparse_query, RECALL_LIMIT, query_filter=query_filter, with_payload=True, tolerate_sparse_error=True, use_dense=bool(RRF_DENSE_WEIGHT), use_sparse=_use_sparse, sparse_client=sc, )
         if note:
             _degraded(steps, note)
         _t0_fuse = time.perf_counter()
-        rankings = channel_rankings(dense_hits, sparse_hits)
+        if _server_fused is not None:
+            # 服务端融合已在请求内完成：fused = 服务端 RRF 序（score 即服务端 RRF 分），
+            # chunks 全部来自随交 payload。rankings 留空——STEP_RECALL/STEP_RRF 是
+            # return_steps 的深追踪口径，本路径与之互斥（steps is None 才启用），
+            # 深追踪与回落档走旧路径，不丢观测。
+            rankings = []
+        else:
+            rankings = channel_rankings(dense_hits, sparse_hits)
         if steps is not None:
             steps[STEP_RECALL] = [ {"channel": ch, "rank": r, "point_id": pid} for ch, pids, _w in rankings for r, pid in enumerate(pids, 1) ]
         n_channels = max(1, len(rankings))
-        # 融合上限 = 召回上界（RECALL_LIMIT × 通道数）：只把"本轮召回的命中"整体保留。
+        # 融合上限 = 召回上界（RECALL_LIMIT × 通道数；服务端融合路径同值 = RECALL_LIMIT×2）：
+        # 只把"本轮召回的命中"整体保留。
         # 2026-10-30 起（用户两度拍板"不用截断"）：此后到重排**没有任何截断**——
         # 候选池/预算收缩机制已删除，去重后的全体候选都进重排（见 RERANK_TOP_K 处注释）。
-        fused = weighted_rrf(rankings, k=RRF_K, limit=RECALL_LIMIT * n_channels)
-        # payload 随召回返回（2026-10-30 起 with_payload=True，经 qdrant-client 同一次
-        # query_points 交付）：省掉按 id retrieve 那次 RTT，"回取"不再是一个独立往返段。
-        # 语义三等价：内容新鲜度仍由开跑前的指纹闸门保证（这里不重复取号，_fetch_chunks
-        # 整体删除）；"命中后再 retrieve 撞上原子切换"的状态点也消失了——payload 是命中
-        # 时刻的快照；payload 缺字段时 chunk_from_payload 兜默认值，与旧 retrieve 逐字一致。
-        # fused 的 id 必然 ⊆ 本轮召回命中（rankings 就来自命中），不存在的键只剩"payload
-        # 字段缺失被兜成空文本"这一种，与旧行为同形。
         chunks = {}
-        for _hit in (dense_hits + sparse_hits):
-            chunks[_hit.id] = chunk_from_payload(_hit.payload, _hit.id)
+        if _server_fused is not None:
+            fused = [(p.id, float(p.score), [f"qdrant/rrf#{i}"]) for i, p in enumerate(_server_fused, 1)]
+            for _hit in _server_fused:
+                chunks[_hit.id] = chunk_from_payload(_hit.payload, _hit.id)
+        else:
+            fused = weighted_rrf(rankings, k=RRF_K, limit=RECALL_LIMIT * n_channels)
+            # payload 随召回返回（2026-10-30 起 with_payload=True，经 qdrant-client 同一次
+            # query_points 交付）：省掉按 id retrieve 那次 RTT，"回取"不再是一个独立往返段。
+            # 语义三等价：内容新鲜度仍由开跑前的指纹闸门保证（这里不重复取号，_fetch_chunks
+            # 整体删除）；"命中后再 retrieve 撞上原子切换"的状态点也消失了——payload 是命中
+            # 时刻的快照；payload 缺字段时 chunk_from_payload 兜默认值，与旧 retrieve 逐字一致。
+            # fused 的 id 必然 ⊆ 本轮召回命中（rankings 就来自命中），不存在的键只剩"payload
+            # 字段缺失被兜成空文本"这一种，与旧行为同形。
+            for _hit in (dense_hits + sparse_hits):
+                chunks[_hit.id] = chunk_from_payload(_hit.payload, _hit.id)
         if steps is not None:
             steps[STEP_RRF] = [ { "resource": resources, "score": float(score), "id": (chunks.get(point_id) or {}).get("id", str(point_id)), "text": (chunks.get(point_id) or {}).get("child_text", ""), } for point_id, score, resources in fused ]
         candidates = []
@@ -5327,6 +5660,9 @@ class RAGEngine:
             steps[STEP_RESULTS] = output
             steps[STEP_RESULT_COUNT] = { "返回": len(output), "请求 top_k": top_k, "候选池": len(candidates), "说明": TRACE_NOTES["条数"], }
             steps[STEP_CONFIDENCE] = confidence
+        if _qc is not None:
+            with _RAG_QUERY_CACHE_LOCK:
+                _qc[_qck] = copy.deepcopy(output)
         if return_steps:
             return output, steps
         return output
@@ -5418,6 +5754,64 @@ def _tps_from_done(done_info):
     return round(n / (ns / 1e9), 2)
 
 
+def rewrite_query(query, history, *, num_ctx):
+    """多轮检索改写：把「最近 N 轮对话 + 本轮问」交给生成模型，合成一条独立完整、可独立
+    召回的检索查询（指代消解）。手标上限收益见 evalsets/multi_turn.sample.jsonl +
+    `evaluate --compare-rewrite`（ΔRecall@5 来源层 +0.45~0.55）。
+
+    单次非流式请求：温度 0、`num_predict` 封顶、think 关（一行查询，不要思维链）、
+    无检索/重排依赖（只占生成槽位一次；NUM_PARALLEL=1 下串行，实测 2B Q4 约 1~2s）。
+    返回 (query_used, meta)：
+      meta.used   —— 是否真的采用了改写结果（False = 任何失败/空输出，退回原 query）
+      meta.elapsed —— 改写请求墙钟（用于 turns 台账诊断首字延迟，改写计入检索段）
+    **失败永不阻断本轮**：这是增收益位不是可靠性依赖——阻塞式失败（模型没起、超时、
+    HTTP 500）全都只落一条告警，检索带着原 query 继续。无重试（与生成侧同一哲学）。
+    """
+    msgs = [m for m in history_to_messages(history) if (m.get("role") or "") in ("user", "assistant")]
+    msgs = [m for m in msgs if (m.get("content") or "").strip()]
+    if not msgs:
+        return query, {"used": False}
+    tail = msgs[-2 * REWRITE_MAX_TURNS:]
+    transcript = "\n".join(
+        f"{'用户' if m.get('role') == 'user' else '助手'}：{(m.get('content') or '').strip()[:REWRITE_TURN_CLIP_CHARS]}"
+        for m in tail
+    )
+    prompt = (
+        "根据对话历史，把最后要检索的问题改写成一条独立完整、不依赖代词指代的中文检索查询。"
+        "保留原问题的语义、限定词与疑问点，不新增对话里没有的假设，不要回答问题，"
+        "只输出改写后的这一行查询，不要任何解释。\n\n"
+        f"对话历史：\n{transcript}\n\n本轮要检索的问题：{query[:200]}\n改写后的查询："
+    )
+    t0 = time.monotonic()
+    parts = []
+    try:
+        for kind, delta in stream_chat(
+            [{"role": "user", "content": prompt}],
+            num_ctx=num_ctx, num_predict=REWRITE_MAX_TOKENS, temperature=0.0, think=False,
+        ):
+            if kind == EVENT_DELTA:
+                parts.append(delta if isinstance(delta, str) else str(delta))
+            elif kind == EVENT_ERROR:
+                raise RuntimeError(str(delta)[:200])
+            elif kind == EVENT_DONE:
+                break
+    except Exception as exc:
+        log(f"⚠️  检索改写失败，用原查询继续: {type(exc).__name__}: {str(exc)[:200]}")
+        return query, {"used": False, "failed": type(exc).__name__, "elapsed": round(time.monotonic() - t0, 3)}
+    elapsed = round(time.monotonic() - t0, 3)
+    # 只取首个非空行：短输出下模型偶发自行加换行/空行；并剥离外层引号包裹（小模型
+    # 常把中文引号当“补全话”加在两侧）。
+    out = ""
+    for line in "".join(parts).strip().splitlines():
+        line = line.strip().strip("「」“”")
+        if line:
+            out = line
+            break
+    if not out:
+        return query, {"used": False, "elapsed": elapsed}
+    return out, {"used": True, "elapsed": elapsed, "chars": len(out)}
+
+
 def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_context=None, num_ctx=None, num_predict=None, chat=None):
     source = source if source is not None else book
     chat = chat or _CHAT_BACKEND.stream
@@ -5432,6 +5826,11 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     # 本函数不再做内存编排（无 gate/卸载/release，2026-10-24 定稿）：
     # 检索模型首次加载后常驻，生成模型驻留由 Ollama 服务端策略决定；进程异常由 entrypoint
     # 的进程级巡检就地重启（README §11.4）。
+    # 多轮检索改写：仅在开关开且 history>0 时发生（首轮零开销）；失败退回原 query
+    # （rewrite_query 内部兜底，永不抛出）。改写耗时计入检索段 elapsed（它就是检索前置）。
+    _rewrite_meta = None
+    if RAG_REWRITE and history:
+        query, _rewrite_meta = rewrite_query(query, history, num_ctx=num_ctx)
     results = engine.hybrid_search(query, top_k=top_k, source=source)
     confidence = results_confidence(results)
     elapsed = time.time() - started
@@ -5439,7 +5838,7 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
     # 唯一事件契约：首事件恒为 RETRIEVAL，之后 thinking/delta/error/done；检索为空也照常生成。
     # 诊断只报**实际发出**的内容：gen（plan["stats"]）就是装配真正执行后统计出来的
     # （context_docs_kept/context_partial/query_truncated/…），不再另拼一套 steps。
-    yield EVENT_RETRIEVAL, { "query": query, "results": results, "confidence": confidence, "gen": plan["stats"], "elapsed": elapsed }
+    yield EVENT_RETRIEVAL, { "query": query, "rewrite": _rewrite_meta, "results": results, "confidence": confidence, "gen": plan["stats"], "elapsed": elapsed }
     answer_chars = 0
     # 预算参数必须真的进请求（见 stream_chat 文档）：chat 可调用对象须接受这两个关键字。
     # **无重试、无长度/时间闸**：本轮生成原样转发，窗口（num_ctx）与上下文移位是唯一边界；
@@ -5488,12 +5887,16 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
             and _prefill_count > 0 and _prompt_tok_est > 0
             else None
         )
-        record_turn_stats({
+        _turn_fields = {
             "status": _status,
+            "turn_start": round(started, 3),
             "num_ctx": num_ctx,
             "request_predict": request_predict,
             "history_turns": len(history or []),
             "retrieval_elapsed": round(elapsed, 3),
+            "rewrite_used": bool(_rewrite_meta and _rewrite_meta.get("used")),
+            "rewrite_ms": (_rewrite_meta or {}).get("elapsed"),
+            "rewrite_chars": (_rewrite_meta or {}).get("chars"),
             "gen_elapsed": round(time.time() - _gen_t0, 3),
             "prompt_tokens_est": _prompt_tok_est,
             "history_tokens": plan["stats"].get("used_tokens"),
@@ -5513,7 +5916,9 @@ def run_turn(engine, query, history, *, top_k=None, source=None, book=None, use_
             "load_ms": _ms_from_ns((_done_info or {}).get("load_duration")),
             "prefill_ms": _ms_from_ns((_done_info or {}).get("prompt_eval_duration")),
             "error": _error_text,
-        })
+        }
+        record_turn_stats(_turn_fields)
+        otel_emit_turn(_turn_fields)
         if _done_info is not None:
             _hint = _slow_hint(_ttft, _tps)
             log(
