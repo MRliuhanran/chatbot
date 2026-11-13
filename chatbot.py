@@ -22,6 +22,7 @@ import logging
 import os
 import queue
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -1531,9 +1532,21 @@ RERANK_MODEL_PATH = os.getenv("RAG_RERANK_MODEL_PATH", "./models/bge-reranker-v2
 WEIGHTS_BACKGROUND = env_bool("RAG_WEIGHTS_BACKGROUND", False)
 MODEL_WAIT_SECS = env_int_min("RAG_MODEL_WAIT_SECS", 900, 0)
 _ARTIFACTS_DIR = os.getenv("RAG_ARTIFACTS_DIR", "./artifacts")
+
+# ── 分块产物存储（2026-11-09 定型）：单表 JSON 文档库 ──
+# artifacts/chunks.db stdlib sqlite3（WAL）：docs(store, key, data) 三列，store 是分区
+# （chunks/meta/manifest），key 文档键，data 整份 JSON 文档——**字段结构零定义、想存
+# 什么存什么，业务用时再按描述选取**（SQLite JSON1 官方文档同款用法）；实测 61MB/
+# 21255 条真实产物：全量读 0.145s（json.load 0.179s）、单事务写 0.578s（换崩溃回滚）、
+# 盘面 88MB vs 64MB（字段名随行重复，如实付）。原子性外包 C 库事务：COMMIT 前被杀/
+# 掉电 = 回滚上一完整提交，旧式双 rename 舞台（"新 chunks + 旧 meta"窗口）整类消失。
+# 本地工作区数据（运行期闸门不读产物库，镜像不携带）；发布链仍消费派生小 JSON：
+# CHUNKS_META_JSON（process 后导出）与 INDEX_MANIFEST_JSON（index 收尾导出），路径与
+# 字节契约不变。CHUNKS_JSON（61MB 平铺数组）退役：不再写不再读，路径常量仅供
+# compare-chunks 比对历史 JSON 归档。
 CHUNKS_JSON = os.path.join(_ARTIFACTS_DIR, "chunks.json")
-
-
+CHUNKS_DB = os.path.join(_ARTIFACTS_DIR, "chunks.db")
+STORE_CHUNKS, STORE_META, STORE_MANIFEST = "chunks", "meta", "manifest"
 CHUNKS_META_JSON = os.path.splitext(CHUNKS_JSON)[0] + ".meta.json"
 CHUNKS_META_VERSION = 1
 # ── 发布契约：索引清单（artifacts/index_manifest.json）────────────────────────
@@ -2542,7 +2555,7 @@ def _chunk_one_document(job):
             messages.append(f"    ⚠️  丢弃 {dropped} 个纯空白块（不含任何文字）")
         if not kept:
             # 空文档（0 字节/纯空白）是**合法边界**，不是本轮失败：按 0 块正常结算并留痕。
-            # 旧写法在此 raise -> failures 短路 -> 整轮拒绝写 chunks.json：一篇空文件就能让
+            # 旧写法在此 raise -> failures 短路 -> 整轮拒绝发布产物：一篇空文件就能让
             # 其余文档的增改全都不入库，且 process 永远退出 1（卡死式静默）。
             messages.append(f"    ⚠️  文档 {source_name} 分块后无有效内容（0 块）：按空文档结算，不影响其余文档")
             _save_doc_chunks(source_name, sha, fingerprint, [])
@@ -2569,17 +2582,89 @@ def _chunk_one_document(job):
         log = prev_log
 
 
-def _chunks_fast_path_meta(paths, name_of, sources_now, fingerprint):
-    """process 快路径判据：指纹未变、产物在、每篇文档缓存都在 → 连读 60MB 缓存+重写 61MB 都省掉。
+# ── 分块产物库（sqlite3 文档单表）的唯一读写口：全部读方/写方只走这几个函数 ──
+def _chunks_db_open():
+    """打开产物库并确保 schema：WAL + busy_timeout（幂等建表，读侧同样可用）。"""
+    conn = sqlite3.connect(CHUNKS_DB, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("CREATE TABLE IF NOT EXISTS docs(store TEXT NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_docs_store_key ON docs(store, key)")
+    return conn
 
-    只读 meta + stat 每个文档缓存（不解析 60MB JSON）；判据与全量路径共用同一套指纹
-    （meta.fingerprint 已含 config + 源 sha），缓存内容损坏由下一次真实重算兜底。
+
+def chunks_db_read():
+    """读全量分块产物 → (meta 或 None, [记录…])。rowid 序 = 写入时的数组序。"""
+    conn = _chunks_db_open()
+    try:
+        row = conn.execute("SELECT data FROM docs WHERE store=? AND key=?", (STORE_META, "current")).fetchone()
+        meta = json.loads(row[0]) if row else None
+        chunks = [json.loads(r[0]) for r in conn.execute(
+            "SELECT data FROM docs WHERE store=? ORDER BY rowid", (STORE_CHUNKS,))]
+        return meta, chunks
+    finally:
+        conn.close()
+
+
+def chunks_meta_db_read():
+    """轻量读：库里 meta 单文档（快路径/新鲜度共享），无 meta 文档返回 None。"""
+    conn = _chunks_db_open()
+    try:
+        row = conn.execute("SELECT data FROM docs WHERE store=? AND key=?", (STORE_META, "current")).fetchone()
+        return json.loads(row[0]) if row else None
+    finally:
+        conn.close()
+
+
+def chunks_db_write(meta, chunks):
+    """单事务发布整份产物（chunks + meta 同一 COMMIT）：中途被杀/掉电 = 回滚上一完整
+    提交，无撕裂窗口。成功后立即导出 chunks.meta.json 派生兼容副本（发布链消费）。"""
+    conn = _chunks_db_open()
+    try:
+        with conn:
+            conn.execute("DELETE FROM docs WHERE store=? OR store=?", (STORE_CHUNKS, STORE_META))
+            conn.execute("INSERT INTO docs VALUES(?,?,?)",
+                         (STORE_META, "current", json.dumps(meta, ensure_ascii=False)))
+            conn.executemany("INSERT INTO docs VALUES(?,?,?)",
+                             ((STORE_CHUNKS, c["id"], json.dumps(c, ensure_ascii=False)) for c in chunks))
+    finally:
+        conn.close()
+    os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
+    with open(CHUNKS_META_JSON + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    os.replace(CHUNKS_META_JSON + ".tmp", CHUNKS_META_JSON)
+
+
+def _manifest_db_write(manifest):
+    """发布清单主拷贝进产物库（store=manifest，单事务 upsert），随后立即导出
+    INDEX_MANIFEST_JSON 兼容副本——发布链（Dockerfile/ms_release/verify-build）照旧
+    消费那份文件，路径与字节契约不变。"""
+    conn = _chunks_db_open()
+    try:
+        with conn:
+            conn.execute("INSERT INTO docs VALUES(?,?,?) ON CONFLICT(store, key) DO UPDATE SET data=excluded.data",
+                         (STORE_MANIFEST, "current", json.dumps(manifest, ensure_ascii=False)))
+    finally:
+        conn.close()
+    os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
+    with open(INDEX_MANIFEST_JSON + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    os.replace(INDEX_MANIFEST_JSON + ".tmp", INDEX_MANIFEST_JSON)
+
+
+def _chunks_fast_path_meta(paths, name_of, sources_now, fingerprint):
+    """process 快路径判据：指纹未变、产物在、每篇文档缓存都在 → 连读产物库都省掉。
+
+    只读库里 meta 单文档 + stat 每个文档缓存（不解析全量产物）；判据与全量路径共用
+    同一套指纹（meta.fingerprint 已含 config + 源 sha），缓存内容损坏由下一次真实重算兜底。
     """
-    if not (os.path.exists(CHUNKS_JSON) and os.path.exists(CHUNKS_META_JSON)):
+    if not os.path.exists(CHUNKS_DB):
         return None
     try:
-        with open(CHUNKS_META_JSON, encoding="utf-8") as f:
-            meta = json.load(f)
+        meta = chunks_meta_db_read()
+        if meta is None:
+            return None
         if meta.get("meta_version") != CHUNKS_META_VERSION:
             return None
         if meta.get("fingerprint") != fingerprint or meta.get("sources") != sources_now:
@@ -2594,8 +2679,8 @@ def _chunks_fast_path_meta(paths, name_of, sources_now, fingerprint):
 
 
 def build_chunks():
-    # 上次 process 中断留下的半截 tmp（原子写靠 os.replace 收尾）：进到这里说明本轮
-    # 没有别的 writer 在跑（process 单进程串行），直接清掉，不让孤儿 tmp 永久占盘。
+    # 清理孤儿 tmp（两处来源：旧版 tmp+rename 协议的历史残留、派生导出被中断的 .tmp）：
+    # 进到这里说明本轮没有别的 writer 在跑（process 单进程串行），直接清掉。
     for _stale_tmp in (CHUNKS_JSON + ".tmp", CHUNKS_META_JSON + ".tmp"):
         try:
             os.remove(_stale_tmp)
@@ -2618,8 +2703,8 @@ def build_chunks():
         log(f"找到 {len(paths)} 个文档: {', '.join(os.path.basename(p) for p in paths)}")
     else:
         # 目录存在、通配符一个都没命中 = 语料被清空（合法边界，见 _document_paths）：
-        # 按 0 文档结算，写出空的 chunks.json + 空 sources，知识库才有"清空"这条路。
-        log(f"⚠️  {DATA_DIR} 中没有匹配 {DOC_GLOB!r} 的文档：按空语料结算（chunks.json 写成 0 条）")
+        # 按 0 文档结算，产物库 chunks 写入 0 条 + meta 空 sources，知识库才有"清空"这条路。
+        log(f"⚠️  {DATA_DIR} 中没有匹配 {DOC_GLOB!r} 的文档：按空语料结算（产物库写成 0 条）")
     all_chunks = []
     reused = 0
     failures: list = []
@@ -2631,7 +2716,7 @@ def build_chunks():
     if fast_meta is not None:
         _gc_doc_chunks(names_now)
         _wall_s = time.time() - t_start
-        log(f"process 快路径: 指纹未变、{total}/{total} 篇文档缓存齐全 → 跳过重算与 61MB 重写")
+        log(f"process 快路径: 指纹未变、{total}/{total} 篇文档缓存齐全 → 跳过重算与产物重写")
         log(f"process 墙钟: {_wall_s:.1f}s（复用 {total}/{total} 篇，并行 {workers} 路；{hw_report()}）")
         record_build_stats({
             "stage": "process",
@@ -2646,7 +2731,7 @@ def build_chunks():
         })
         return 0
     # 逐文档兜底语义不变：单篇坏数据/异常只跳过自己，末尾因 failures 短路返回、不覆盖
-    # chunks.json —— 残缺产物一旦入库，索引就会静默少文档。
+    # 产物库 —— 分块产物一旦入库，索引就会静默少文档。
     # per-doc 缓存判据用「分块配置指纹 + 本文档 sha」，**不是**语料级全局 fingerprint：
     # 全局值把全部文档的 sha 并在一起（_chunking_fingerprint），任何一篇增/删/改都会
     # 让所有未变文档的缓存判据失配 → 名义上的"增量"在每次语料变化时都退化为全库重算
@@ -2729,7 +2814,7 @@ def build_chunks():
         log(f"❌ {len(failures)}/{len(paths)} 个文档分块失败（其余已处理）:")
         for fail_name, fail_err in failures:
             log(f"   - {fail_name}: {fail_err}")
-        log("chunks.json 与 meta 保持上一版（残缺产物不入库），失败文档未写缓存；修复后重跑 process 即可增量续算。")
+        log("分块产物库保持上一版（残缺产物不入库），失败文档未写缓存；修复后重跑 process 即可增量续算。")
         log(f"process 墙钟: {time.time() - t_start:.1f}s（复用 {reused}/{total}，失败 {len(failures)}；未写产物）")
         return 1
     if all_chunks and set(all_chunks[0]) != _RECORD_FIELDS:
@@ -2738,25 +2823,18 @@ def build_chunks():
     for c in all_chunks:
         c["parent_chunk_count"] = parent_counts[c["parent_id"]]
     os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
-    # 原子写（tmp + rename，与文档缓存/向量缓存同款）：直写时进程被杀会留下半截
-    # chunks.json，下次 json.load 当场崩且无法自愈。先写齐两份 tmp 再依次 rename：
-    # 任一步崩溃都只剩「新 chunks + 旧 meta」或整份旧产物，verify_chunks_freshness
-    # 的指纹/语料比对都能拦下重跑，不会出现能通过校验的撕裂产物。
-    chunks_tmp = CHUNKS_JSON + ".tmp"
-    meta_tmp = CHUNKS_META_JSON + ".tmp"
-    with open(chunks_tmp, "w", encoding="utf-8") as f:
-        json.dump(all_chunks, f, ensure_ascii=False, indent=2)
+    # 单事务发布（sqlite 文档库）：chunks + meta 同一 COMMIT，COMMIT 前进程被杀/掉电
+    # = 回滚到上一完整提交——"新 chunks + 旧 meta"混搭窗口整类消失，无需两份 tmp。
+    # 成功后派生 chunks.meta.json 兼容副本（镜像打包/verify-build 产物同代核对消费，
+    # 路径字节契约不变）。
     meta = { "meta_version": CHUNKS_META_VERSION, "fingerprint": fingerprint, "chunking_config": config_snapshot, "sources": sources_now, "total_chunks": len(all_chunks), "total_parents": len(parent_counts), "reused_documents": reused, "build_time": datetime.datetime.now().isoformat(timespec="seconds"), }
-    with open(meta_tmp, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    os.replace(chunks_tmp, CHUNKS_JSON)
-    os.replace(meta_tmp, CHUNKS_META_JSON)
+    chunks_db_write(meta, all_chunks)
     log("分块统计:")
     for b, cnt in sorted(Counter(_source_of(c) or "?" for c in all_chunks).items()):
         log(f"  {b}: {cnt} 条")
     log(f"  总计: {len(all_chunks)} 条，父块 {len(parent_counts)} 个")
-    log(f"已保存: {CHUNKS_JSON}")
-    log(f"元信息: {CHUNKS_META_JSON}（指纹 {fingerprint}）")
+    log(f"已发布: {CHUNKS_DB}（chunks {len(all_chunks)} 条 + meta 单文档，单事务提交）")
+    log(f"派生元信息: {CHUNKS_META_JSON}（指纹 {fingerprint}）")
     _wall_s = time.time() - t_start
     # 缓存命中 / 耗时可视化：一眼看出"这轮到底做了多少活、花了多久、卡在哪一段"。
     log(
@@ -2778,14 +2856,13 @@ def build_chunks():
 
 
 def verify_chunks_freshness():
-    if not os.path.exists(CHUNKS_JSON):
-        raise FileNotFoundError(f"找不到 {CHUNKS_JSON}，请先运行: python chatbot.py process")
-    if not os.path.exists(CHUNKS_META_JSON):
-        raise FileNotFoundError(f"找不到 {CHUNKS_META_JSON}，请重跑: python chatbot.py process")
-    with open(CHUNKS_META_JSON, encoding="utf-8") as f:
-        meta = json.load(f)
+    if not os.path.exists(CHUNKS_DB):
+        raise FileNotFoundError(f"找不到 {CHUNKS_DB}，请先运行: python chatbot.py process")
+    meta = chunks_meta_db_read()
+    if meta is None:
+        raise FileNotFoundError(f"{CHUNKS_DB} 里没有 meta 文档，请重跑: python chatbot.py process")
     if meta.get("meta_version") != CHUNKS_META_VERSION:
-        raise RuntimeError(f"{CHUNKS_META_JSON} 的 meta_version={meta.get('meta_version')}，当前代码是 {CHUNKS_META_VERSION}，请重跑 process")
+        raise RuntimeError(f"{CHUNKS_DB} 的 meta_version={meta.get('meta_version')}，当前代码是 {CHUNKS_META_VERSION}，请重跑 process")
     config_fp, config_snapshot = _chunking_config_fingerprint()
     paths = _document_paths()
     sources_now = _sources_fingerprint(paths)
@@ -3712,25 +3789,28 @@ def build_index():
         DeleteAlias,
         DeleteAliasOperation,
         Distance,
+        FieldCondition,
+        Filter,
+        MatchValue,
         Modifier,
         PayloadSchemaType,
         PointStruct,
         SparseVectorParams,
         VectorParams,
     )
-    # 构建启动预检（用户决策 2026-11-01）：精度链 / 内存 / 电源 / 自适应参数，全部在
-    # 读语料、加载模型之前判定；不一致像"编译不过"一样当场失败，不浪费一次全量重建。
+    # 构建启动预检（2026-11-10 服务化改版）：合同三证（infinity 可达 / served 名单含
+    # 配置模型 / 嵌入身份可解）+ Qdrant 可达，全部在读语料之前判定；不一致像"编译不过"
+    # 一样当场失败，不浪费一次全量重建。
     policy = index_preflight()
     meta = verify_chunks_freshness()
-    with open(CHUNKS_JSON, encoding="utf-8") as f:
-        all_chunks = json.load(f)
-        # ★ 记录键集必须与当前契约一致：改 RAG_SOURCE_FIELD 后只跑 index（没跑 process）时，
-        # 切分指纹与源 sha 都不变、stages 四段全绿，而旧键读不到 -> payload 来源全空、
-        # 来源过滤恒零命中（静默）。这里 fail-closed 并指名要重跑 process。
-        if all_chunks and set(all_chunks[0]) != _RECORD_FIELDS:
-            _miss = sorted(_RECORD_FIELDS - set(all_chunks[0]))
-            _extra = sorted(set(all_chunks[0]) - _RECORD_FIELDS)
-            raise RuntimeError(f"{CHUNKS_JSON} 记录键集与当前契约不一致（多 {_extra}、少 {_miss}）——通常是改了 RAG_SOURCE_FIELD 等字段配置，请重跑 process 后再 index")
+    _meta_db, all_chunks = chunks_db_read()
+    # ★ 记录键集必须与当前契约一致：改 RAG_SOURCE_FIELD 后只跑 index（没跑 process）时，
+    # 切分指纹与源 sha 都不变、stages 四段全绿，而旧键读不到 -> payload 来源全空、
+    # 来源过滤恒零命中（静默）。这里 fail-closed 并指名要重跑 process。
+    if all_chunks and set(all_chunks[0]) != _RECORD_FIELDS:
+        _miss = sorted(_RECORD_FIELDS - set(all_chunks[0]))
+        _extra = sorted(set(all_chunks[0]) - _RECORD_FIELDS)
+        raise RuntimeError(f"{CHUNKS_DB} 记录键集与当前契约不一致（多 {_extra}、少 {_miss}）——通常是改了 RAG_SOURCE_FIELD 等字段配置，请重跑 process 后再 index")
     log(f"加载分块数据: {len(all_chunks)} 条（{meta.get('total_parents', '?')} 个父块）")
     build_id = uuid.uuid4().hex
     lexicon_id = lexicon_fingerprint()
@@ -7585,7 +7665,7 @@ def get_engine():
 
 
 # ── 工具：分块 A/B 比较 ──
-DEFAULT_B = CHUNKS_JSON
+DEFAULT_B = CHUNKS_DB
 # 比对列**由 _PAYLOAD_SPEC 派生**（不再手写）：来源字段那一项在产物里的键名由
 # RAG_SOURCE_FIELD 决定，比对时统一按规范名 "source" 走 _source_of 读取。
 # 手写清单是"多份字段契约表示"里最容易分叉的一份：少一列时比较器遍历不到它，
@@ -7601,10 +7681,17 @@ _SOURCE_ALIASES = set(SOURCE_PAYLOAD_FIELDS)
 def load(path):
     if not os.path.exists(path):
         sys.exit(f"❌ 找不到文件: {path}")
+    if path.endswith(".db"):
+        if os.path.abspath(path) != os.path.abspath(CHUNKS_DB):
+            sys.exit(f"❌ {path} 不是分块产物库（产物库只认 {CHUNKS_DB}；历史 JSON 归档直接传 .json 路径）")
+        _load_meta, data = chunks_db_read()
+        if not data:
+            sys.exit(f"❌ {CHUNKS_DB} 里没有分块记录（store=chunks 为空），请先跑 process")
+        return data
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
-        sys.exit(f"❌ {path} 不是 JSON 列表（chunks.json 应为记录数组）")
+        sys.exit(f"❌ {path} 不是 JSON 列表（分块产物归档应为记录数组）")
     return data
 
 

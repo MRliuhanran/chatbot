@@ -203,7 +203,7 @@ docker run --rm -p 7860:7860 rag-chatbot:modelscope
 ./start.sh stop             # 必须：让 Qdrant 把 WAL 刷盘，避免把运行中的 storage 打进镜像
 # storage/ 在 .gitignore 里，新索引文件必须 -f；漏了它镜像里的索引还是旧快照
 git add -f storage
-git add artifacts/index_manifest.json artifacts/chunks.json artifacts/chunks.meta.json
+git add artifacts/index_manifest.json artifacts/chunks.meta.json
 git commit -m "data: 重建索引并同步 index_manifest"
 bash tools/ms_release.sh    # preflight → push → 构建 → 运行日志验收
 ~~~
