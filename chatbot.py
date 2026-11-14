@@ -7,6 +7,9 @@
 #   · L4 只依赖 L3 的 Protocol；L6 是唯一允许 import streamlit 的层。
 #   · 指纹单元（_CHUNKING_CODE_UNITS / _embed_code_fingerprint / lexicon_fingerprint
 #     列出的函数）源码禁改：改名/加装饰器/改空白都会让 inspect.getsource 变化 → 全量重建。
+#     嵌入侧同理有第二套身份键 _embed_http_code_key（http_embeddings/_model_http_json/
+#     HttpEmbeddingBackend 源码哈希）：改这几处函数 = 服务"嵌入代码"换代，收藏集收编
+#     闸门与 embed_parity.json 凭证全部失效，index 会全量重算 —— 属预期，不做外科手术。
 # ── 基础设施：环境配置与日志 ──
 from __future__ import annotations
 
@@ -507,7 +510,8 @@ def runtime_precision_policy(device=None, total_mb=None):
       · GPU（MPS/CUDA）统一内存：<16GB → fp16（fp32 两组模型 4.4G + Ollama/应用会换页）；
         ≥16GB → fp32（质量档可用）。
       · CPU：恒 fp32（CPU fp16 更慢，且 CPU 上 fp32 才是既有质量口径）。
-    显式 RAG_INFINITY_DTYPE 仍是最终覆写；但构建设置不一致会被预检拦下（见 build_policy）。
+    显式 RAG_INFINITY_DTYPE 仍是最终覆写；构建与查询的档位一致性由 index 预检与
+    embedpairs 记录（2026-11-10 嵌入服务化后入库档 = 服务端 --dtype，见 index_preflight）。
     """
     device = device or _detect_build_device()
     if total_mb is None:
@@ -556,128 +560,39 @@ def detect_resources():
     }
 
 
-def _estimate_embed_peak_mb(device, precision, batch):
-    """嵌入阶段峰值内存估算（含权重/激活/框架缓冲；按实测平台留出保守余量）。"""
-    if device == "mps":
-        return (1200 + 55 * batch) if precision == "fp16" else (2300 + 90 * batch)
-    if device == "cuda":
-        return (1300 + 50 * batch) if precision == "fp16" else (2400 + 90 * batch)
-    return 2200 if precision == "fp16" else 2400
-
-
-def build_policy(res=None):
-    """构建期自适应策略：设备、精度、批大小、线程、写并发一次算清并给出来源。
-
-    精度契约（本函数是唯一推导点）：
-      · 默认目标 = runtime_precision_policy()（查询侧预算档）→ 构建与查询同档；
-      · RAG_INDEX_PRECISION / RAG_EMBED_FORCE_FP32 是显式覆写，必须 RAG_ALLOW_PRECISION_OVERRIDE=1；
-      · 覆写未开时，构建立即失败（在预检里抛），不浪费一次全量重建。
+def _resource_note(res):
+    """电源/负载提示位（2026-11-10 嵌入服务化降级为**提示级**）：重活已经发生在 infinity
+    服务进程里，预检拦分离侧也拦不住，只剩"提醒用户条件差、构建会不会慢"的观测价值。
+    低电量/电池/高负载继续打日志，不再让 build 不可用。
     """
-    res = res or detect_resources()
-    policy_prec, policy_reason = runtime_precision_policy(res["device"], res["mem_total_mb"])
-    override = (os.getenv("RAG_INDEX_PRECISION") or "").strip().lower()
-    if override in ("fp16", "fp32"):
-        target, target_src = override, f"RAG_INDEX_PRECISION={override}"
-    elif EMBED_FORCE_FP32:
-        target, target_src = "fp32", "RAG_EMBED_FORCE_FP32=1"
-    else:
-        target, target_src = policy_prec, "内存预算策略"
-    allow = env_bool("RAG_ALLOW_PRECISION_OVERRIDE", False)
-    device = (INDEX_DEVICE or "").strip() or res["device"]
-    if device not in ("mps", "cuda", "cpu"):
-        device = res["device"]
-    if device == "cpu" and target == "fp16":
-        target, target_src = "fp32", target_src + "（CPU 强制 fp32）"
-    batch = EMBED_BATCH_SIZE or embed_batch_size(device, res["mem_total_mb"])
-    avail = res["mem_available_mb"]
-    if avail is not None:
-        while batch > 8 and _estimate_embed_peak_mb(device, target, batch) > max(1024, avail - 1536):
-            batch //= 2
-    return {
-        "resources": res,
-        "policy_precision": policy_prec,
-        "policy_reason": policy_reason,
-        "precision": target,
-        "precision_source": target_src,
-        "allow_override": allow,
-        "device": device,
-        "batch_size": batch,
-        "threads": res["cores"],
-        "embed_peak_mb": _estimate_embed_peak_mb(device, target, batch),
-        "write_workers": INDEX_WRITE_WORKERS or qdrant_write_workers(999),
-    }
-
-
-def _resource_gate(pol):
-    """真正要跑嵌入之前的资源闸门（内存/电源/负载）。
-
-    从 index_preflight() 拆出来：完整缓存命中的 index 只写 Qdrant（秒级），不该因为电池/
-    低电量被拦；只有"确实要算向量"（missing 非空）时才需要这些前置条件。
-    """
-    res = pol["resources"]
-    avail = res["mem_available_mb"]
-    need = int(pol["embed_peak_mb"] * 1.35) + 512
-    if INDEX_MIN_FREE_MB:
-        need = max(need, INDEX_MIN_FREE_MB)
-    if avail is None:
-        log("⚠️  index 内存闸门：本机读不到可用内存，跳过（不影响构建）")
-    elif avail < need:
-        if env_bool("RAG_INDEX_ALLOW_LOW_MEMORY", False):
-            log(
-                f"⚠️  内存闸门放行（RAG_INDEX_ALLOW_LOW_MEMORY=1）：可开 {avail}MB < 所需 {need}MB"
-                f"（峰值估算 {pol['embed_peak_mb']}MB）；断点续算已开启，风险自担"
-            )
-        else:
-            raise RuntimeError(
-                f"可开内存 {avail}MB < 本次构建所需 {need}MB（峰值估算 {pol['embed_peak_mb']}MB + 余量，"
-                f"RAG_INDEX_MIN_FREE_MB={INDEX_MIN_FREE_MB}）：大概率 serve/infinity/Ollama 同机驻留。"
-                f"先停 serve/infinity/Ollama（Qdrant 可留）释放内存后重跑 index；"
-                f"应急可设 RAG_INDEX_ALLOW_LOW_MEMORY=1 放行（断点续算兜底）。"
-            )
-    else:
-        log(f"index 内存闸门: 可开 {avail}MB ≥ 所需 {need}MB（峰值估算 {pol['embed_peak_mb']}MB）")
     power = res.get("power") or {}
-    if power:
-        if power.get("low_power") and not env_bool("RAG_INDEX_ALLOW_LOW_POWER", False):
-            raise RuntimeError(
-                "低电量模式=1：CPU/GPU 被系统限频，全量构建会慢数倍。"
-                "关闭低电量模式（系统设置→电池）后重跑；或显式 RAG_INDEX_ALLOW_LOW_POWER=1 强行构建。"
-            )
-        if power.get("source") == "battery" and not env_bool("RAG_INDEX_ALLOW_BATTERY", False):
-            raise RuntimeError(
-                "电池供电：8G M2 上 GPU 有效吞吐会掉到插电的一半左右（实测 13.7 vs ~27 块/s）。"
-                "插电后重跑；或显式 RAG_INDEX_ALLOW_BATTERY=1 强行构建。"
-            )
+    if power.get("low_power"):
+        log("⚠️  低电量模式=1：系统限频会让 infinity 的重计算变慢（构建被动拉长，仅提示）")
+    if power.get("source") == "battery":
+        log("⚠️  电池供电：GPU 有效吞吐约减半（实测 13.7 vs ~27 块/s；仅提示，构建不失败）")
     if res.get("load1") is not None and res["load1"] > max(4.0, res["cores"] * 0.75):
         log(f"⚠️  当前 load1={res['load1']:.1f} 偏高：同机有其他负载，构建墙钟会被拉长（但不会失败）")
 
 
 def index_preflight():
-    """index 构建启动预检：精度链 / 内存 / 电源 / 自适应参数，全部在**做任何工作之前**。
+    """index 构建启动预检（2026-11-10 嵌入服务化改版）。
 
-    用户决策 2026-11-01：精度链不一致必须像"代码编译不过"一样在构建启动时失败，
-    不能跑完 88 分钟才在运行期发现；资源按机器上限自动选择，不靠人手填 HW_*。
+    旧版在这里做"精度链 + 内存闸门 + 自适应参数"（全部为进程内 torch 服务）。向量迁入
+    模型服务后，重活在服务进程里，本地预检的边界收敛为两类：
+      · **合同三证**：infinity 可达、served 名单含 EMBED_MODEL_NAME、嵌入身份可解
+        （缺一像编译不过一样当场失败，不浪费一次全量重建）；
+      · Qdrant 可达（别等嵌入跑完才在写入阶段发现连不上）。
+    电源/负载降级 `_resource_note` 提示级。
+    返回 {"identity": 嵌入身份, "http_batch": 客户端批大小}。
     """
-    res = detect_resources()
-    pol = build_policy(res)
-    power = res.get("power") or {}
-    power_txt = (
-        f"{power.get('source')} low_power={power.get('low_power')}" if power else "未知"
-    )
+    identity = _embed_http_identity(verify_service=True)
     log(
-        f"[自适应] 设备={pol['device']} 核数={res['cores']} 内存={res['mem_total_mb']}MB"
-        f"(可用 {res['mem_available_mb']}MB) 电源={power_txt} 精度={pol['precision']}"
-        f"({pol['precision_source']}) batch={pol['batch_size']} 写并发={pol['write_workers']}"
+        f"[预检] 嵌入服务 {EMBED_URL}：model={identity['model']} 服务端版本={identity['version']}"
+        f" dtype={identity['dtype']} 身份 content={identity['content_key']} code={identity['code_key']}"
     )
-    if pol["precision"] != pol["policy_precision"] and not pol["allow_override"]:
-        raise RuntimeError(
-            f"精度链不一致（构建启动即失败）：本次要构建 {pol['precision']}（{pol['precision_source']}），"
-            f"但查询侧按内存预算只能是 {pol['policy_precision']}（{pol['policy_reason']}）。"
-            f"这会导致索引与查询不同精度、质量口径无法保证。"
-            f"处置：① 让构建跟随预算档（去掉 RAG_INDEX_PRECISION / RAG_EMBED_FORCE_FP32）；"
-            f"② 确实要强制异档，显式设 RAG_ALLOW_PRECISION_OVERRIDE=1 并同步设 RAG_INFINITY_DTYPE。"
-        )
-    # Qdrant 可达性：不要等嵌入跑完 20-90 分钟才在写入阶段发现连不上。
+    res = detect_resources()
+    _resource_note(res)
+    # Qdrant 可达性：不要等嵌入跑完才在写入阶段发现连不上。
     try:
         _probe = _qdrant_client(timeout=max(5, min(QDRANT_TIMEOUT, 15)))
         _n = len(_probe.get_collections().collections)
@@ -689,7 +604,7 @@ def index_preflight():
             f"Qdrant 未就绪或不可达（{QDRANT_HOST}:{QDRANT_PORT} / gRPC {QDRANT_GRPC_PORT}）："
             f"{type(exc).__name__}: {exc}。先 ./start.sh start（或单独起 Qdrant）再跑 index。"
         ) from exc
-    return pol
+    return {"identity": identity, "http_batch": EMBED_HTTP_BATCH}
 
 
 class _StdoutHandler(logging.StreamHandler):
@@ -1559,14 +1474,18 @@ CHUNKS_META_VERSION = 1
 # 否则"看起来完整"的清单会把坏产物判成同源（判据恒真 + 静默）。
 INDEX_MANIFEST_JSON = os.path.join(_ARTIFACTS_DIR, "index_manifest.json")
 INDEX_MANIFEST_VERSION = 1
-EMBED_CACHE_DIR = os.path.join(_ARTIFACTS_DIR, "embeddings")
-EMBED_CACHE_ENABLED = env_bool("RAG_EMBED_CACHE", True)
-# 入库编码精度档（RAG_EMBED_FORCE_FP32=1 = 质量优先档，消掉 fp16 量化折损）：
-# GPU（mps/cuda）默认走 fp16 计算路径（快一倍、实测 top-10 recall 0.998）；置 1 后
-# 权重/autocast/缓存精度标签全部回到 fp32（见 _embed_use_fp16 单一事实源）。
-# 注意两条兼容性约定：① precision 本来就是缓存键的一段 —— 切档只会换文件（fp16/fp32
-# 两份共存），**不会静默混用旧向量**；② 缺省设备重定为 CPU（fp32 语义最稳），显式
-# RAG_INDEX_DEVICE 锁设备则留在原设备只摘 half/autocast（MPS fp32 计算合法但慢一倍）。
+# 嵌入对拍接收凭证（embedpairs 绿灯落盘；index 的"旧档收编"复用它做机器担保）。
+PARITY_RECEIPT_JSON = os.path.join(_ARTIFACTS_DIR, "embed_parity.json")
+# 嵌入走模型服务时客户端一次提交的条数：服务端 --batch-size 在 infinity 侧只会再细分成
+# 它自己的批，客户端提交粒度影响的是一次 HTTP 往返的体积与排队。只在"真的缺向量"路径
+# 生效（收编/复用路径不经过它）。默认 32 ≈ 服务端批 8 的 4 倍，留出队列缓冲。
+EMBED_HTTP_BATCH = env_int_min("RAG_HTTP_EMBED_BATCH", 32, 1)
+# 旧 npz 缓存常量（EMBED_CACHE_DIR/EMBED_CACHE_ENABLED）随 2026-11-10 嵌入服务化退役：
+# 向量的唯一存储现在是 Qdrant 集合，稠密复用走"身份凭证 + 服务端快照克隆"（见
+# _parity_receipt_validate / build_index）。
+# 入库编码精度档口径变化：precision 现在记录的是**服务端 --dtype**（RAG_INFINITY_DTYPE/
+# 已推导档，runtime_infinity_dtype 单一事实源）；RAG_EMBED_FORCE_FP32 仍属查询侧
+# torch 后端的口径（进程内推理），不再决定入库精度。
 EMBED_FORCE_FP32 = env_bool("RAG_EMBED_FORCE_FP32", False)
 DOC_CHUNK_DIR = os.path.join(_ARTIFACTS_DIR, "docs")  # 单文档分块缓存：只重分块增/改的文档
 LEXICON_DIR = os.getenv("RAG_LEXICON_DIR", "./lexicon")
@@ -2019,6 +1938,13 @@ def load_rerank_tokenizer_only():
 
 def _embed_batch(texts, tokenizer, model, device, autocast=False):
     import torch
+    # 2026-11-10 与服务端对齐：sentence-transformers 在 tokenize 前强制 str(s).strip()
+    # （models/Transformer.py L499，infinity 继承之），本地旧实现直接送原文 —— 尾部
+    # "\n" 被编成多余的 ▁ token，CLS 向量偏 ~0.003 cos（40 点全库扫描实测：无尾部
+    # 空白 16 点全 1.000000，尾部含空白 24 点 min=0.995439）。**query 指令已在上层
+    # embed() 拼进文本**，这里 strip 的对象与方法与 ST 完全同构（含指令串无尾随空白
+    # 的性质，strip 后查询侧与服务端逐位一致）。
+    texts = [t.strip() for t in texts]
     inputs = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
@@ -3264,10 +3190,6 @@ def _index_text(rec):
     return text
 
 
-def _embed_cache_key(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 _EMBED_CODE_FINGERPRINT = None
 
 
@@ -3346,20 +3268,13 @@ def _model_content_fingerprint():
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
-def _embed_cache_file(precision):
-    model_key = hashlib.sha256( os.path.abspath(EMBED_MODEL_PATH).encode("utf-8") ).hexdigest()[:12]
-    content_key = _model_content_fingerprint()
-    code_key = _embed_code_fingerprint()
-    return os.path.join(EMBED_CACHE_DIR, f"{model_key}_{content_key}_{code_key}_{precision}.npz")
-
-
 def _expected_embed_dim():
     """嵌入维度的无模型读法：直接读模型目录的 config.json。
 
-    只服务"缓存命中后不必加载模型"的路径 —— 那条路拿不到 model.config.hidden_size，
-    而维度交叉校验不能因此消失：同路径换了个不同维度的模型时，少了这道校验就会静默
-    复用旧向量。正常加载路径仍以已加载模型的 config 为准；这里读不到就返回 None，
-    由 _load_embed_cache 跳过该项校验（config.json 都缺的模型目录本身已是异常）。
+    build_index 的三条稠密供给路（收编/重算/空语料）与维度交叉校验共用这一份：
+    同路径换了个不同维度的模型时，少了这道校验就会静默复用旧向量。加载路径仍以
+    已加载模型的 config 为准；这里读不到就返回 None，由各分支自己 fail-closed 报错
+    （config.json 都缺的模型目录本身已是异常）。
     """
     try:
         with open(os.path.join(EMBED_MODEL_PATH, "config.json"), encoding="utf-8") as f:
@@ -3369,259 +3284,152 @@ def _expected_embed_dim():
         return None
 
 
-# 固定优先级，与设备无关：完整命中时向量全部来自同一份文件，精度只决定"读哪份"，
-# 不混用就不出错。顺序写死成常量，避免两处各自排序导致跨次运行读到不同那份。
-_EMBED_CACHE_PRECEDENCE = ("fp16", "fp32")
-
-
-def _inspect_embed_caches(keys):
-    """逐份检查候选稠密缓存，返回 [(precision, path, cache, missing), ...]。
-
-    只含磁盘上存在且读得出来的那份，按 _EMBED_CACHE_PRECEDENCE 排序；没有任何候选
-    返回空列表。**这是 index 与 stages 共用的唯一一份缓存选择规则** —— 两处各写一份
-    必然分叉，正是"stages 说新鲜 / index 却重算"这类同轮日志两个结论的来源。
-
-    维度校验走 _expected_embed_dim()（不加载模型），missing 是相对传入 keys 的缺口。
-    """
-    out = []
-    for precision in _EMBED_CACHE_PRECEDENCE:
-        path = _embed_cache_file(precision)
-        if not os.path.exists(path):
-            continue
-        cache = _load_embed_cache(path, expected_dim=_expected_embed_dim())
-        if not cache:
-            continue
-        missing = [i for i, k in enumerate(keys) if k not in cache]
-        out.append((precision, path, cache, missing))
-        # 优先级排第一的已完整覆盖：后面的候选不可能再提供任何东西了（只会把缺失列表
-        # 排得更长），提前收工省一次全量字典遍历。
-        if not missing:
-            break
-    return out
-
-
-def _full_embed_cache(cands):
-    """候选里第一个**完整覆盖 keys** 的（按固定优先级），没有则 None。
-
-    完整命中 = 一条向量都不用算 = 不需要知道设备、不需要加载 torch 与嵌入模型。
-    """
-    return next((c for c in cands if not c[3]), None)
-
-
-def _read_embed_cache_arrays(path):
-    """从 npz 读出 (keys, vectors) **原始数组**，不做任何语义校验。
-
-    运行期（_load_embed_cache）与构建期（cmd_verify_build 的嵌入缓存体检）共用这一份
-    读取入口 —— 两处各写一份必然分叉（"verify 说健康 / 运行时却读坏"的口径分裂原型）。
-    """
-    import numpy as np
-    with np.load(path, allow_pickle=False) as data:
-        keys = data["keys"].tolist()
-        vecs = data["vectors"]
-    return keys, vecs
-
-
-def _check_embed_cache_shape(keys_n, vecs, expected_dim=None):
-    """稠密缓存结构校验（二维 / 行数自洽 / 非空 / 维度与模型期望一致），不合法抛 ValueError。
-
-    错误文案有意与运行期逐字同源：同一句话在 verify-build（构建期判死）与 index（运行期
-    退化告警）里出现，排查时不会得出两个结论。
-    """
-    if vecs.ndim != 2:
-        raise ValueError(f"vectors 不是二维数组: shape={vecs.shape}")
-    if keys_n != vecs.shape[0]:
-        raise ValueError(f"keys 与 vectors 行数不一致: {keys_n} vs {vecs.shape[0]}")
-    if vecs.shape[0] == 0:
-        raise ValueError("缓存为空数组")
-    if expected_dim is not None and vecs.shape[1] != expected_dim:
-        raise ValueError(f"缓存向量维度 {vecs.shape[1]} 与模型期望的 {expected_dim} 不一致（多半是换过模型）")
-
-
-def _load_embed_cache(path, expected_dim=None):
-    import numpy as np
-    if not os.path.exists(path):
-        return {}
-    try:
-        keys, vecs = _read_embed_cache_arrays(path)
-        # fp16 标签的文件现在真的存 float16（_save_embed_cache）。读侧统一升 float32：
-        # 进程内的一切消费（vstack/维度校验/upsert）继续以 float32 口径工作，存储位宽
-        # 只决定文件占盘；旧 float32 文件无视此分支。转完再校验，报错结论不因位宽变化。
-        if vecs.dtype != np.float32:
-            vecs = vecs.astype(np.float32)
-        _check_embed_cache_shape(len(keys), vecs, expected_dim)
-    except Exception as exc:
-        log(f"    ⚠️  向量缓存不可用，将全量重算: {type(exc).__name__}: {exc}")
-        return {}
-    log(f"向量缓存载入: {len(keys)} 条，{vecs.shape[1]} 维")
-    return {k: vecs[i] for i, k in enumerate(keys)}
-
-
-def _save_embed_cache(path, keys, matrix, precision="fp32"):
-    """原子写稠密缓存。落盘 dtype 与**计算路径标签同源**：precision="fp16"（GPU half 权重
-    路径）的向量本来就产自 fp16 计算，存 float16 磁盘减半且终值不变；"fp32"（CPU 全精度
-    路径）保持 float32 不动 —— 名下标签说 fp16，文件就真的只占 fp16 的字节数（旧实现恒存
-    float32，"fp16"名不副实，磁盘多付一倍）。
-    数值口径：fp16 存储只动**存储位宽**，与 fp16 计算路径的既有量化误差同阶（load_embedding_model
-    的对拍实测：余弦 0.999998、top-10 近邻 recall 0.998）；load 侧统一转回 float32，上游
-    （vstack / Qdrant upsert）不受存储位宽影响。缓存文件名四段键不受此改动影响，已有缓存
-    不失效：fp32 存储的旧文件照常读出。
-    """
-    import numpy as np
-    tmp = path + ".tmp.npz"
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        dtype = "float16" if precision == "fp16" else "float32"
-        np.savez(tmp, keys=np.array(keys, dtype="U64"), vectors=matrix.astype(dtype))
-        os.replace(tmp, path)
-        return True
-    except Exception as exc:
-        log(f"    ⚠️  向量缓存写入失败（本次索引不受影响）: {type(exc).__name__}: {exc}")
+def _embed_http_code_key():
+    """http 嵌入客户端链路的代码指纹：`http_embeddings`（唯一请求实现）+ `_model_http_json`
+    + 查询后端。改动任何一处（加校验、改指令前缀、改池化口径）都会换键 → 全量重算。"""
+    import inspect
+    parts = []
+    for name in ("http_embeddings", "_model_http_json", "HttpEmbeddingBackend"):
+        fn = globals().get(name)
         try:
-            os.remove(tmp)  # 失败留下的半截 tmp 别占盘
-        except OSError:
-            pass
-        return False
+            parts.append(f"{name}:" + inspect.getsource(fn))  # type: ignore[arg-type]
+        except (OSError, TypeError):
+            parts.append(f"{name}:<unavailable>")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
-_EMBED_PART_FORMAT = 1
-
-
-def _embed_parts_dir(cache_path):
-    return cache_path[:-4] + ".parts" if cache_path.endswith(".npz") else cache_path + ".parts"
-
-
-def _load_embed_parts(cache_path, expected_dim=None):
-    """载入断点分片（index 中断后下次续算）；坏分片只删除并告警，不阻断构建。"""
-    import numpy as np
-    out: dict = {}
-    d = _embed_parts_dir(cache_path)
-    if not os.path.isdir(d):
-        return out
-    for name in sorted(os.listdir(d)):
-        if not name.endswith(".part.npz"):
-            continue
-        path = os.path.join(d, name)
-        try:
-            with np.load(path, allow_pickle=False) as data:
-                fmt = int(np.asarray(data["format"]).reshape(-1)[0]) if "format" in data else 0
-                dim = int(np.asarray(data["dim"]).reshape(-1)[0]) if "dim" in data else 0
-                keys = data["keys"].tolist()
-                vecs = data["vectors"]
-            if fmt != _EMBED_PART_FORMAT:
-                raise ValueError(f"分片格式 {fmt} 与当前 {_EMBED_PART_FORMAT} 不一致")
-            if vecs.dtype != np.float32:
-                vecs = vecs.astype(np.float32)
-            if dim and expected_dim and dim != expected_dim:
-                raise ValueError(f"分片维度 {dim} 与模型期望 {expected_dim} 不一致")
-            _check_embed_cache_shape(len(keys), vecs, expected_dim)
-            for k, v in zip(keys, vecs):
-                out[k] = v
-        except Exception as exc:
-            log(f"    ⚠️  断点分片不可用，忽略并删除 {name}: {type(exc).__name__}: {exc}")
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-    if out:
-        log(f"断点续算载入: {len(out)} 条（{os.path.basename(d)}）")
-    return out
-
-
-def _save_embed_part(cache_path, seq, keys, embeddings, indices, precision):
-    """把一段已算向量原子落成断点分片；失败只告警，不影响本次构建。"""
-    import numpy as np
-    d = _embed_parts_dir(cache_path)
-    tmp = ""
+def _infinity_server_version():
+    """infinity 服务端版本号（进嵌入身份）。服务端与 CLI 同机同 venv（start.sh 启动），
+    读本包元数据即等价；个别环境读不到 → "unknown" 哨兵（fail-closed：身份钉不住角
+    就别声称钉住了，谁消费这个键就会看到 unknown 而不是静默匹配）。"""
     try:
-        os.makedirs(d, exist_ok=True)
-        selected_keys = [keys[i] for i in indices]
-        vecs = np.vstack([np.asarray(embeddings[i], dtype="float32") for i in indices])
-        dtype = "float16" if precision == "fp16" else "float32"
-        path = os.path.join(d, f"part-{seq}.part.npz")
-        tmp = path + ".tmp.npz"
-        np.savez(
-            tmp,
-            format=np.array([_EMBED_PART_FORMAT], dtype="int32"),
-            dim=np.array([vecs.shape[1]], dtype="int32"),
-            keys=np.array(selected_keys, dtype="U64"),
-            vectors=vecs.astype(dtype),
-        )
-        os.replace(tmp, path)
-        log(f"  断点已落盘: {len(indices)} 条 → {os.path.basename(path)}")
-    except Exception as exc:
-        log(f"    ⚠️  断点分片写入失败（不影响本次构建）: {type(exc).__name__}: {exc}")
-        try:
-            if tmp:
-                os.remove(tmp)
-        except OSError:
-            pass
-
-
-def _gc_embed_parts(cache_path):
-    """构建成功、终态 npz 已落盘后清掉分片目录。"""
-    import shutil
-    try:
-        shutil.rmtree(_embed_parts_dir(cache_path), ignore_errors=True)
+        from importlib.metadata import version as _pkg_version
+        return _pkg_version("infinity-emb")
     except Exception:
-        pass
+        return "unknown"
 
 
-def _gc_embed_cache_files():
-    """删掉**当前键序**不可能再被读到的旧缓存文件（index 成功收尾后调用一次）。
+def _infinity_served_models(timeout=5.0):
+    """GET {EMBED_URL}/models 的 served 名单（失联/应答不符合 OpenAI 形态就抛）。
 
-    缓存文件名前四段（model/content/code，见 _embed_cache_file）任一变更后，旧文件就不再
-    被任何一次运行读取 —— 里面没有 GC，磁盘上会一路积攒"每换一次模型/改一次嵌入代码多一份
-    92MB"的死重。规则：只保留以当前 `<model>_<content>_<code>_` 开头的文件（fp16/fp32 两条
-    计算路径都合法），其余 *.npz 删除；写入中断的 *.tmp.npz 由 _gc_embed_cache_tmp 在
-    index 起手时处理，这里不管。RAG_EMBED_CACHE=0 时缓存管理整层关闭，不动目录。
-    调用时机在 index 单例锁内 + 别名切换成功之后：stages 若真在并发读，读到的是"指紋已
-    变化的库"，其告警本来就会出现——这里不引入新的锁语义（见 acquire_index_lock 的分工）。
+    构建预检用：服务不在、或名单里没有 EMBED_MODEL_NAME，就像编译不过一样启动期失败。
     """
-    if not EMBED_CACHE_ENABLED or not os.path.isdir(EMBED_CACHE_DIR):
-        return
-    prefix = os.path.basename(_embed_cache_file("fp16"))[: -len("_fp16.npz")]
-    try:
-        removed = []
-        for name in sorted(os.listdir(EMBED_CACHE_DIR)):
-            if not name.endswith(".npz") or name.startswith(prefix):
-                continue
-            os.remove(os.path.join(EMBED_CACHE_DIR, name))
-            removed.append(name)
-        if removed:
-            log(f"向量缓存 GC: 当前键序 {prefix}*，删除 {len(removed)} 份不再可读的旧缓存:")
-            for name in removed:
-                log(f"  - {name}")
-        # 2026-11-01：断点分片目录也按同一键序 GC（旧模型/旧代码的 *.parts 再也不会被
-        # 任何一次续算读取，不清就是永久占盘；当前键序的 fp16/fp32 分片目录保留）。
-        import shutil
-        removed_parts = []
-        for name in sorted(os.listdir(EMBED_CACHE_DIR)):
-            path = os.path.join(EMBED_CACHE_DIR, name)
-            if not name.endswith(".parts") or not os.path.isdir(path) or name.startswith(prefix):
-                continue
-            shutil.rmtree(path, ignore_errors=True)
-            removed_parts.append(name)
-        if removed_parts:
-            log(f"断点分片 GC: 删除 {len(removed_parts)} 个旧键序分片目录")
-    except Exception as exc:
-        log(f"    ⚠️  向量缓存文件清理失败（不影响本次索引）: {type(exc).__name__}: {exc}")
+    import requests
+    url = EMBED_URL + "/models"
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json().get("data")
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"模型服务 {url} 应答缺少 data 名单（OpenAI 形态违约）")
+    return [m.get("id") for m in data if isinstance(m, dict) and m.get("id")]
 
 
-def _gc_embed_cache_tmp():
-    """清掉写入中断遗留的 *.tmp.npz（正常缓存名恒以 _fp16.npz/_fp32.npz 结尾，
-    .tmp.npz 只可能来自被杀掉的那次 index）。"""
+_EMBED_HTTP_IDENTITY: dict | None = None
+
+
+def _embed_http_identity(verify_service: bool = False):
+    """**嵌入身份**（2026-11-10 嵌入服务化）：谁计算向量 + 用的哪个模型。
+
+    字段：engine / model / version（infinity 服务端） / dtype（服务端启动参数口径，
+    记录但不进哈希 —— 客户端读不到服务端 --dtype，位级差异由 embedpairs 对拍背书）
+    / content_key / code_key。
+
+    · content_key = sha256(model 名 | 服务端版本 | 模型目录内容)[:12]：换 served 名、
+      升 infinity、本地换权重三者任一都会换键。模型目录内容在此出现是**钉权重**的
+      锚点（服务端与本地同目录，目录内容即权重指纹；切分指纹也用它，但那是它自己
+      的用途，两处消费互不影响）。
+    · code_key = sha256(http 客户端链路源码)[:12]（见 _embed_http_code_key）。
+    · verify_service=True：先探 GET /models（预检合同三证之一），名单缺
+      EMBED_MODEL_NAME 当场抛 —— 构建启动即失败，不浪费一次全量重建。
+    结果进程内记忆（缓存单例）：一次构建多段消费同一个身份，不重复探服务端。
+    """
+    global _EMBED_HTTP_IDENTITY
+    served = _infinity_served_models() if verify_service else None
+    if _EMBED_HTTP_IDENTITY is None:
+        model = EMBED_MODEL_NAME
+        ver = _infinity_server_version()
+        blob = json.dumps({"model": model, "version": ver, "model_dir_content": _model_content_fingerprint()},
+                          sort_keys=True, ensure_ascii=False)
+        _EMBED_HTTP_IDENTITY = {
+            "engine": "infinity-http",
+            "model": model,
+            "version": ver,
+            "dtype": runtime_infinity_dtype(),
+            "content_key": hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12],
+            "code_key": _embed_http_code_key(),
+        }
+    identity = dict(_EMBED_HTTP_IDENTITY)
+    if served is not None and identity["model"] not in served:
+        raise RuntimeError(
+            f"模型服务 {EMBED_URL}/models 的 served 名单 {served} 不含配置的 {identity['model']!r}："
+            f"服务端改了 --served-model-name 或起了别的服务 —— "
+            f"改 RAG_EMBED_MODEL_NAME 对齐，或把 infinity 恢复成 start.sh 的原参数"
+        )
+    return identity
+
+
+def _parity_receipt_read():
+    """读对拍接收凭证 embed_parity.json（没有/损坏/形态不对 → None）。"""
+    if not os.path.exists(PARITY_RECEIPT_JSON):
+        return None
     try:
-        if not os.path.isdir(EMBED_CACHE_DIR):
-            return
-        removed = 0
-        for name in os.listdir(EMBED_CACHE_DIR):
-            if name.endswith(".tmp.npz"):
-                os.remove(os.path.join(EMBED_CACHE_DIR, name))
-                removed += 1
-        if removed:
-            log(f"清理 {removed} 个中断遗留的向量缓存临时文件")
-    except Exception as exc:
-        log(f"    ⚠️  向量缓存临时文件清理失败（不影响本次索引）: {type(exc).__name__}: {exc}")
+        with open(PARITY_RECEIPT_JSON, encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _parity_receipt_validate(receipt, identity, collection):
+    """凭证消费端（fail-closed）：黑名单一眼可读；返回 (合法?, 原因)。
+
+    判据缺一不可（2026-11-10 定标，两条 cos 线 + 三条身份线）：
+      · min_cos ≥ 0.999 —— A/B 引擎对拍线（本地 torch vs http，探针句不含尾部空白，
+        引擎级必须严格一致）；
+      · min_cos_collection_http ≥ 0.99 —— C 侧库内锚定线：legacy 库是 torch 老路
+        （不 strip）产物，服务端 ST 规范剥空白，尾部含空白文本的 cos 实测带为
+        [0.995439, 1.0)（全库 40 点扫样；无尾部空白的点全部精确 1.000000）。该线仍
+        远高于任何真换模型/换池化/换归一的掉幅（0.85-0.95 一档）。**凭证必须由
+        C 侧对拍产生**（authorize 的对象就是"那些库内向量"）；
+      · 凭证里的 http 身份 = 当前身份（服务没被换，权重/版本/客户端代码全同）；
+      · 凭证锚定的集合 = 要被复用的集合（对拍就是**那些向量**本身，不是"同模型"的
+        泛化声明）；
+      · 有时间戳且不早于当前身份可用（防止拿旧版本服务的凭证放过新版本）。
+    """
+    if not isinstance(receipt, dict):
+        return False, "凭证缺失"
+    try:
+        cos = float(receipt.get("min_cos", 0.0))
+    except (TypeError, ValueError):
+        return False, "凭证 min_cos 不可读"
+    if cos < 0.999:
+        return False, f"A/B 对拍 min_cos={cos} 低于 0.999"
+    try:
+        cos_c = float(receipt.get("min_cos_collection_http", 0.0))
+    except (TypeError, ValueError):
+        return False, "凭证 min_cos_collection_http 不可读（须由三侧对拍的 embedpairs 重新生成）"
+    if cos_c < 0.99:
+        return False, f"C 侧库内锚定 min_cos={cos_c:.6f} 低于 0.99（余白带下限之上才算合法）"
+    rid = receipt.get("http_identity") or {}
+    if (rid.get("content_key") != identity["content_key"]
+            or rid.get("code_key") != identity["code_key"]):
+        return False, (f"凭证身份 {rid.get('content_key')}/{rid.get('code_key')}"
+                       f" ≠ 当前 {identity['content_key']}/{identity['code_key']}")
+    if receipt.get("collection") != collection:
+        return False, f"凭证锚定集合 {receipt.get('collection')} ≠ 目标 {collection}"
+    ts = float(receipt.get("ts", 0) or 0)
+    if ts <= 0:
+        return False, "凭证无时间戳"
+    return True, (f"A/B min_cos={cos:.6f} / C 侧 min_cos={cos_c:.6f} "
+                  f"集合={receipt.get('collection')} ts={int(ts)}")
+
+
+def _parity_receipt_write(receipt):
+    """原子写对拍接收凭证（embedpairs 绿灯时调用件交换）。"""
+    os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
+    with open(PARITY_RECEIPT_JSON + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(receipt, f, ensure_ascii=False, indent=2)
+    os.replace(PARITY_RECEIPT_JSON + ".tmp", PARITY_RECEIPT_JSON)
 
 
 # ── 索引构建 ──
@@ -3714,7 +3522,19 @@ def _qdrant_storage_root():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
 
 
-def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id, points, embed_model_content, qdrant_server, embed_precision=None):
+def _qdrant_snapshots_dir():
+    """Qdrant 快照根目录：服务端默认 ./snapshots（相对 **Qdrant 进程** CWD）。
+
+    本仓 Qdrant 由 start.sh/cmd_all 从项目根启动（CWD = 项目根），index 与之同 CWD，
+    两端眼中的目录一致 —— shard 快照克隆（build_index 收编路）的硬链/拷贝必须落到
+    snapshots/<目标集合>/shards/<id>/ 下：服务端 recover 的 location 只按"目标集合
+    自己的快照目录 + 裸文件名"解析（2026-11-10 实证；绝对路径/相对路径表达式全 404）。
+    Qdrant 跑在不同 CWD/卷里时，把 QDRANT_SNAPSHOT_DIR 指向其快照根。
+    """
+    return os.path.abspath(os.getenv("QDRANT_SNAPSHOT_DIR") or "snapshots")
+
+
+def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id, points, embed_model_content, qdrant_server, embed_precision=None, embed_identity=None, migration=None):
     """把本次索引的**身份**写成 artifacts/index_manifest.json（发布契约）。
 
     只在 build_index 的**成功收尾**调用：点数不变量、维度校验、别名切换全部通过之后。
@@ -3728,9 +3548,14 @@ def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id,
         离线重算需要这个版本号（verify-build 不连 Qdrant），故一并记录。
       · collection：物理集合名（别名模式带 build_id 后缀），verify-build 据此核对
         storage/collections/<name> 是否随镜像带上。
-      · embed_precision：本次入库向量的**计算路径档位**（fp16/fp32；完整命中路径 =
-        缓存文件自身的档，重算路径 = 当次 encode 的档；corpus 清空时为 null 无从记录）。
-        verify-build 的嵌入缓存体检拿它与当前键序缓存对账 —— 精度代际不再只靠口头约定。
+      · embed_precision：本次入库向量的**计算路径档位**（2026-11-10 起记服务端 --dtype
+        档 fp16/fp32，来自 embed_identity.dtype；corpus 清空时为 null 无从记录）。
+      · embed_identity（additive，2026-11-10）：**谁的嵌入身份**产出这份索引的稠密向量
+        （engine/model/version/dtype/content_key/code_key）。下一次 index 的收编闸门拿
+        它与当前身份对账（相等才允许服务端快照克隆）；v2 清单身份不匹配 → 违约走重算。
+        旧清单没有此字段 = legacy，收编资格由对拍凭证（embed_parity.json）承接。
+      · migration（additive）：收编双凭证 —— mode/from_collection/prev_identity/credit/
+        min_cos/at。全量重算时为 null：不是迁移就不撒谎。
       · build_id/points/built_at/embed_model_content：排障时一眼定位"这份镜像是哪次构建"。
     """
     manifest = {
@@ -3742,16 +3567,16 @@ def write_index_manifest(*, chunk_fingerprint, lexicon_id, collection, build_id,
         "points": int(points),
         "embed_model_content": embed_model_content,
         "embed_precision": embed_precision,
+        "embed_identity": embed_identity,
+        "migration": migration,
         "qdrant_server": qdrant_server,
         "built_at": datetime.datetime.now().isoformat(timespec="seconds"),
     }
     os.makedirs(_ARTIFACTS_DIR, exist_ok=True)
-    # 原子写（tmp + rename，与 chunks.json/meta 同款）：进程被杀不会留下半截 JSON。
-    tmp = INDEX_MANIFEST_JSON + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, INDEX_MANIFEST_JSON)
-    log(f"索引清单: {INDEX_MANIFEST_JSON}（分块指纹 {chunk_fingerprint}、集合 {collection}、{points} 点）")
+    # 发布契约主拷贝进分块产物库（单事务 upsert），随后立即导出 INDEX_MANIFEST_JSON
+    # 兼容副本：Dockerfile/ms_release/verify-build 的消费路径与文件契约不变。
+    _manifest_db_write(manifest)
+    log(f"索引清单: {INDEX_MANIFEST_JSON}（分块指纹 {chunk_fingerprint}、集合 {collection}、{points} 点；主拷贝在 {CHUNKS_DB}，此文件为派生副本）")
 
 
 def read_index_manifest():
@@ -3822,220 +3647,391 @@ def build_index():
     log(f"词表指纹: {lexicon_id}（别名 {ALIASES_ENABLED} / 停用词 {STOPWORDS_ENABLED}）")
     total = len(all_chunks)
     t0 = time.time()
-    # 不保留全量 texts：那是一份 ~35MB 的中间 list，而它的两次用途（算 key、逐批取文）
-    # 都能按需重取 _index_text（纯读字段+校验）。命中路径下调用次数不变，缺失路径每条
-    # 多算一次 —— 换峰值里少背 35MB。
-    keys = [_embed_cache_key(_index_text(c)) for c in all_chunks]
-    _gc_embed_cache_tmp()  # 写入端顺手清中断遗留（*.tmp.npz 不匹配任何正常缓存名）
-    # 先按磁盘事实看有没有一份缓存能完整覆盖 keys：完整命中就一条向量都不用算，于是
-    # 不必知道设备、不必加载 torch 与嵌入模型（约 600MB 峰值，原本只为猜"读哪个精度
-    # 的文件名"和拿 hidden_size 而付）。cands 同时供下面的增量路径复用，同一份文件
-    # 不会读两遍。
-    cands = _inspect_embed_caches(keys) if (EMBED_CACHE_ENABLED and total) else []
-    hit = _full_embed_cache(cands)
-    target_precision = policy["precision"]
-    if hit is not None and hit[0] != target_precision:
-        log(
-            f"稠密缓存完整命中但精度 {hit[0]} ≠ 本次目标 {target_precision}"
-            f"（{policy['precision_source']}）：忽略旧档，按目标精度重算（缓存键分档，不会混用）"
+    # ── 嵌入供给（2026-11-10 嵌入服务化，替代原 npz 缓存机器）─────────────────
+    # 稠密向量的唯一存储是 Qdrant 本体，供给分三路：
+    #   · 收编（服务端快照克隆）：别名旧集合 = 同批语料的上一代向量。闸门 = 点数/维度/
+    #     距离/指纹采样/身份（v2 清单）或对拍凭证（legacy 清单）全过 →
+    #     create_shard_snapshot → 硬链进目标集合快照目录 → recover（裸文件名）→
+    #     校验。零重算；点 id/payload/稀疏/HNSW 图随快照**逐位**原样带走
+    #     （2026-11-10 探针实证：count=21255、status=green、payload_schema 保留）。
+    #     点级 build_id 原样继承**不重写**（同日归因实验：全量 set_payload 触发
+    #     optimizer 段改写重建 HNSW，平分边界查询召回次序跨跳漂移——同构克隆不写
+    #     4/4 预取逐位，照抄写入 3/4 分叉即历跳漂移同形；点级 build_id 运行期无
+    #     消费者，新 build 身份只进 manifest/集合名/台账）。
+    #   · http 全量重算：闸门不过（换模型/升服务/语料变/无旧库/凭证缺失/收编被关）时
+    #     的诚实路径：http_embeddings 按 EMBED_HTTP_BATCH 分批算齐全部点。中断不提供
+    #     断点分片（诚实降级：重跑代价 = 再走一遍收编门或重算；Phase 4 把检查点粒度
+    #     回到"upsert 即检查点"）。
+    #   · 空语料：0 点集合 + 切别名（合法边界，原实现语义不变）。
+    identity = policy["identity"]
+    http_batch = policy["http_batch"]
+    _dtype_prec = {"float16": "fp16", "float32": "fp32"}
+    target_precision = _dtype_prec.get(str(identity.get("dtype") or ""))
+    if target_precision is None:
+        raise RuntimeError(
+            f"嵌入身份的 dtype {identity.get('dtype')!r} 无法映射入库精度档位（预期 float16/float32）"
+            "——检查 RAG_INFINITY_DTYPE 与 infinity 启动参数"
         )
-        hit = None
+    # 台账口径（2026-11-10）：vectors_source = 稠密向量实际来源；precision = 服务端
+    # --dtype 档位（identity['dtype']）；device 语义退役（嵌入发生在服务进程里）。
+    vectors_source, reuse_points, recompute_points = None, 0, 0
+    precision = target_precision
+    batch_size = None
+    _embed_wall = 0.0
+    _write_wall = 0.0
+    max_workers = None
+    _c_avg = _h_avg = None
+    clone_src = None
+    clone_meta: dict | None = None
+    embeddings = None          # 重算路 = 整块 float32 矩阵；收编/空语料路恒 None
+    # 稠密维度：模型目录 config.json 的 hidden_size 无模型读法（三条供给路的共同防线）。
+    # 读不出 → None，空语料/收编分支各自 fail-closed 报错；重算路用服务端实际输出回填。
+    dense_dim = _expected_embed_dim()
+    if dense_dim is not None:
+        dense_dim = int(dense_dim)
+    # client/别名目标前移：收编闸门要在任何计算之前消费"本轮之前的别名指向"。
+    # 固定 REST 客户端：快照克隆 API 是 REST-only（gRPC 通道没有 recover_shard_snapshot）。
+    client = _qdrant_client(prefer_grpc=False)
+    alias_ok = USE_COLLECTION_ALIAS
+    if alias_ok:
+        try:
+            client.get_aliases()
+        except Exception as exc:
+            log(f"    ⚠️  Qdrant 不支持集合别名，回退为 delete+create 全量重建: {exc}")
+            alias_ok = False
+    target_collection = f"{COLLECTION_NAME}__{build_id[:8]}" if alias_ok else COLLECTION_NAME
+    # 本轮之前别名指向的集合（收编源候选；别名切换失败恢复也要知道"旧库是谁"）。
+    prev_alias_target = _current_alias_target(client) if alias_ok else None
+    # 清单（构建前快照）：收编路据此判定上一代构建的嵌入身份；缺 embed_identity 字段
+    # 即 legacy 清单——收编资格退回对拍凭证一条路（见下方闸门）。
+    manifest_read = None
+    try:
+        with open(INDEX_MANIFEST_JSON, encoding="utf-8") as f:
+            manifest_read = json.load(f)
+        if not isinstance(manifest_read, dict):
+            manifest_read = None
+    except (OSError, ValueError):
+        manifest_read = None
     if not total:
         # 空产物 =「已清空」的合法边界（corpus 被清空，见 _document_paths / build_chunks）：
         # 与正常重建同法写入 0 点新集合并切别名 —— 写出就是一个**已清空**的知识库，
         # 而不是在此 raise 把"清空"变成不可达状态（serve/stages 永远指向死路）。
         # 清空集合同样需要一个稠密维度：嵌入模型目录缺失在 verify_chunks_freshness 的
         # 切分指纹里已先行报错，这里 config.json 缺 hidden_size 是最后防线。
-        dense_dim = _expected_embed_dim()
         if not dense_dim:
             raise RuntimeError(
                 f"嵌入模型目录读不出稠密维度（config.json 缺失或 hidden_size 为空，{EMBED_MODEL_PATH!r}）："
                 "空集合同样需要维度，先恢复模型目录再重跑 index"
             )
-        dense_dim = int(dense_dim)
-        precision, device, cache_path = None, None, None
-        batch_size = None   # 台账字段：无嵌入计算的路径记 None（不编造）
-        cache, missing, cache_entries = {}, [], 0
-        tokenizer = model = None
-        log("⚠️  chunks.json 为空（corpus 已清空）：跳过嵌入阶段，按清空语义写入 0 点集合并切换别名")
-    elif hit is not None:
-        precision, cache_path, cache, missing = hit
-        device = None
-        use_gpu = False
-        batch_size = None   # 完整命中：一条向量都不算，批量大小无从谈起
-        tokenizer = model = None
-        log(f"稠密缓存完整命中: {os.path.basename(cache_path)}（{precision}）{len(keys)} 条 → 跳过设备选择与模型加载")
+        vectors_source = "empty"
+        precision = batch_size = None
+        log("⚠️  分块产物库为空（corpus 已清空）：跳过嵌入阶段，按清空语义写入 0 点集合并切换别名")
     else:
-        # 自适应策略已把设备/精度/batch 算好（policy）。这里把同一条精度决定写回
-        # EMBED_FORCE_FP32 —— 权重、autocast、缓存标签都从 _embed_use_fp16 这一处读，
-        # 不再出现"策略说 fp16、加载却 fp32"的分叉；不改指纹单元源码，旧缓存不失效。
-        global EMBED_FORCE_FP32
-        device = policy["device"]
-        use_gpu = device in ("mps", "cuda")
-        use_fp16 = policy["precision"] == "fp16"
-        if use_gpu and use_fp16:
-            EMBED_FORCE_FP32 = False
-        elif use_gpu:
-            EMBED_FORCE_FP32 = True
-        # 资源闸门必须在**加载模型之前**判：模型权重占 1.1-2.2GB，加载后再看可用内存
-        # 会得出"必然不够"的假失败；同时也能在真正吃内存前 fail-fast（用户决策）。
-        _resource_gate(policy)
-        tokenizer = model = None
-        if use_gpu:
-            try:
-                tokenizer, model, _ = load_embedding_model(device=device)
-                if use_fp16:
-                    model = model.half()
-            except Exception as exc:
-                raise RuntimeError(
-                    f"{device.upper()} 初始化失败，拒绝静默降级 CPU（会破坏目标精度 "
-                    f"{policy['precision']} 与查询侧一致性）: {type(exc).__name__}: {exc}。"
-                    f"排查设备/内存后重跑；确要用 CPU 请显式 RAG_INDEX_PRECISION=fp32 并同步查询侧 dtype。"
-                ) from exc
-        if use_gpu:
-            batch_size = policy["batch_size"]
-            precision = "fp16" if use_fp16 else "fp32"
-            log(f"Embedding 设备: {device} ({precision}, batch_size={batch_size}；策略={policy['precision_source']})")
+        if not dense_dim:
+            raise RuntimeError(
+                f"嵌入模型目录读不出稠密维度（config.json 缺失或 hidden_size 为空，{EMBED_MODEL_PATH!r}）："
+                "收编与重算两条路都需要维度，先恢复模型目录再重跑 index"
+            )
+        # ── 收编闸门（服务端快照克隆门，fail-closed）────────────────────────
+        # 判据（任一不过 → 给出唯一原因并走 http 全量重算，绝不静默混用旧向量）：
+        #   ① 收编未被 RAG_INDEX_NO_RECYCLE 显式关闭；
+        #   ② 别名指向的旧集合可读，点数 == 产物条数，shard 数 == 1（克隆按 shard 进行）；
+        #   ③ 稠密向量参数 == 期望维度、距离 COSINE，稀疏配置在位；
+        #   ④ 采样点（头/中/尾）payload：切分指纹/词表指纹逐位等、维度等、build_id 在位；
+        #   ⑤ 身份凭证二选一：清单 embed_identity == 当前身份（上一代构建是服务向量），
+        #      或 legacy 清单走对拍凭证四判据（min_cos≥0.999 / 身份等 / 锚定集合等 / 时间戳在位）。
+        _why: list = []
+        if env_bool("RAG_INDEX_NO_RECYCLE", False):
+            _why.append("RAG_INDEX_NO_RECYCLE=1（显式关闭收编）")
+        elif not (alias_ok and prev_alias_target):
+            _why.append("无别名旧集合可收编" if alias_ok else "别名不可用")
         else:
-            import torch
-            tokenizer, model, device = load_embedding_model(device="cpu")
-            # 线程数 = **真实核数**（os.cpu_count/psutil 已补齐 macOS）：不再写死 6/4。
-            _threads = hw_cores()
-            torch.set_num_threads(_threads)
-            batch_size = EMBED_BATCH_SIZE or embed_batch_size("cpu")
-            precision = "fp32"
-            log(f"Embedding 设备: cpu ({_threads} 线程, batch_size={batch_size}；策略回退)")
-        cache_path = _embed_cache_file(precision)
-        expected_dim = getattr(getattr(model, "config", None), "hidden_size", None)
-        if expected_dim is None:
-            # 回退：用一次前向传播推断维度，避免缓存维度校验被绕过
-            test_vec = embed([_index_text(all_chunks[0])], tokenizer, model, device, is_query=False, autocast=use_fp16)
-            expected_dim = test_vec.shape[-1]
-            log(f"  推断嵌入维度: {expected_dim}")
-        # 该精度的缓存刚被 _inspect_embed_caches 读过（含维度校验），复用它的结论；
-        # 没这份文件或它读坏了 → 全量待算，与旧写法 cache={} 等价。
-        reuse = next((c for c in cands if c[0] == precision), None)
-        cache, missing = (reuse[2], reuse[3]) if reuse else ({}, list(range(total)))
-        # 断点续算（2026-11-01）：上次中断留下的 *.parts 分片先并入缓存，只算缺口。
-        if EMBED_CACHE_ENABLED and total:
-            _resumed = _load_embed_parts(cache_path, expected_dim)
-            if _resumed:
-                cache.update(_resumed)
-                missing = [i for i, k in enumerate(keys) if k not in cache]
-                log(f"断点续算: 从分片恢复 {len(_resumed)} 条，仍需计算 {len(missing)}/{total} 条")
-    # 先记条数再 del cache：后面"要不要重写缓存"的判据要用它，而缓存 dict 本身
-    # （22019 个条目 ≈ 12MB）在 embeddings 取完值之后就不该再占着峰值。
-    cache_entries = len(cache)
-    _cache_saved = False   # 台账字段：False=本轮没有整份重写 npz（全部命中且无冗余）
-    log(f"批量生成 Embedding... 命中缓存 {total - len(missing)}/{total} 条，需计算 {len(missing)} 条")
-    embeddings = [cache.get(k) for k in keys] if cache else [None] * total
-    del cache
-    if missing:
-        # 分段 + 断点：每 RAG_EMBED_CHECKPOINT_CHUNKS 条落一份分片（默认 2048）。中断/被杀后
-        # 下次 index 直接载入分片续算，不再让 20-90 分钟工作全丢；分片只在终态 npz 写成功
-        # 后清理（写失败时保留，仍可续算）。
-        _ckpt = env_int_min("RAG_EMBED_CHECKPOINT_CHUNKS", 2048, 0)
-        segments = ([missing[i:i + _ckpt] for i in range(0, len(missing), _ckpt)]
-                    if _ckpt else [missing])
-        processed = 0
-        for _seq, seg in enumerate(segments):
-            batches = [seg[i:i + batch_size] for i in range(0, len(seg), batch_size)]
-            for idxs in batches:
-                batch_texts = [_index_text(all_chunks[i]) for i in idxs]
-                vecs = embed(batch_texts, tokenizer, model, device, is_query=False, autocast=use_fp16)
-                if device == "mps":
-                    pass  # （已删除）_mps_empty_cache：MPS 中途清缓存随 2026-11-11 组件审计退役——语义分块小批量内存 <0.5GB，无需中途清缓存（墓碑注释见常量区）
-                for row, i in enumerate(idxs):
-                    embeddings[i] = vecs[row]
-                processed += len(idxs)
-                elapsed = time.time() - t0
-                speed = processed / elapsed if elapsed > 0 else 0
-                log(f"  计算进度 {processed / len(missing) * 100:5.1f}% ({processed}/{len(missing)}) {speed:.0f} 条/秒")
-            if _ckpt and seg:
-                _save_embed_part(cache_path, f"{seg[0]:06d}-{len(seg):06d}", keys, embeddings, seg, precision)
-    # 嵌入阶段墙钟到这里的分界：缓存命中路径 ≈ npz 载入时间；重算路径含全量前向。
-    # 写批墙钟分开记（_write_wall），台账里两段独立可读——"慢"要能指认到哪个阶段。
-    _embed_wall = time.time() - t0
-    if total:
-        holes = [i for i, e in enumerate(embeddings) if e is None]
-        if holes:
-            raise RuntimeError(f"{len(holes)} 个槽位没有被填充（例如 {holes[:5]}）：缓存命中数与待计算集合不一致")
-        dims = {int(np.asarray(e).shape[-1]) for e in embeddings}
-        if len(dims) != 1:
-            raise RuntimeError(f"向量维度不一致: {sorted(dims)} —— 通常意味着缓存里混入了别的模型的向量，请删掉 {cache_path} 后重跑或设 RAG_EMBED_CACHE=0")
-        # 1710: 上方 embeddings 是 list[ndarray|None]（槽位填充），从这里起是整块矩阵 —— 同名两义正是类型报错根源，矩阵一侧改名 matrix。
-        matrix = np.vstack([np.asarray(e, dtype="float32") for e in embeddings])
-        # 显式 raise 而非 assert：`python -O` 会剥离 assert，不变量静默消失
+            src_info = None
+            try:
+                src_info = client.get_collection(prev_alias_target)
+            except Exception as exc:
+                _why.append(f"旧集合 {prev_alias_target} 不可读: {type(exc).__name__}: {exc}")
+            if src_info is not None:
+                _vp = next(iter(src_info.config.params.vectors.values()), None)
+                _spv = getattr(src_info.config.params, "sparse_vectors", None) or {}
+                _shn = getattr(src_info.config.params, "shard_number", None)
+                try:
+                    src_points = client.count(collection_name=prev_alias_target, exact=True).count
+                except Exception as exc:
+                    src_points = -1
+                    _why.append(f"旧集合点数读取失败: {type(exc).__name__}: {exc}")
+                man_coll = manifest_read.get("collection") if manifest_read else None
+                if src_points >= 0 and src_points != total:
+                    _why.append(f"点数 {src_points} ≠ 产物 {total}")
+                if _shn and int(_shn) > 1:
+                    _why.append(f"旧集合 {int(_shn)} 分片：shard 克隆只支持单分片")
+                if _vp is None or getattr(_vp, "size", None) != dense_dim:
+                    _why.append(f"稠密维度 {getattr(_vp, 'size', None)} ≠ 目录声明 {dense_dim}")
+                if getattr(_vp, "distance", None) != Distance.COSINE:
+                    _why.append(f"距离 {getattr(_vp, 'distance', None)} ≠ COSINE")
+                if _spv.get(SPARSE_VECTOR_NAME) is None:
+                    _why.append("稀疏向量配置缺失")
+                if man_coll != prev_alias_target:
+                    _why.append(f"清单集合 {man_coll!r} ≠ 旧集合 {prev_alias_target!r}")
+                if not _why:
+                    _ids = sorted({0, total // 2, total - 1})   # 收编后同一组 id 复检
+                    _pts = []
+                    try:
+                        _pts = client.retrieve(collection_name=prev_alias_target, ids=_ids, with_payload=True, with_vectors=True)
+                    except Exception as exc:
+                        _why.append(f"采样读取失败: {type(exc).__name__}: {exc}")
+                    if not _why and len(_pts) < len(_ids):
+                        _why.append(f"采样只取到 {len(_pts)}/{len(_ids)}（旧库残缺）")
+                    _old_build = None
+                    if not _why:
+                        _bad = []
+                        for _p in _pts:
+                            _pl = dict(_p.payload or {})
+                            _dvec = (_p.vector or {}).get(DENSE_VECTOR_NAME)
+                            if _pl.get(CHUNK_FINGERPRINT_FIELD) != chunk_fingerprint:
+                                _bad.append(f"点{_p.id} 切分指纹 {_pl.get(CHUNK_FINGERPRINT_FIELD)!r} ≠ {chunk_fingerprint}")
+                            if _pl.get(LEXICON_ID_FIELD) != lexicon_id:
+                                _bad.append(f"点{_p.id} 词表指纹 {_pl.get(LEXICON_ID_FIELD)!r} ≠ {lexicon_id}")
+                            if _dvec is None or len(_dvec) != dense_dim:
+                                _bad.append(f"点{_p.id} 实际维度 {None if _dvec is None else len(_dvec)} ≠ {dense_dim}")
+                            if not _pl.get(INDEX_BUILD_ID_FIELD):
+                                _bad.append(f"点{_p.id} 缺 {INDEX_BUILD_ID_FIELD}")
+                            _old_build = _old_build or _pl.get(INDEX_BUILD_ID_FIELD)
+                        if _bad:
+                            _why.append("采样对不上: " + "; ".join(_bad[:2]))
+                        else:
+                            # 身份凭证（⑤）：上一代"谁算的向量"由谁背书 —— v2 清单自报身份等
+                            # 于当前身份，或 legacy 清单 + embedpairs 对比凭证。两路都过不了
+                            # 就收编不成立；v2 清单身份不匹配时不许退回对拍凭证（防身份洗白）。
+                            _prev_identity = manifest_read.get("embed_identity") if manifest_read else None
+                            _credit: tuple | None = None
+                            if isinstance(_prev_identity, dict):
+                                if _prev_identity == identity:
+                                    _credit = ("v2-manifest", None)
+                                else:
+                                    _why.append(
+                                        f"清单 embed_identity（{_prev_identity.get('content_key')}"
+                                        f"/{_prev_identity.get('code_key')}）≠ 当前（{identity['content_key']}"
+                                        f"/{identity['code_key']}）——换过模型/升级过服务/改过嵌入代码"
+                                    )
+                            else:
+                                _rr = _parity_receipt_read()
+                                _okr, _whyr = _parity_receipt_validate(_rr, identity, prev_alias_target)
+                                if _okr:
+                                    _credit = ("parity-receipt", float((_rr or {}).get("min_cos", 0.0)))
+                                else:
+                                    _why.append(f"对拍凭证不适用: {_whyr}（跑 python chatbot.py embedpairs 生成）")
+                            if _credit is not None:
+                                clone_src = prev_alias_target
+                                clone_meta = {
+                                    "credit": _credit[0],
+                                    "min_cos": _credit[1],
+                                    "prev_identity": _prev_identity,
+                                    "old_build": _old_build,
+                                    "sample_ids": _ids,
+                                }
+                                vectors_source = "clone"
+                                reuse_points = total
+                                recompute_points = 0
+        if clone_src:
+            log(f"稠密收编闸门通过: {clone_src}（凭据 {clone_meta['credit']}，{total} 点零重算）")
+        else:
+            log(f"稠密收编不适用（{'；'.join(_why)}）→ 服务全量重算（{total} 条）")
+            vectors_source = "http"
+            recompute_points = total
+    # ── http 全量重算（收编闸门不过时的稠密供给路径；收编/空语料路跳过整段）──────
+    if recompute_points:
+        log(f"批量生成 Embedding（服务端 {EMBED_URL} model={identity['model']} batch={http_batch} 条/请求）：共 {total} 条")
+        matrix_rows: list = []
+        _last_prog = time.time()
+        for _st in range(0, total, http_batch):
+            _texts = [_index_text(c) for c in all_chunks[_st:_st + http_batch]]
+            _vecs = http_embeddings(_texts, is_query=False)
+            matrix_rows.append(np.asarray(_vecs, dtype="float32"))
+            _done = _st + len(_texts)
+            if _done == total or time.time() - _last_prog > 2.0:
+                log(f"  嵌入进度 {_done}/{total}（{time.time() - t0:.0f}s）")
+                _last_prog = time.time()
+        matrix = np.vstack(matrix_rows) if matrix_rows else np.zeros((0, dense_dim or 0), dtype="float32")
+        # 嵌入阶段墙钟到这里的分界：收编路 ≈ 克隆耗时；重算路含全部 HTTP 往返。
+        # 写批墙钟分开记（_write_wall），台账里两段独立可读——"慢"要能指认到哪个阶段。
+        _embed_wall = time.time() - t0
+        batch_size = http_batch
+        # 双重防线：条数与维度在入库前当场对账（服务端单批真伪已由 http_embeddings 的
+        # 合同三查守住；这里守住"批间一致 + 模型目录声明一致"）。
         if matrix.shape[0] != total:
             raise RuntimeError(f"向量条数 {matrix.shape[0]} 与分块数 {total} 不一致")
-        # 维度下游（create_collection / 一致性校验）一律引用 dense_dim：它与矩阵生命周期
-        # 解耦，清空重建（total==0）_branch 上方从模型目录读出，两条路都有一份。
-        dense_dim = int(matrix.shape[1])
-        if EMBED_CACHE_ENABLED:
-            # 命中且无冗余时整份重写是纯浪费：np.savez 在峰值里再摊一份 zip 缓冲，
-            # 磁盘上 73MB 也原地重写一遍。判据要两条一起看才严 —— missing==0 保证每个
-            # key 都在缓存里，条数相等才排除"缓存里残留已删文档的旧条目"（那种仍需重写清理）。
-            # ★ 两侧口径必须都去重：cache 是 dict（键天然唯一），keys 是逐块列表 —— 只要两条
-            #   分块正文逐字相同（重复段落/重复标题很常见），len(keys) 就恒大于 len(cache)，
-            #   判据恒真，index 每次都整份重写 npz（判据恒真式浪费，日志却写"全部命中"）。
-            if missing or cache_entries != len(set(keys)):
-                _cache_saved = bool(_save_embed_cache(cache_path, keys, matrix, precision))
-                if _cache_saved:
-                    log(f"向量缓存已更新: {cache_path}（重算 {len(missing)} 条）")
-                else:
-                    log("    ⚠️  向量缓存写入失败：断点分片已保留，下次 index 可续算")
-            else:
-                log(f"向量缓存无需更新（{len(keys)} 条全部命中且无冗余）: {cache_path}")
-            if _cache_saved or not missing:
-                # 终态 npz 已完整：分片不再需要；写失败则保留，下次继续续算。
-                _gc_embed_parts(cache_path)
-    del keys, model, tokenizer
-    if device == "mps":
-        pass  # （已删除）_mps_empty_cache：MPS 中途清缓存随 2026-11-11 组件审计退役——语义分块小批量内存 <0.5GB，无需中途清缓存（墓碑注释见常量区）
-    client = _qdrant_client()
+        if dense_dim is None:
+            dense_dim = int(matrix.shape[1])
+            log(f"  模型目录读不出维度，回填服务端实测 {dense_dim}")
+        elif matrix.shape[1] != dense_dim:
+            raise RuntimeError(
+                f"向量维度 {matrix.shape[1]} 与模型目录声明的 {dense_dim} 不一致 ——"
+                "http_embeddings 单批已校对 hidden_size，这里再不一致意味着模型目录与服务端口径漂移，"
+                "排查 RAG_EMBED_MODEL_PATH 与 infinity 的模型目录"
+            )
+        embeddings = matrix
+        del matrix, matrix_rows
+
     try:
-        alias_ok = USE_COLLECTION_ALIAS
-        if alias_ok:
+        # ── 目标集合构造（三路共用）＋ 收编克隆 ─────────────────────────────────
+        def _target_create():
+            """建目标集合（非别名模式先删旧库）：空语料/收编/重算三路同一份集合构造。"""
+            if not alias_ok:
+                try:
+                    client.delete_collection(collection_name=target_collection)
+                except Exception as exc:
+                    # 只放行"本来就不存在"（首次建库的合法情形）。其它失败（超时/闪断/busy）不能
+                    # 静默吞掉：下一步 create_collection 会以同名冲突裸崩、发生在 write_failures
+                    # 收尾**之前** —— 不删孤儿集合、不报"谁在服务"，报错方向还被指反。这里先说
+                    # 真实根因、再重试一次，都失败就带上下文退出。
+                    _not_present = ("not found" in str(exc).lower()
+                                    or getattr(exc, "status_code", None) == 404)
+                    if _not_present:
+                        log(f"    （旧集合 {target_collection} 不存在：首次建库，略过删除）")
+                    else:
+                        log(f"⚠️  delete_collection({target_collection}) 失败（非'不存在'）: {type(exc).__name__}: {exc}；2s 后重试一次")
+                        time.sleep(2)
+                        try:
+                            client.delete_collection(collection_name=target_collection)
+                        except Exception as exc2:
+                            raise RuntimeError(
+                                f"重建前的旧集合 {target_collection} 删除失败（{type(exc2).__name__}: {exc2}；已重试一次）"
+                                f"—— 旧集合仍在时同名 create 必然冲突，先手动清理："
+                                f"curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{target_collection}"
+                            ) from exc2
+            client.create_collection(
+                collection_name=target_collection,
+                vectors_config={DENSE_VECTOR_NAME: VectorParams(size=dense_dim, distance=Distance.COSINE)},
+                sparse_vectors_config={SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF)},
+            )
+            for field, schema in ((SOURCE_FIELD, PayloadSchemaType.KEYWORD), ("parent_id", PayloadSchemaType.KEYWORD)):
+                try:
+                    client.create_payload_index(collection_name=target_collection, field_name=field, field_schema=schema)
+                except Exception as exc:
+                    log(f"    ⚠️  payload 索引 {field} 创建失败（过滤会退化为扫描）: {exc}")
+
+        def _wait_ready(coll, deadline=300.0):
+            """等 status=green 且 optimizer ok（收编克隆后、切别名前的硬要求；超时 fail-closed）。"""
+            _t_d = time.time() + deadline
+            _last = None
+            while True:
+                _info_s = client.get_collection(collection_name=coll)
+                _st = getattr(_info_s.status, "value", str(_info_s.status))
+                _opt = _info_s.optimizer_status
+                _ok = (_opt == "ok") if isinstance(_opt, str) else (isinstance(_opt, list) and bool(_opt) and _opt[0] == "ok")
+                _cur = f"status={_st} optimizer={_opt}"
+                if _cur != _last:
+                    log(f"    {_cur}")
+                    _last = _cur
+                if _st == "green" and _ok:
+                    return
+                if time.time() > _t_d:
+                    raise RuntimeError(f"集合 {coll} 在 {deadline:.0f}s 内未收敛（{_cur}）——拒绝切别名（fail-closed）")
+                time.sleep(2.0)
+
+        def _clone_into_target():
+            """服务端 shard 快照克隆（收编核心；机制探针 2026-11-10 实证）：
+
+            create_shard_snapshot（424MB/1.4s，含 HNSW 图与 payload 索引）→ 硬链进
+            snapshots/<目标集合>/shards/0/ → recover_shard_snapshot(location=裸文件名，
+            服务端按目标集合自己的快照目录解析) → count/维度/build_id 存在性校验 →
+            等 status=green + optimizer ok。**不重写点级 build_id**（理由见上方供给
+            注释与下方手术注释）。"""
+            import shutil
+            _snap_name = None
+            _dst_file = None
+            _t = time.time()
             try:
-                client.get_aliases()
-            except Exception as exc:
-                log(f"    ⚠️  Qdrant 不支持集合别名，回退为 delete+create 全量重建: {exc}")
-                alias_ok = False
-        # 旧集合名不再在这里占位：别名分支用 prev_alias_target（本轮之前的目标），
-        # 非别名分支的目标集合就是 COLLECTION_NAME 本身。
-        target_collection = f"{COLLECTION_NAME}__{build_id[:8]}" if alias_ok else COLLECTION_NAME
-        if not alias_ok:
-            try:
-                client.delete_collection(collection_name=target_collection)
-            except Exception as exc:
-                # 只放行"本来就不存在"（首次建库的合法情形）。其它失败（超时/闪断/busy）不能
-                # 静默吞掉：下一步 create_collection 会以同名冲突裸崩、发生在 write_failures
-                # 收尾**之前** —— 不删孤儿集合、不报"谁在服务"，报错方向还被指反。这里先说
-                # 真实根因、再重试一次，都失败就带上下文退出。
-                _not_present = ("not found" in str(exc).lower()
-                                or getattr(exc, "status_code", None) == 404)
-                if _not_present:
-                    log(f"    （旧集合 {target_collection} 不存在：首次建库，略过删除）")
-                else:
-                    log(f"⚠️  delete_collection({target_collection}) 失败（非'不存在'）: {type(exc).__name__}: {exc}；2s 后重试一次")
-                    time.sleep(2)
+                snap = client.create_shard_snapshot(collection_name=clone_src, shard_id=0, wait=True)
+                _snap_name = getattr(snap, "name", None)
+                if not _snap_name:
+                    raise RuntimeError(f"源快照创建失败: {snap!r}")
+                _root = _qdrant_snapshots_dir()
+                _src_file = os.path.join(_root, clone_src, "shards", "0", _snap_name)
+                _dst_dir = os.path.join(_root, target_collection, "shards", "0")
+                _dst_file = os.path.join(_dst_dir, _snap_name)
+                if not os.path.exists(_src_file):
+                    raise RuntimeError(
+                        f"快照文件不在预期位置: {_src_file} —— Qdrant 默认把 shard 快照落在"
+                        " ./snapshots/<集合>/shards/0/（相对 Qdrant 进程 CWD）。若 Qdrant 由"
+                        " start.sh 从别的 CWD/容器启动，把 QDRANT_SNAPSHOT_DIR 指到其快照根后重跑"
+                    )
+                os.makedirs(_dst_dir, exist_ok=True)
+                try:
+                    os.link(_src_file, _dst_file)
+                except OSError as link_exc:
+                    log(f"    （硬链失败 {type(link_exc).__name__}，回退整份拷贝快照文件）")
+                    shutil.copy2(_src_file, _dst_file)
+                log(f"  快照就绪（{time.time() - _t:.1f}s，含 HNSW 图与 payload）")
+                client.recover_shard_snapshot(collection_name=target_collection, shard_id=0, location=_snap_name, wait=True)
+                # 校验（fail-closed）：全量点数 + 采样维度/payload 身份。
+                _cnt = client.count(collection_name=target_collection, exact=True).count
+                if _cnt != total:
+                    raise RuntimeError(f"克隆后点数 {_cnt} ≠ 产物 {total}：快照恢复不完整，拒绝切别名")
+                for _p in client.retrieve(collection_name=target_collection, ids=clone_meta["sample_ids"], with_payload=True, with_vectors=True):
+                    _vec = (_p.vector or {}).get(DENSE_VECTOR_NAME)
+                    if _vec is None or len(_vec) != dense_dim:
+                        raise RuntimeError(f"点 {_p.id} 稠密维度不符（快照恢复不可信）")
+                    if not (_p.payload or {}).get(INDEX_BUILD_ID_FIELD):
+                        raise RuntimeError(f"点 {_p.id} 缺 {INDEX_BUILD_ID_FIELD}（快照恢复不可信）")
+                # build_id **不重写**（2026-11-10 手术，用户拍板）：原实现在此全量
+                # set_payload（filter 旧值→写新值，本版形参是 points 可传 Filter）。
+                # 归因实验实锤该写触发 optimizer 段改写 → HNSW 重建，平分/边界查询的
+                # 召回次序跨跳漂移（同构克隆不写 4/4 预取逐位；照抄写入 3/4 分叉 =
+                # 历跳实测漂移同形）。点级 build_id 是"向量来源代"血统标记，运行期无人
+                # 消费（门禁/收编校验只查存在性；检索不读；指纹对账全在 manifest 层）——
+                # 原样继承 = 新旧集合物理逐位同源。新 build 身份由 manifest
+                # （build_id/集合名/migration 血统链）与台账承载。
+                _wait_ready(target_collection)
+                _info_c = client.get_collection(collection_name=target_collection)
+                _have = set(_info_c.payload_schema or {})
+                for _field in (SOURCE_FIELD, "parent_id"):
+                    if _field not in _have:
+                        log(f"    ⚠️  payload 索引 {_field} 未随快照恢复，补建")
+                        client.create_payload_index(collection_name=target_collection, field_name=_field, field_schema=PayloadSchemaType.KEYWORD)
+                log(f"  克隆完成: {total} 点 / 维度 {dense_dim} / 点级 build_id 原样继承 {clone_meta['old_build'][:8]}（{time.time() - _t:.1f}s）")
+            except Exception:
+                # 收编半途的残件清理后如实上抛：孤儿目标集合 + 快照残件不留盘。
+                if _dst_file:
                     try:
-                        client.delete_collection(collection_name=target_collection)
-                    except Exception as exc2:
-                        raise RuntimeError(
-                            f"重建前的旧集合 {target_collection} 删除失败（{type(exc2).__name__}: {exc2}；已重试一次）"
-                            f"—— 旧集合仍在时同名 create 必然冲突，先手动清理："
-                            f"curl -X DELETE {QDRANT_HOST}:{QDRANT_PORT}/collections/{target_collection}"
-                        ) from exc2
-        log(f"写入 Qdrant (稠密+稀疏混合) → 集合 {target_collection}")
-        client.create_collection( collection_name=target_collection, vectors_config={ DENSE_VECTOR_NAME: VectorParams( size=dense_dim, distance=Distance.COSINE, ) }, sparse_vectors_config={ SPARSE_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF) }, )
-        for field, schema in ( (SOURCE_FIELD, PayloadSchemaType.KEYWORD), ("parent_id", PayloadSchemaType.KEYWORD), ):
+                        os.remove(_dst_file)
+                    except OSError:
+                        pass
+                if _snap_name:
+                    try:
+                        client.delete_shard_snapshot(collection_name=clone_src, shard_id=0, snapshot_name=_snap_name)
+                    except Exception:
+                        pass
+                try:
+                    client.delete_collection(collection_name=target_collection)
+                except Exception as cleanup_exc:
+                    log(f"  ⚠️  收编失败后的孤儿集合 {target_collection} 清理失败，需手动回收: {cleanup_exc}")
+                raise
+            # 成功：源快照记录与硬链副本都退役（数据已并入目标 shard）。
             try:
-                client.create_payload_index( collection_name=target_collection, field_name=field, field_schema=schema )
+                client.delete_shard_snapshot(collection_name=clone_src, shard_id=0, snapshot_name=_snap_name)
             except Exception as exc:
-                log(f"    ⚠️  payload 索引 {field} 创建失败（过滤会退化为扫描）: {exc}")
+                log(f"    ⚠️  源快照 {_snap_name} 删除失败（磁盘文件可手动删）: {exc}")
+            try:
+                os.remove(_dst_file)
+            except OSError:
+                pass
+
+        # 三路统一先造集合（非别名模式先删旧库），收编路紧接着服务端克隆。
+        _target_create()
+        if not total:
+            log("  空语料：0 点集合就绪，稍后切别名")
+        elif clone_src:
+            log(f"稠密收编: 服务端克隆 {clone_src} → {target_collection}（凭据 {clone_meta['credit']}）")
+            _clone_into_target()
+        else:
+            log(f"写入 Qdrant (稠密+稀疏混合) → 集合 {target_collection}")
         write_failures: list = []
-        batch_starts = list(range(0, total, WRITE_BATCH))
+        # 写批机器只在 http 全量重算路跑（2026-11-10）：克隆路的点与 build_id 都已在
+        # clone 内就位，空语料路无点可写 —— batch_starts 置空，并发池对空批自然 no-op，
+        # 台账的 write 字段记空值；不变量段照旧用 count 复核点数（克隆后 = total）。
+        batch_starts = list(range(0, total, WRITE_BATCH)) if vectors_source == "http" else []
         batch_sizes = {i: min(i + WRITE_BATCH, total) - i for i in batch_starts}
 
         # 线程本地客户端：ModelEmbedder 每客户端一份，per-worker 客户端 = per-worker 推理器，
@@ -4084,10 +4080,11 @@ def build_index():
         # 与"并发发往 Qdrant"这句注释相反。分开客户端后每份推理器只被自己的线程使用，
         # 本地推理天然串行，HTTP 往返真正并发。
         max_workers = INDEX_WRITE_WORKERS or qdrant_write_workers(len(batch_starts))
-        log(
-            f"  Qdrant 写批并发: {max_workers} 路（{len(batch_starts)} 批 × {WRITE_BATCH} 点；"
-            f"Little: 目标 {QDRANT_TARGET_PPS} 点/秒 × 实测单批 {QDRANT_BATCH_RTT_S}s ÷ {WRITE_BATCH} 点/批；{hw_report()}）"
-        )
+        if batch_starts:
+            log(
+                f"  Qdrant 写批并发: {max_workers} 路（{len(batch_starts)} 批 × {WRITE_BATCH} 点；"
+                f"Little: 目标 {QDRANT_TARGET_PPS} 点/秒 × 实测单批 {QDRANT_BATCH_RTT_S}s ÷ {WRITE_BATCH} 点/批；{hw_report()}）"
+            )
         from concurrent.futures import ThreadPoolExecutor, as_completed
         _write_t0 = time.time()
         done_points = 0
@@ -4140,7 +4137,8 @@ def build_index():
             raise RuntimeError(
                 f"{len(write_failures)} 批写入失败（批次起始 {[fi for fi, _ in write_failures][:5]}）："
                 f"{serving}；"
-                f"失败示例 {write_failures[0][1]}{orphan_hint}。网络/Qdrant 恢复后重跑 index（稠密走缓存增量）。"
+                f"失败示例 {write_failures[0][1]}{orphan_hint}。网络/Qdrant 恢复后重跑 index"
+                f"（收编路会从当前别名集合自动克隆，这次失败不影响下次）。"
             )
         info = client.get_collection(collection_name=target_collection)
         # 不变量「索引点数 = 产物记录数」在这里当场把关，不只靠 stages 事后发现。
@@ -4149,7 +4147,8 @@ def build_index():
         # 没有任何 id 过滤，残留点会被正常召回并返回陈旧正文（旧文案把方向说反了）。
         # 所以这里不是报错了事，而是**按实现清理**：先删 id >= total 的残留点，再复核点数。
         written = client.count(collection_name=target_collection, exact=True).count
-        log(f"  Qdrant 写入完成: {written} 条")
+        _src_label = {"http": "写入完成", "clone": "收编部署完成"}.get(vectors_source, "空集合就绪")
+        log(f"  Qdrant {_src_label}: {written} 条")
         if written != total:
             residual = []
             offset = None
@@ -4183,7 +4182,8 @@ def build_index():
             # 先发一次恢复性 CreateAlias（失败仅告警）；②文案按 client.get_aliases() 的**实际**
             # 结果组织；③成功路径用"本轮之前的目标"删旧集合 —— 重试后循环内变量可能已变成
             # 本次的 target（切成功但读回旧缓存），那时真正的旧集合就永远不会被删。
-            prev_alias_target = None   # 本轮之前别名指向的集合，只在第一次尝试前读一次
+            # 本轮之前别名指向的集合已在嵌入段提前读好（prev_alias_target，收编闸门消费过
+            # 同一份值）；此处只在它为空（冷启动）时于 attempt==0 补读一次。
             switched = False
             max_retries = 2
             for attempt in range(max_retries):
@@ -4192,7 +4192,7 @@ def build_index():
                         (a.collection_name for a in client.get_aliases().aliases if a.alias_name == COLLECTION_ALIAS),
                         None,
                     )
-                    if attempt == 0:
+                    if attempt == 0 and prev_alias_target is None:
                         prev_alias_target = current_target
                     # 空别名冷启动不能对不存在的 alias 提交 Delete（部分 Qdrant 版本整批失败）；有旧别名才删，Create 恒提交。
                     ops: list = []
@@ -4224,7 +4224,7 @@ def build_index():
                 raise RuntimeError(
                     f"别名切换失败：新集合 {target_collection} 已建好；别名 {COLLECTION_ALIAS} 实际指向 "
                     f"{actual if actual else '（不存在 —— 检索端当前不可用，需人工恢复）'}。"
-                    f"修好后重跑 index（稠密走缓存增量），或直接用 Qdrant 别名 API 指回可用集合。"
+                    f"修好后重跑 index（收编路可从旧集合自动克隆），或直接用 Qdrant 别名 API 指回可用集合。"
                 )
             if prev_alias_target and prev_alias_target != target_collection:
                 try:
@@ -4244,26 +4244,26 @@ def build_index():
         else:
             log(f"  ⚠️  未使用别名：检索端读 {COLLECTION_NAME}，重建期间该集合会短暂不可用")
         log(f"  索引建造标识: {build_id}")
-        # 台账 + 缓存 GC 都在"点数不变量与别名切换已通过"之后：写坏的索引不产生读数，
-        # 键序过期的旧缓存也不再有任何一次运行会读它（见 _gc_embed_cache_files）。
+        # 台账与清单都在"点数不变量与别名切换已通过"之后：写坏的索引不产生读数，也不写
+        # 会被构建期 verify-build 当同源消费的清单。
         record_build_stats({
             "stage": "index",
             "wall_s": round(time.time() - t0, 3),
             "embed_s": round(_embed_wall, 3),
             "write_s": round(_write_wall, 3),
             "chunks": total,
-            "cache_hit": total - len(missing),
-            "cache_miss": len(missing),
-            "cache_saved": _cache_saved,
-            "precision": precision,
-            "device": device,
+            # 2026-11-10 口径：稠密向量来源与点数构成（取代旧 cache_hit/cache_miss）。
+            "vectors_source": vectors_source,       # clone | http | empty
+            "reuse_points": reuse_points,           # 收编路 = 全部点；其余路 0
+            "recompute_points": recompute_points,   # 重算路 = 全部点；其余路 0
+            "precision": precision,                 # 服务端 --dtype 档位（fp16/fp32），空语料 None
+            "http_batch": http_batch if recompute_points else None,
             "batch_size": batch_size,
             "dense_dim": dense_dim,
             "write_workers": max_workers,
             "write_batches": len(batch_starts),
             "construct_s": round(_c_avg, 3) if _c_avg is not None else None,
             "rtt_s": round(_h_avg, 3) if _h_avg is not None else None,
-            "cache_file": os.path.basename(cache_path) if cache_path else None,
             "chunk_fingerprint": chunk_fingerprint,
             "lexicon_id": lexicon_id,
             "build_id": build_id[:8],
@@ -4272,6 +4272,19 @@ def build_index():
         # 路径一条都不写——写坏的清单会让构建期 verify-build 把坏产物判成同源。
         # 清单写失败直接抛（index 退出码 1）：镜像里没有清单 = 构建期闸门必定拦下，
         # 与其让坏产物上线后到首轮检索才暴露，不如在重建现场就报出来。
+        migration = None
+        if clone_src:
+            # 收编双凭证（additive）：稠密向量来自哪个集合、上一代身份是什么、由哪份凭据
+            # 背书。verify-build/stages/排障据此可复述整条收编链；全量重算写 None（不是
+            # 迁移就不撒谎）。
+            migration = {
+                "mode": "shard-snapshot-clone",
+                "from_collection": clone_src,
+                "prev_identity": clone_meta["prev_identity"],
+                "credit": clone_meta["credit"],
+                "min_cos": clone_meta["min_cos"],
+                "at": int(time.time()),
+            }
         write_index_manifest(
             chunk_fingerprint=chunk_fingerprint,
             lexicon_id=lexicon_id,
@@ -4281,8 +4294,9 @@ def build_index():
             embed_model_content=_model_content_fingerprint(),
             embed_precision=precision,
             qdrant_server=qdrant_server_version(client),
+            embed_identity=identity,
+            migration=migration,
         )
-        _gc_embed_cache_files()
         log(f"总耗时: {time.time() - t0:.1f} 秒")
     finally:
         try:
@@ -6052,10 +6066,10 @@ def cmd_process(args=None):
 
 
 # ── index 单例锁：同一 artifacts 目录只允许一个重建（index/**sparse** 共用）在跑 ──
-# 为什么必须 fail-fast（而不是等待/跳过）：两个 index 会写**同一个**稠密缓存 tmp
-# （_save_embed_cache 用 "<path>.tmp.npz" + os.replace）—— 一方还在写、另一方就把它 rename，
-# 得到的半截缓存**看起来完全正常**（维度对、条数对），却少了一批向量；而写缓存失败只被 catch
-# 成一条 warning。这正是本项目反复点名的"状态"失效原型：不崩，只留下一个像正常的坏文件。
+# 为什么必须 fail-fast（而不是等待/跳过）：两个 index 会写**同一个**清单/台账
+# （write_index_manifest / record_build_stats 的 last-write-wins）并各自建/删集合，
+# 别名在两轮之间来回摆，serve 读到反复换代 —— 半截状态比全量失败更难排查（2026-11-10 起
+# 稠密写库本身是幂等 upsert，但"两轮构建相互踩"的别名/清单竞态仍在）。
 # sparse 同样必须进这把锁：它按启动时的别名目标原地更新向量，index 中途切别名并删除旧集合，
 # 会让 sparse 的页更新打到已删除的集合上，留下"已更新前缀 + 旧指纹后缀"的混合态。
 # 语义：拿不到锁 = 明确报错退出（exit 1）。"另一个重建正在跑"与"本次跳过重建"是两件事，
@@ -8325,12 +8339,17 @@ def _stage_next_action(stale, unknown) -> str:
 
 
 def cmd_embedpairs(args=None):
-    """对拍探针（只读不写，不碰 Qdrant/Ollama）：http 嵌入服务 vs 本地 torch 的回归校验。
+    """对拍探针（三侧对拍 + 接收凭证落盘）：本地 torch vs http 服务端 vs **库内实点**。
 
-    同一批固定句子由**两端各自**编码（is_query=False，无查询指令差），逐句算 cos；
-    min cos ≥ 0.999 判"同模型同池化同归一"通过，否则退出码 1 —— 对不上就不要把
-    http 后端用于检索（服务端换模型/换权重 revision/改池化会在此暴露）。
-    切换流程：.env 翻 http → start.sh 起 infinity → 跑本命令，绿了才 serve。
+    同一批固定句子由 A（本地 torch）与 B（http 服务端）各自编码（is_query=False，无
+    查询指令差），逐句算 cos；再加 C 侧：从当前 serving 集合按位采 5 个实点，payload
+    的 contextual_text 原文送 http 重编码，与**库内已有向量**对算 —— 这一侧背书的不是
+    "两引擎同号"，而是"库里那批向量 ≡ 服务端空间"，即 torch→http 收编（服务端 shard
+    快照克隆）的信任锚。三侧 min cos ≥ 0.999 判通过，否则退出码 1。
+    通过 → 原子写 artifacts/embed_parity.json 接收凭证：index 的收编闸门（legacy
+    清单路）拿它与当前嵌入身份/目标集合对账，四判据齐全才允许零重算克隆。
+    C 侧缺席（Qdrant 不在）= 对拍结论仍可读，但**凭证不落盘**（收编不可用，如实告知）。
+    切换流程：.env 翻 http → start.sh 起 infinity → 跑本命令，绿了才 serve/index。
     """
     texts = (
         "毛泽东在延安文艺座谈会上的讲话",
@@ -8338,6 +8357,10 @@ def cmd_embedpairs(args=None):
         "新民主主义论是毛泽东的重要著作",
         "The quick brown fox jumps over the lazy dog",
         "空格   制\\t表  与  换行\\n混杂 —— 1949。",
+        # 尾部换行探针（2026-11-10 加）：钉死"本地 embed 与服务端 ST 同样剥空白"——
+        # 服务端 ST tokenize 前强制 strip；旧本地实现因尾部 \n 多出一个 ▁ token 而偏
+        # ~0.003 cos。此句若出现明显偏差，先对齐 _embed_batch 的 strip 再谈收编。
+        "《湖南农民运动考察报告》、星火燎原，各子军将有待于续编。\n",
     )
     log(f"A 侧（本地 torch，is_query=False）编码 {len(texts)} 句，首次加载权重需数十秒…")
     tokenizer, model, device = load_embedding_model()
@@ -8355,41 +8378,111 @@ def cmd_embedpairs(args=None):
         cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
         worst = min(worst, cos)
         log(f"  [{i}] dim {a.shape[0]} → {b.shape[0]}  cos={cos:.6f}  {text[:14]!r}")
-    ok = worst >= 0.999
+
+    # ── C 侧：库内实点锚定（收编信任锚）──────────────────────────────────
+    # 阈值口径（2026-11-10 定标）：库 = torch 老路产物 vs 服务端 ST 规范（strip）。
+    # 全库 40 点扫描：无尾部空白 16 点 min=1.000000（引擎逐位一致）；尾部含空白 24 点
+    # min=0.995439（ST strip 余白噪声带）。**C 侧 ≥ 0.99** 的判据仍远高于任何真换模
+    # 型/换池化/换归一的掉幅（那些在 0.85-0.95 一档），又让 legacy 库的知名缺陷带
+    # 放行收编 —— 金丝雀逐位一致恰恰需要克隆老库，而不是 http 重算打穿旧向量空间。
+    worst_c: float | None = None
+    anchor_coll = None
+    anchor_model = EMBED_MODEL_NAME
+    anchor_ids: list = []
+    try:
+        from qdrant_client import QdrantClient
+        _client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, api_key=QDRANT_API_KEY, timeout=QDRANT_TIMEOUT)
+        # 锚点必须记**物理集合名**：收编闸门/stages/verify-build 的对账对象都是
+        # manifest 里与别名指到的物理名（rag_documents_v1__<build8>），不是别名本身。
+        anchor_coll = _current_alias_target(_client) if USE_COLLECTION_ALIAS else COLLECTION_NAME
+        if not anchor_coll:
+            raise RuntimeError("别名目标读取失败：无法判定当前 serving 的物理集合")
+        _n = _client.count(collection_name=anchor_coll, exact=True).count
+        _ids = sorted({0, 1, 2, _n // 2, _n - 1}) if _n else []
+        pts = _client.retrieve(collection_name=anchor_coll, ids=_ids, with_payload=True, with_vectors=True) if _ids else []
+        anchor_ids = [p.id for p in pts]
+        c_texts = [str((p.payload or {}).get("contextual_text") or "") for p in pts]
+        if len(pts) < len(_ids) or not all(c_texts):
+            raise RuntimeError(f"采样只取到 {len(pts)}/{len(_ids)} 条或缺 contextual_text（fragment库残缺）")
+        _t0 = time.time()
+        remote_c = http_embeddings(c_texts, is_query=False)
+        _rem_c_s = time.time() - _t0
+        for k, p in enumerate(pts):
+            v = p.vector or {}
+            _cvec = v.get(DENSE_VECTOR_NAME)
+            if _cvec is None:
+                raise RuntimeError(f"点 {p.id} 无稠密向量（集合 {anchor_coll} 结构异常）")
+            a, b = np.asarray(_cvec, dtype=float), np.asarray(remote_c[k], dtype=float)
+            if a.shape[0] != b.shape[0]:
+                raise RuntimeError(f"点 {p.id} 维度 {a.shape[0]} ≠ 服务端输出 {b.shape[0]}")
+            cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+            worst_c = cos if worst_c is None else min(worst_c, cos)
+            _txt = (p.payload or {}).get("contextual_text") or ""
+            log(f"  [C{k}] 点{p.id} dim {a.shape[0]} → {b.shape[0]}  cos={cos:.6f}  {_txt[:14]!r}")
+        log(f"  C 侧 {len(pts)} 点（编号 {anchor_ids}）http 重编码 {_rem_c_s:.2f}s —— 库内向量 ≡ 服务端空间的逐点锚定")
+    except Exception as exc:
+        log(f"  ⚠️  C 侧不可用（{type(exc).__name__}: {exc}）—— Qdrant 未起或 serving 集合不可读？凭证将不落盘（index 收编不可用）")
+
+    ok = worst >= 0.999 and (worst_c is None or worst_c >= 0.99)
+    _verdict = "✅ 对拍通过" if ok else "❌ 对拍不通过"
+    _detail = (f"A/B min cos={worst:.6f}（阈 0.999）"
+               + (f" / C 侧 min cos={worst_c:.6f}（阈 0.99，余白带）" if worst_c is not None else " / C 侧缺席（凭证不落盘）"))
     log(
-        ("✅ 对拍通过" if ok else "❌ 对拍不通过")
-        + f"：min cos={worst:.6f}（阈值 0.999）；本地 {_lcl_s:.2f}s / http {_rem_s:.2f}s / {len(texts)} 句 —— "
-        + ("" if ok else "服务端的模型/池化/归一与本地不一致：先修服务端或换 MODEL_NAME，再投入检索")
+        _verdict + f"；本地 {_lcl_s:.2f}s / http {_rem_s:.2f}s / {len(texts)} 句 —— "
+        + ("" if ok else "A/B 偏差 = 服务端模型/池化/归一与本地对不上；C 侧偏差过线 = 库内向量不是当前模型空间的产物。"
+                        "先修对不上的那侧，再投入检索/index（余白带口径见 _parity_receipt_validate）")
     )
+    if ok and worst_c is not None:
+        # 三侧全绿 → 接收凭证（原写临时文件 + os.replace 原子落位）。
+        receipt = {
+            # 两条 cos 线（2026-11-10 定标）：min_cos = A/B 引擎对拍线（严格 ≥0.999）；
+            # min_cos_collection_http = C 侧库内锚定线（legacy 库知名 ST-strip 余白带，
+            # 阈值 ≥0.99；见 _parity_receipt_validate 的判据说明）。消费端逐条核对。
+            "ts": int(time.time()),
+            "min_cos": round(worst, 6),
+            "min_cos_torch_http": round(worst, 6),
+            "min_cos_collection_http": round(worst_c, 6) if worst_c is not None else None,
+            "collection": anchor_coll,
+            "anchor_points": anchor_ids,
+            "model": anchor_model,
+            "http_identity": _embed_http_identity(),
+            "probes": {"torch_http": len(texts), "collection_http": len(anchor_ids)},
+        }
+        try:
+            _parity_receipt_write(receipt)
+            log(f"  接收凭证已落盘: {PARITY_RECEIPT_JSON}（index 收编闸门据此放行服务端快照克隆）")
+        except Exception as exc:
+            log(f"  ⚠️  凭证写入失败（不影响对拍结论，下次 embedpairs 重试）: {type(exc).__name__}: {exc}")
+    elif ok and worst_c is None:
+        log("  ⚠️  凭证未落盘（C 侧缺席）：index 的收编闸门将按不适用处理（只剩全量重算）；"
+            "连上 Qdrant 且库内有 serving 集合后重跑 embedpairs 即可补发凭证")
     return 0 if ok else 1
 
 
 def cmd_stages(args=None):
     """逐阶段比对指纹，给出最小重跑命令。
-    A 分块（语料/切分变 → process） B 稠密（换模型/新内容 → index 增量）
+    A 分块（语料/切分变 → process） B 稠密（嵌入身份/凭证漂移 → index 重算或收编）
     C 稀疏（词表/BM25/编码变 → sparse） D 入库（集合缺失/点数不符 → index）"""
     stale = []
     cd_unknown = False
 
     log("[A] 分块产物")
-    # 产物只读一次，A/B/C/D 共用同一份数据：各段各自再 open 一遍，文件截断/损坏时就出现
-    # "同一份文件半截读得出、半截读不出"的混乱结论。读失败 = 产物坏了，B/D 都判不了。
+    # 产物只读一次，A/B/C/D 共用同一份数据：读失败 = 产物坏了，B/D 都判不了。
     chunks = None
     read_failed = False
-    if os.path.exists(CHUNKS_JSON):
+    if os.path.exists(CHUNKS_DB):
         try:
-            with open(CHUNKS_JSON, encoding="utf-8") as f:
-                chunks = json.load(f)
+            _stage_meta, chunks = chunks_db_read()
         except Exception as exc:
-            log(f"  ⚠️  读取 {CHUNKS_JSON} 失败（产物可能损坏，重跑 process 修复）: {type(exc).__name__}: {exc}")
+            log(f"  ⚠️  读取 {CHUNKS_DB} 失败（产物可能损坏，重跑 process 修复）: {type(exc).__name__}: {exc}")
             read_failed = True
             cd_unknown = True
     n_chunks = len(chunks) if chunks is not None else None
     if read_failed:
-        # chunks 读坏时 meta 仍可能是好的：只比 meta 会打出"A ✅ 新鲜"，与上方⚠️
+        # 产物库读坏时 meta 仍可能是好的：只比 meta 会打出"A ✅ 新鲜"，与上方⚠️
         # 自相矛盾（坏产物被报成新鲜），D 段也会因拿不到点数而无从比对。坏产物 = A 过期。
         stale.append("A")
-        log("  ❌ chunks.json 不可读（见上方）-> 需要: python chatbot.py process")
+        log("  ❌ 分块产物库不可读（见上方）-> 需要: python chatbot.py process")
     else:
         try:
             meta = verify_chunks_freshness()
@@ -8400,46 +8493,65 @@ def cmd_stages(args=None):
             stale.append("A")
             log(f"  ❌ {exc}")
 
-    log("[B] 稠密向量缓存")
+    log("[B] 稠密向量（嵌入身份）")
     if "A" in stale:
         log("  ⏭  A 过期，先重跑 process 再谈 B")
-    elif not EMBED_CACHE_ENABLED:
-        log("  ⏭  RAG_EMBED_CACHE=0：无缓存，index 每次全量重算")
     elif chunks is None:
-        log("  ⏭  缺/坏 chunks.json，先跑 process（见上方提示）")
+        log("  ⏭  缺/坏分块产物库，先跑 process（见上方提示）")
     else:
         try:
-            keys = [_embed_cache_key(_index_text(c)) for c in chunks]
-            # 与 index 共用 _inspect_embed_caches / _full_embed_cache：这里若再按设备预测
-            # 一次精度，就会与 index 的实际选择分叉（同一轮日志给出两个结论），而且预测
-            # 要 import torch —— 只为读一个文件名，白花 200MB。
-            cands = _inspect_embed_caches(keys)
-            # 2026-11-01：index 目标精度由构建预检按内存预算决定；stages 必须用**同一决策**
-            # 判断 B，否则会出现"stages 说全新鲜、index 却按目标档全量重算"的自相矛盾。
-            _pol_prec = build_policy()["precision"]
-            target = next((c for c in cands if c[0] == _pol_prec), None)
-            hit_other = _full_embed_cache(cands)
-            if target is not None and not target[3]:
-                precision, path, cache, _missing = target
-                log(f"  ✅ 缓存 {os.path.basename(path)}（{precision}=目标档）：{len(cache)} 条全部命中；当前产物 0/{len(chunks)} 条需重算")
-            else:
-                # 没有完整覆盖的那份 = index 仍要重算：不标 B 会让 A/C/D 全新鲜时打出
-                # "无需重跑"，与这一行自相矛盾（同一轮日志两个结论）。
+            # 2026-11-10 嵌入服务化替原 npz 缓存体检：稠密向量的存储是 Qdrant 集合本体，
+            # "B 新鲜" = 上一代向量的身份与当前服务身份同键。
+            #   · v2 清单：embed_identity 对账（换模型/升 infinity/改嵌入代码都会换键）；
+            #   · legacy 清单：对拍凭证四判据承接（min_cos≥0.999 / 身份等 / 凭证集合 ==
+            #     清单集合 / 时间戳在位）—— torch 时代的向量由此证明与 http 同锚。
+            # 两者都不成立 = index 只能全量重算，B 必须标过期，不能让 A/C/D 全绿时打
+            # "无需重跑"（判据恒真式假新鲜）。
+            _b_identity = _embed_http_identity()
+            _b_manifest = None
+            try:
+                with open(INDEX_MANIFEST_JSON, encoding="utf-8") as f:
+                    _b_manifest = json.load(f)
+            except (OSError, ValueError):
+                pass
+            _b_m_id = _b_manifest.get("embed_identity") if isinstance(_b_manifest, dict) else None
+            _b_m_fp = _b_manifest.get("chunk_fingerprint") if isinstance(_b_manifest, dict) else None
+            _b_m_coll = _b_manifest.get("collection") if isinstance(_b_manifest, dict) else None
+            if not isinstance(_b_manifest, dict):
                 stale.append("B")
-                if target is not None:
-                    detail = f"目标档 {_pol_prec} 缺 {len(target[3])}/{len(chunks)} 条"
-                elif cands:
-                    detail = f"目标档 {_pol_prec} 没有缓存文件；现有 " + "，".join(
-                        f"{p}（缺 {len(m)}/{len(chunks)}）" for p, _f, _c, m in cands
-                    )
+                log("  ❌ 无 index_manifest -> 需要: python chatbot.py index（首次构建或清单已损坏）")
+            elif isinstance(_b_m_id, dict):
+                if _b_m_fp != fingerprint:
+                    stale.append("B")
+                    log(f"  ❌ 清单分块指纹 {_b_m_fp} ≠ 当前 {fingerprint}（process 之后没重跑 index）-> 需要: python chatbot.py index")
+                elif _b_m_id == _b_identity:
+                    log(f"  ✅ 嵌入身份冻结: {_b_m_id['model']} v{_b_m_id['version']} dtype={_b_m_id['dtype']}"
+                        f" content={_b_m_id['content_key']} code={_b_m_id['code_key']}（向量在 {_b_m_coll}）")
                 else:
-                    detail = f"目标档 {_pol_prec} 与其它档都没有缓存文件"
-                log(f"  ❌ {detail} -> 需要: python chatbot.py index")
+                    stale.append("B")
+                    log("  ❌ 清单身份 ≠ 当前嵌入身份（"
+                        f"清单 {_b_m_id.get('content_key')}/{_b_m_id.get('code_key')} vs 当前"
+                        f" {_b_identity['content_key']}/{_b_identity['code_key']}）—— 换过模型/升级过服务/改过嵌入代码"
+                        " -> 需要: python chatbot.py index（全量重算）")
+            else:
+                _b_receipt = _parity_receipt_read()
+                _b_ok, _b_why = False, "凭证文件不可读或缺失"
+                if isinstance(_b_receipt, dict) and _b_receipt.get("collection") != _b_m_coll:
+                    _b_why = f"凭证锚定集合 {_b_receipt.get('collection')!r} ≠ 清单集合 {_b_m_coll!r}"
+                else:
+                    _b_ok, _b_why = _parity_receipt_validate(_b_receipt, _b_identity, _b_m_coll)
+                if _b_ok and _b_m_fp == fingerprint:
+                    log(f"  ✅ 对拍凭证背书（legacy 清单 {_b_m_coll}，收编可用）: {_b_why}")
+                else:
+                    stale.append("B")
+                    _detail = _b_why if (_b_ok or not isinstance(_b_receipt, dict)) else (
+                        f"凭证可用但清单分块指纹 {_b_m_fp} ≠ 当前 {fingerprint}（process 之后没重跑 index）")
+                    log(f"  ❌ {_detail} -> 需要: python chatbot.py embedpairs（生成凭证）或 python chatbot.py index（全量重算）")
         except Exception as exc:
             # 检查失败 = B 没验证过：不置位会让 A/C/D 全新鲜时打出"无需重跑"、exit 0，
             # 而 B 正可能过期（判据恒真式假新鲜）。CD 类"未验证"与"已过期"同权计数。
             cd_unknown = True
-            log(f"  ⚠️  缓存检查失败（B 未验证，不算新鲜）: {type(exc).__name__}: {exc}")
+            log(f"  ⚠️  嵌入身份检查失败（B 未验证，不算新鲜）: {type(exc).__name__}: {exc}")
 
     log("[C] 稀疏向量（词表/BM25）与 [D] 入库（Qdrant）")
     # 产物读取与 Qdrant 连接分开兜底：chunks.json 截断/损坏是"产物坏了"，
@@ -8521,10 +8633,11 @@ def cmd_verify_build(args=None):
         只告警不判死：Qdrant 别名文件格式随版本变化，不能当唯一判据；
       E 产物同代（可选）：chunks.meta.json 存在时，其分块指纹必须与清单一致 —— 防
         "process 之后没重跑 index"这种两代产物混进同一镜像。
-      F 嵌入缓存体检（稠密向量 / 精度档，离线只读）：结构自洽（二维/行数/非空）、维度
-        与模型 config 一致、**精度标签与实际存储位宽同源**；损坏/维度错判死（运行期只会
-        整份报废并全量重算，是分钟到小时级的无谓浪费）；并把清单的 embed_precision
-        与当前键序缓存对账 —— 精度代际切换从此有构建期判据，不再只靠运行日志口头约定。
+      F 嵌入身份体检（离线只读）：清单 embed_identity vs 当前服务身份
+        （_embed_http_identity；legacy 清单 → embed_parity.json 对拍凭证对账，四判据）。
+        镜像里稠密向量的存储是 Qdrant 集合本体，"旧向量 == 服务端空间"由身份或凭证
+        机器担保 —— 两者都缺 = 未验证镜像，构建期拦下（收编不可用的基底 + 全量重算
+        起点不明，不该出仓）。
     全程只读、不建 QdrantClient、不写数据。
     """
     problems = []
@@ -8654,73 +8767,48 @@ def cmd_verify_build(args=None):
     else:
         log(f"  ⚠️  {CHUNKS_META_JSON} 不存在（跳过产物同代核对）")
 
-    # F 嵌入缓存体检（离线只读，不 import torch / 不连 Qdrant）：稠密缓存结构 + 精度档
-    # 与清单对账。为什么必须有：坏缓存的运行期表现是"⚠️ 不可用 → 全量重算"——本地是
-    # 30-73 分钟级的无谓浪费，容器内应急重建还会在 CPU 上把同样的事放慢十倍；坏产物
-    # 进了镜像就到下一次 index 才暴露（"发布成功但不能使用"同类，应在构建期拦下）。
-    # 边界声明：镜像里没有 chunks.json，无法判断"缓存是否完整覆盖本次语料"——覆盖判据
-    # 继续归 index 运行时（命中即用、不混代）；这里只拦**确定性坏**：文件在但读不出 /
-    # 结构错 / 维度错 / 精度标签与存储位宽名实不符。
-    log("[F] 嵌入缓存体检（稠密向量 / 精度档，离线只读）")
-    if not EMBED_CACHE_ENABLED:
-        log("  ⏭  RAG_EMBED_CACHE=0：缓存层整层关闭，跳过体检")
-    else:
-        _cand_paths = {p: _embed_cache_file(p) for p in _EMBED_CACHE_PRECEDENCE}
-        _good = {}  # 精度档 -> (rows, dim, store_dtype)：结构完好的现有缓存
-        for _prec in _EMBED_CACHE_PRECEDENCE:
-            _path = _cand_paths[_prec]
-            if not os.path.exists(_path):
-                continue
-            _basename = os.path.basename(_path)
-            try:
-                _keys, _vecs = _read_embed_cache_arrays(_path)
-                _check_embed_cache_shape(len(_keys), _vecs, _expected_embed_dim())
-                _good[_prec] = (int(_vecs.shape[0]), int(_vecs.shape[1]), str(_vecs.dtype))
-            except Exception as exc:
-                _bad(f"嵌入缓存[{_prec}]结构体检失败: {_basename} —— {type(exc).__name__}: {exc}"
-                     f"（下次 index 整份报废并全量重算；确认无用可直接删除该文件）")
-                continue
-            _rows, _dim, _dtype = _good[_prec]
-            _want = "float16" if _prec == "fp16" else "float32"
-            log(f"  {'✅' if _dtype == _want else '⚠️'} 嵌入缓存[{_prec}]: {_basename}（{_rows}×{_dim}，存 {_dtype}）")
-            if _dtype != _want:
-                log(f"  ⚠️  [{_prec}] 标签说 {_prec}、实际存 {_dtype}（2026-10-29 前旧实现产物；读侧统一升位仍兼容，"
-                    "只是磁盘多付一倍 —— 下次该档整份重写时自愈，不必为此单独处理）")
-        if _good:
-            _lead = next(p for p in _EMBED_CACHE_PRECEDENCE if p in _good)
-            log(f"  ✅ 缓存选择序 {_EMBED_CACHE_PRECEDENCE} → 将优先使用 [{_lead}]（两份都在也绝不混用，"
-                "任何一轮 index 的向量取自同一份文件 + 同精度补算）")
-        else:
-            _lead = None
-            log("  ⚠️  两份候选缓存都不在：npz 不入仓/不进镜像时属**正常**（容器 index 靠 storage 里既有集合，"
-                "不需要缓存）；本地发布前没有缓存 = 下次 index 将全量重算（30-73 分钟，预期内则忽略）")
-        # 死缓存扫描：不在当前键序内的 *.npz（含 *.tmp.npz 中断残留）不再被任何运行读取，
-        # 留在盘上只是死重 —— index 成功收尾的 _gc_embed_cache_files 会自动清，这里给个账。
-        if os.path.isdir(EMBED_CACHE_DIR):
-            _current_prefix = os.path.basename(_cand_paths["fp16"])[: -len("_fp16.npz")]
-            _dead = [n for n in sorted(os.listdir(EMBED_CACHE_DIR))
-                     if n.endswith(".npz") and not n.startswith(_current_prefix)]
-            if _dead:
-                _dead_mb = sum(os.path.getsize(os.path.join(EMBED_CACHE_DIR, n)) for n in _dead) / 1e6
-                log(f"  ⚠️  死缓存 {len(_dead)} 份（{_dead_mb:.0f}MB）不被任何运行读取:{_dead[:3]}"
-                    f"{'…' if len(_dead) > 3 else ''} —— 下次 index 成功收尾自动清除（无需手工）")
-        # 清单精度档对账（verify-build 判据新增字段；旧版清单只提示不判死）
-        _m_prec = manifest.get("embed_precision")
-        if not _m_prec:
-            log("  ⚠️  清单无 embed_precision 字段（旧版清单）：该字段由本次改造后的 index 写入，"
-                "重跑一次 index 后精度对账生效")
-        elif _m_prec not in _EMBED_CACHE_PRECEDENCE:
-            _bad(f"index_manifest.embed_precision 非法值 {_m_prec!r}（允许 {_EMBED_CACHE_PRECEDENCE}）"
-                 "—— 清单可能被手工改过或版本错配，重跑 index 重写")
-        elif _m_prec in _good:
-            if _lead == _m_prec:
-                log(f"  ✅ 清单精度档与缓存选择序一致（{_m_prec}）")
+    # F 嵌入身份体检（离线只读，不 import torch / 不连 Qdrant）：2026-11-10 替原
+    # npz 缓存体检。镜像里稠密向量的存储是 Qdrant 集合本体，npz 连"能否读出"都无从
+    # 判断收编资格，真正的锚点转移为两代凭证：
+    #   · v2 清单：embed_identity 与当前服务身份对账（离线可解，契约同样 fail-closed）；
+    #   · legacy 清单（torch 时代产物）：embed_parity.json 凭证四判据，锚点对清单集合。
+    # 坏旧产物的运行期表现是"index 静默全量重算 / 检索空间无法自证"—— 构建期拦下。
+    log("[F] 嵌入身份体检（清单/凭证 vs 当前身份，离线只读）")
+    _f_identity = None
+    try:
+        _f_identity = _embed_http_identity()
+    except Exception as exc:
+        _bad(f"嵌入身份无法解析: {type(exc).__name__}: {exc} —— 模型目录缺失或非法？先恢复 {EMBED_MODEL_PATH!r}")
+    if _f_identity is not None:
+        _f_m_id = manifest.get("embed_identity")
+        _f_m_prec = manifest.get("embed_precision")
+        _dtype_prec = {"float16": "fp16", "float32": "fp32"}
+        if isinstance(_f_m_id, dict):
+            if _f_m_id == _f_identity:
+                log(f"  ✅ 清单身份 = 当前服务身份（{_f_m_id['model']} v{_f_m_id['version']}"
+                    f" content={_f_m_id['content_key']} code={_f_m_id['code_key']}）")
             else:
-                log(f"  ⚠️  清单记录本次入库用 [{_m_prec}]，缓存选择序将优先 [{_lead}]：下次 index 会整体换代到 "
-                    f"[{_lead}]（代内自洽、代间不混 —— 两档都是同一模型的合法产出；在意代际一致可手动只留 {_m_prec} 那份）")
+                _bad("清单 embed_identity ≠ 当前身份 —— 镜像里的向量是另一代服务算的"
+                     f"（清单 {_f_m_id.get('model')} v{_f_m_id.get('version')} {_f_m_id.get('content_key')}"
+                     f"/{_f_m_id.get('code_key')} vs 当前 {_f_identity['model']} v{_f_identity['version']}"
+                     f" {_f_identity['content_key']}/{_f_identity['code_key']}）；重跑 index 后重新打包")
+            _want_prec = _dtype_prec.get(str(_f_m_id.get("dtype") or ""))
+            if _f_m_prec and _want_prec and _f_m_prec != _want_prec:
+                _bad(f"清单 embed_precision {_f_m_prec!r} ≠ 清单身份 dtype {_f_m_id.get('dtype')!r}"
+                     f"（应映射为 {_want_prec!r}）—— 两字段自相矛盾，多半被手工改过，重跑 index 重写")
         else:
-            log(f"  ⚠️  清单记录 build 用 [{_m_prec}]，当前键序下没有该档缓存（换档/换代码指纹后已被淘汰）："
-                "下次 index 将以现有可用档位计算——与已入库向量同模型同池化，embedpairs 对拍口径内")
+            # legacy 清单：对拍凭证承接（离线；锚点 = 清单自身记录的集合）。
+            _f_receipt = _parity_receipt_read()
+            _f_ok, _f_why = False, "凭证文件不可读或缺失"
+            if isinstance(_f_receipt, dict) and _f_receipt.get("collection") != manifest.get("collection"):
+                _f_why = f"凭证锚定集合 {_f_receipt.get('collection')!r} ≠ 清单集合 {manifest.get('collection')!r}"
+            else:
+                _f_ok, _f_why = _parity_receipt_validate(_f_receipt, _f_identity, manifest.get("collection"))
+            if _f_ok:
+                log(f"  ✅ 对拍凭证背书（legacy 清单 {manifest.get('collection')}）：{_f_why}")
+            else:
+                _bad(f"legacy 清单且对拍凭证不适用（{_f_why}）—— 本机跑一次 python chatbot.py embedpairs 生成"
+                     "embed_parity.json 后重跑 verify-build；缺失凭证的镜像在下一次 index 只剩全量重算一条路")
 
     if problems:
         log(f"❌ verify-build 未通过：{len(problems)} 项不一致（见上）—— 这份镜像不要发布")
