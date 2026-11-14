@@ -14,11 +14,22 @@
 #   ./start.sh verify-build      构建期/发布前离线自检（index 清单 vs 当前切分/词表/模型指纹）
 #   ./start.sh sparse            重建稀疏向量
 #   ./start.sh stages            四阶段新鲜度检查
+#   ./start.sh config-audit      配置审计（.env 死键 / 退役键残留 / README §4 幻影键）
+#   ./start.sh deps-check        依赖 pin 对账（requirements.txt 逐条 == 环境实装；--app-layer 查 Dockerfile 应用层）
+#   ./start.sh lint              lint 基线闸门（ruff 新发现失败/减少放行，基线 tools/ruff-baseline.json）
 #   ./start.sh lexicon           词表自检
 #   ./start.sh embedpairs        嵌入对拍探针（本地 torch vs http，cos≥0.999 准入）
 #   ./start.sh compare-chunks A [B]
 #   ./start.sh evaluate <评测集> [--rerank] [--k 1 3 5 10] [--out 报告.json]
 #   ./start.sh fetch-models [dest] 构建期下载模型（Docker 也复用本文件）
+#   ./start.sh supervisor        supervisord 四进程前台编排（Ctrl-C 一并全停）
+#   ./start.sh supervisor-status supervisorctl status 查看四进程
+#   ./start.sh supervisor-stop   supervisorctl shutdown 停止编排及全部子进程
+#
+#   （编排子命令 run-infinity / run-app 不是给人手跑的入口：它们是 start.sh 与
+#   supervisord.conf 共用的 exec 单点 —— infinity 参数真相在 _infinity_spec、
+#   app 真相在 cmd_serve；--watch 是 supervisord 专用的看门狗模式，退出码
+#   71=复用实例消失、70=归属不明。本地日常编排仍走上面 start/stop。）
 #
 # 前置:
 #   · Python 3.10 + pip install -r requirements.txt
@@ -159,11 +170,11 @@ _load_dotenv() {
 
 # ── infinity 编排（2026-10-30 起）：http 后端就绪闸，替代旧的"警告不内置"────────
 # torch 后端 → 直接放行（本机进程内跑）；http 后端 → 必须有就绪的 infinity：
-#   · 一个服务同时托管两组模型（bge-m3 + bge-reranker-v2-m3），--model-id/--served-model-name
-#     成对重复传；名字必须与 .env 的 RAG_*_MODEL_NAME 逐字一致（客户端按名调用，运行期
-#     还有合同三查兜底）；
-#   · --device auto：cuda/mps 可用即 GPU，都没有自动 CPU（"没有 GPU 的时候用 cpu"）；
-#   · --dtype：显式 RAG_INFINITY_DTYPE 优先；auto/空时由内存预算档推导（与 index 预检同源）；
+#   · 启动参数（--model-id/--served-model-name 成对且名字与 .env 的 RAG_*_MODEL_NAME
+#     逐字一致、--device/--dtype/--batch、--no-model-warmup）的唯一真相 = chatbot.py 的
+#     _infinity_spec（2026-11-11 audit A3 起本脚本经 `chatbot.py run-infinity` exec，
+#     shell 不再手工拼装 —— 此前这里与容器 _infinity_spec、supervisord.conf 三份手工
+#     同步，改一处漏两处）；run-infinity 自带全量预检（PATH/模型目录），失败日志见下；
 #   · 已健康则复用：本脚本实例（pid 文件）或外部实例（平台自管 infinity 的场景）都放行，
 #     与 Qdrant 的"拒绝外部实例"不同 —— 推理服务无状态，来源不影响检索正确性；
 #   · 端口/前缀/超时可覆写：RAG_INFINITY_PORT / RAG_INFINITY_DEVICE / RAG_INFINITY_DTYPE /
@@ -181,41 +192,19 @@ _ensure_infinity() {
         fi
         return 0
     fi
-    command -v infinity_emb >/dev/null 2>&1 \
-        || _die "http 后端需要 infinity_emb：pip install infinity-emb（GPU 机器上装 CUDA 版 torch），或先把两模型手动起在 ${INFINITY_PORT}（--url-prefix /v1）"
-    local _emb="${RAG_EMBED_MODEL_PATH:-./models/bge-m3}" _rer="${RAG_RERANK_MODEL_PATH:-./models/bge-reranker-v2-m3}"
-    _emb="${ROOT}/${_emb#./}"; _rer="${ROOT}/${_rer#./}"
-    [ -d "${_emb}" ] || _die "缺少嵌入模型目录: ${_emb}（先 ./start.sh fetch-models）"
-    [ -d "${_rer}" ] || _die "缺少重排模型目录: ${_rer}（先 ./start.sh fetch-models）"
-    local _dev="${RAG_INFINITY_DEVICE:-auto}" _batch="${RAG_INFINITY_BATCH:-32}"
-    # dtype：显式 RAG_INFINITY_DTYPE 优先；空/auto 时由 chatbot.runtime_infinity_dtype()
-    # 按"启动时内存预算"推导（GPU<16G→float16、GPU≥16G→float32、CPU→float32）。
-    # 与 index 构建预检共用同一函数 —— 构建和查询不会再各自拍脑袋选档。
-    local _dtype="${RAG_INFINITY_DTYPE:-auto}"
-    case "${_dtype}" in
-        auto|AUTO|"")
-            _dtype="$("${PY}" -c 'import chatbot; print(chatbot.runtime_infinity_dtype())' 2>/dev/null | tail -n 1)"
-            [ -n "${_dtype}" ] || _dtype="float32"
-            ;;
-    esac
-    _log "启动 infinity：device=${_dev}、dtype=${_dtype}、batch=${_batch}、两组模型同实例"
-    # --no-model-warmup（2026-11-01 补齐，与容器 _infinity_spec 同构）：infinity 的 warmup
-    # calibration 会用 batch×512 token 跑一次满前向；8G M2 上两组模型已占满 MPS 预算时，
-    # 这一步就是 "MPS allocated 7.96GB / 尝试再分配 2.02GB" 的那一次分配，进程直接启动失败
-    # （infinity.log 实证，batch=8 与 32 两次都死在这里）。就绪闸只查 /health，而就绪探测
-    # 本来就真打一发 embeddings/rerank —— 那才是真预热；省掉 calibration 后本地冷启也从
-    # ~88s 收敛到 ~48s。容器早已这么干，本地脚本此前漏传，本行把两端拉平。
-    nohup infinity_emb v2 \
-        --host 127.0.0.1 --port "${INFINITY_PORT}" --url-prefix /v1 \
-        --engine torch --device "${_dev}" \
-        --dtype "${_dtype}" \
-        --batch-size "${_batch}" \
-        --no-model-warmup \
-        --model-id "${_emb}" --served-model-name "${RAG_EMBED_MODEL_NAME:-bge-m3}" \
-        --model-id "${_rer}" --served-model-name "${RAG_RERANK_MODEL_NAME:-bge-reranker-v2-m3}" \
-        >"${INFINITY_LOG}" 2>&1 &
+    # pid 语义不变：run-infinity 内部 os.execv **不换 pid** —— 这里写下的 python 包装
+    # 进程 pid 就是最终 infinity_emb 的 pid（exec 只换程序映像），_owned_pid 按
+    # "infinity_emb" 字样核对命令行照旧成立。
+    nohup "${PY}" chatbot.py run-infinity >"${INFINITY_LOG}" 2>&1 &
     printf '%s' "$!" >"${INFINITY_PID}"
-    local _i _ready=0 _wait="${RAG_INFINITY_WAIT:-300}"
+    # 等待预算缺省**问 Python**（2026-11-11 audit A3 收敛）：RAG_INFINITY_WAIT 的
+    # normative 缺省（300）只在 chatbot.py 定义一次，.env 已导出的值经 load_dotenv
+    # 被 Python 同读。这里不抄数字 —— 旧写法 "${RAG_INFINITY_WAIT:-300}" 是第二份缺省，
+    # 两个"没配"答案迟早漂移。问不出（Python 环境坏）才 fail-closed 退出让人工介入。
+    local _wait
+    _wait="$("${PY}" -c 'import chatbot; print(chatbot.RAG_INFINITY_WAIT)' 2>/dev/null | tail -n 1)"
+    [ -n "${_wait}" ] || _die "读不到 chatbot.RAG_INFINITY_WAIT（Python 导入失败？先手动跑 python chatbot.py stages 验环境）；或在 .env 显式设置 RAG_INFINITY_WAIT（秒）"
+    local _i _ready=0
     for _i in $(seq 1 "${_wait}"); do
         _infinity_ok && { _ready=1; break; }
         if [ -f "${INFINITY_PID}" ] && ! _pid_alive "$(cat "${INFINITY_PID}" 2>/dev/null || true)"; then break; fi
@@ -549,9 +538,16 @@ _fetch_models() {
     _log "模型下载完成: ${_dest}（组: ${_groups}）"
 }
 
-_usage() { sed -n '2,25p' "${ROOT}/start.sh"; }
+_usage() { sed -n '2,28p' "${ROOT}/start.sh"; }
 
 _load_dotenv
+# APP_PORT 在文件头（L37）已经算过一次 —— 那时 .env 还没加载，RAG_LOCAL_PORT 若只
+# 写在 .env 里就读不到，start.sh 的健康检查会去敲 8501 而 serve 子进程（Python 侧
+# APP_PORT 同读本键）却绑了覆盖端口：又是"半生效"。这里重算收敛：ambient 环境变量
+# 经 _load_dotenv 的"进程环境优先"原样保留，.env 新设的值此刻补齐。APP_URL 一并
+# 重算 —— 所有消费点（_start_app/_status_all/logs）都在本行之后，无遗漏。
+APP_PORT="${RAG_LOCAL_PORT:-${APP_PORT}}"
+APP_URL="http://127.0.0.1:${APP_PORT}"
 _detect_hw
 case "${1:-start}" in
     fetch-models) shift; _fetch_models "$@" ;;
@@ -575,7 +571,25 @@ case "${1:-start}" in
         tail -F "${_tail_files[@]}"
         ;;
     serve)   _ensure_infinity; exec "${PY}" chatbot.py serve ;;
-    process|index|verify-build|sparse|stages|lexicon|embedpairs|compare-chunks|evaluate)
+    supervisor)
+        command -v supervisord >/dev/null 2>&1 || _die "缺少 supervisord：pip3 install supervisor（pip 包附 supervisord 与 supervisorctl）"
+        # 日志目录必须先在：supervisord 启动时打不开 logfile 会直接拒启。
+        mkdir -p "${ROOT}/artifacts/logs"
+        _log "supervisord 前台编排（配置 ${ROOT}/supervisord.conf；Ctrl-C 一并全停）"
+        # _load_dotenv 已把 .env 导出进本 shell 环境 → supervisord 继承 → 子进程再有一层
+        # 载荷内的 source 兜底（裸跑 supervisord 不经本脚本也有 .env）。
+        exec supervisord -n -c "${ROOT}/supervisord.conf"
+        ;;
+    supervisor-status) exec supervisorctl -c "${ROOT}/supervisord.conf" status ;;
+    supervisor-stop)   exec supervisorctl -c "${ROOT}/supervisord.conf" shutdown ;;
+    lint)
+        # lint 基线闸门是 tools/ 脚本不是 chatbot.py 子命令：闸门管的是**整个仓库**
+        # 的 python 面（含 tools/ 自身），主体放在 chatbot.py 里会让"被测对象含自己"
+        # 的层级倒挂；chatbot.py 的子命令集保持"应用功能"语义。
+        shift   # 去掉 case 关键字本身，余参透传（--regen 等）
+        exec "${PY}" tools/lint_gate.py "$@"
+        ;;
+    process|index|verify-build|sparse|stages|lexicon|embedpairs|compare-chunks|evaluate|config-audit|deps-check)
         _cmd="${1}"; shift
         exec "${PY}" chatbot.py "${_cmd}" "$@"
         ;;

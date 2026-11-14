@@ -47,10 +47,34 @@ RUN ["pip", "install", "--no-cache-dir", "-i", "https://mirrors.aliyun.com/pypi/
 COPY .env /app/.env
 COPY start.sh /app/start.sh
 COPY chatbot.py /app/chatbot.py
+# Dockerfile 本体进镜像（2026-11-12 A4/A9）：① deps-check --app-layer 的 pin 唯一
+# 真相就是本文件（清单现场从它解析），没有它容器内自检无从对账；② 运行期排障时
+# 镜像自带"自己是怎么构建的"配方（base tag/pip 钉值都在），不再依赖构建机留档。
+COPY Dockerfile /app/Dockerfile
 # base 烤入层（10-28）的 bge-m3 缺 ST 池化元文件——modules.json 要求 1_Pooling/config.json，
 # 缺了 infinity 的 ST 引擎把模型路径当 HF repo id → HFValidationError，rc=3 启动即崩
 # （2026-10-31 本地实证）。应用层补 191B；将来重层换 base 时此覆盖幂等可留。
 COPY models/bge-m3/1_Pooling/config.json /app/models/bge-m3/1_Pooling/config.json
+
+# ── 2026-11-11 组件解耦新增依赖（轻、纯 py，自建小 pip 层：只失效本层）──────────
+# cachetools = 查询级缓存（D2）；opentelemetry 全家 = OTLP 观测（D3，必须 api/sdk 同
+# 版本锁齐——混版直接 import 崩，2026-11-10 本机实证）；pydantic-settings = 配置校验
+# （D5，本地现役 2.14.1 已随传递闭包在场，显式化）；ir_measures/pytrec-eval-terrier
+# = evaluate 计分内核（TREC 官方 trec_eval，manylinux cp310 wheel 有、无需 gcc）；
+# scipy 显式锁 = pytrec 的传递依赖，不点名则容器装"构建当天最新"，与本地 1.15.3 漂。
+# 缺装时代码各自软降级（缓存退场/观测退场；evaluate 容器内跑会 ImportError），
+# 装齐 = 容器与本地功能对等，不等的话容器悄悄少能力还难发现。
+# ⚠️ 单行 exec-form JSON 数组不能跨行续写（魔搭 parser 把续行当独立指令，见上）。
+RUN ["pip", "install", "--no-cache-dir", "-i", "https://mirrors.aliyun.com/pypi/simple/", "cachetools==7.1.4", "pydantic-settings==2.14.1", "opentelemetry-api==1.42.1", "opentelemetry-sdk==1.42.1", "opentelemetry-exporter-otlp-proto-http==1.42.1", "ir_measures==0.4.3", "pytrec-eval-terrier==0.5.11", "scipy==1.15.3"]
+
+# ── 应用层依赖自检（2026-11-12 audit A4）：两行 pip 装完立刻对账，任何一行钉的版本
+#    ≠ 实装版本（镜像源劫持/解析漂移/单行笔误）当场构建失败，不等运行期炸在启动日志里。
+#    --app-layer = 只对账本文件应用层 RUN 行自己装的 pin（清单由 deps-check 现场从
+#    /app/Dockerfile 解析 —— 本文件已在应用文件层 COPY 进镜像，Dockerfile 是唯一
+#    真相，chatbot.py 不复制第二份，改行即自动跟随）；base 层钉的版本是镜像快照、
+#    不归应用层管（换 base 才重对齐，见文件头分层定案）。
+# ⚠️ 单行 exec-form JSON 数组不能跨行续写（魔搭 parser 把续行当独立指令，见上）。
+RUN ["python", "chatbot.py", "deps-check", "--app-layer"]
 
 # ── 可变数据层（必须放在 pip RUN 之后：改数据只失效本层+verify 层，不重跑 16min 级依赖层）──
 # 先删 base 里的旧快照再 COPY：COPY 目录是 merge 语义（只覆盖同名文件，不删除源端没有的文件）。

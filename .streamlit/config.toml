@@ -4,6 +4,9 @@
 # 只监听回环地址：本机可访问，局域网/外网访问不到。
 # 若确实想让同网段机器访问，改成 "0.0.0.0"（有暴露风险）。
 address = "127.0.0.1"
+# 仅裸 run（`streamlit run chatbot.py`，不经 serve）时的缺省端口；serve 走 chatbot.py
+# 的 APP_PORT（RAG_LOCAL_PORT/RAG_APP_PORT 覆盖，缺省同为 8501）并显式传 CLI 参数，
+# CLI 优先级高于本文件 —— 改这里不会改 serve 的端口，两处缺省必须保持一致。
 port = 8501
 headless = true
 # 平台网关会把 Host 改写为容器内部地址，外部域名与之不同源，

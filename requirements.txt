@@ -1,6 +1,8 @@
 # RAG 知识库依赖（唯一安装文件；纯运行时，不含任何测试框架）
 #
-# ★ 版本锁定 = 本地现役环境的精确快照（2026-09-27，全部 == 本机实际运行版本）★
+# ★ 版本锁定 = 本地现役环境的精确快照（2026-09-27 建档；2026-11-12 audit A4 实测
+#   校准——九处 pin 曾与本机实装漂移，今起以 `python chatbot.py deps-check` 机检
+#   "清单 == 环境"，改依赖后先跑它再提交）★
 # 为什么锁：旧写法全是 >= 松约束，镜像每次构建都解析"当天最新"——实测漂移到
 #   transformers 4.53.2→5.17.0、pandas 1.5.3→3.0.6、numpy 1.26→2.4、torch 2.7→2.14。
 #   "health 通过"≠"与本地一致"，跨大版本的"碰巧能跑"随时会变成静默行为差异。
@@ -11,11 +13,10 @@
 
 # --- 直接依赖（chatbot.py 显式 import / 使用）---
 streamlit==1.62.0
-# 登录（st.login / st.user / st.logout）走魔搭创空间内置 OAuth。Streamlit 把 Authlib 放在
-# [auth] 额外依赖里（等价 `streamlit[auth]`），单装 streamlit **不会**带上它 —— 缺失时
-# st.login 抛 StreamlitMissingAuthlibError（starlette_auth_routes 的 _create_oauth_client）。
-# 故显式锁定；entrypoint.sh 运行期用它把平台注入的 OAUTH_* 装配成 secrets.toml 的 [auth]。
-authlib==1.7.2
+# （已退役 2026-11-12 audit A4）authlib==1.7.2：当年为 st.login 而锁（streamlit 把 Authlib
+# 放在 [auth] extra，单装不带，缺了抛 StreamlitMissingAuthlibError）。登录路由已整体删除
+# （chatbot.py 鉴权区注释：不再接第三方 IdP，没有 st.login / [auth] / OAuth），全仓
+# *.py / *.sh / Dockerfile 零引用 —— 留在清单里 = 每次镜像构建白装一份 OAuth 客户端。
 requests==2.32.4
 # 内存熔断（RAG_MEM_*）的兜底口径：Linux 容器优先走 cgroup/宿主的 _mem_available_mb，
 # 只有 macOS 本地（无 /proc、无 cgroup）才靠 psutil 读可用量 —— 缺了它熔断在本地直接失效。
@@ -29,7 +30,13 @@ qdrant-client==1.19.0
 # MODEL/OLLAMA_BASE_URL 全失效，程序悄悄跑在代码默认值上，极难定位。
 python-dotenv==1.1.1
 torch==2.7.1
-transformers==4.53.2
+# transformers/tokenizers：A4 校准回现役 4.44.2 / 0.19.1（旧清单写 4.53.2 / 0.21.2，
+# 本机从未装过 —— "快照"名不副实的实证）。4.44.2 是 bge-m3/bge-reranker 实测链路
+# 版本；tokenizers<0.20 是它自己的约束（0.19.1 在带内），两行必须一起改。
+# tokenizers 同时被 chatbot.py 直接 import（生成侧精确分词 / 构建期 token 计数），
+# 属直接依赖，故从传递闭包区上移到此处（A4 起唯一出现，避免同名双行）。
+transformers==4.44.2
+tokenizers==0.19.1
 numpy==1.26.4
 # 分句。**已退场（2026-11-11 全量组件审计）**：2026-10-14 组件化把分句/分块整体交给
 # semantic-text-splitter（TextSplitter 回调 token 计数切分），sentencex 经全仓库
@@ -56,6 +63,11 @@ pydantic-settings==2.14.1
 # 故从传递闭包区升格为直接依赖；它同时仍是 qdrant-client/pydantic-settings 的传递依赖，
 # 双重身份以直接 import 为准。版本 = 本机现役快照。
 pydantic==2.11.7
+
+# 进程编排（D4，2026-11-11，可选）：supervisord 托管 Qdrant/Ollama/infinity/应用四进程
+# （./start.sh supervisor）。容器默认入口仍是 chatbot.py all（模型引导 + 两段式就绪门
+# supervisor 表达不了），故不进 Docker 的 pip 层 —— 只服务本地/手动编排，不装不影响。
+supervisor==4.3.0
 
 # --- 传递闭包（上述依赖解析出的间接包，同样锁定本地现役版本，60 个）---
 # 说明：pydantic 已升出此列 —— 2026-11-11 D5 起 chatbot.py 显式 `from pydantic import …`，
@@ -95,14 +107,17 @@ packaging==25.0
 pandas==1.5.3
 pillow==12.3.0
 portalocker==3.2.0
-protobuf==5.29.6
+# protobuf：A4 校准回现役 6.33.6（旧 5.29.6 是建清单当天的解析结果）。6.x 同时满足
+# 两族约束：opentelemetry-proto 1.42.1 要 <7、streamlit 1.62 要 <8（metadata 实证），
+# 处在唯一交集带内 —— 升级任一方时此处重验。
+protobuf==6.33.6
 pyarrow==25.0.1
 pycparser==3.0
 pydantic-core==2.33.2
 pydeck==0.9.3
 python-dateutil==2.9.0.post0
 python-multipart==0.0.29
-pytz==2025.2
+pytz==2026.5
 pyyaml==6.0.3
 referencing==0.36.2
 regex==2024.11.6
@@ -115,13 +130,13 @@ six==1.17.0
 sniffio==1.3.1
 starlette==1.2.0
 sympy==1.14.0
-tokenizers==0.21.2
+# （tokenizers 已上移直接依赖区，2026-11-12 A4：chatbot.py 直接 import，见上）
 toml==0.10.2
-tqdm==4.67.1
-typing-extensions==4.15.0
-typing-inspection==0.4.1
-urllib3==2.7.0
-uvicorn==0.48.0
+tqdm==4.70.1
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+urllib3==2.8.0
+uvicorn==0.32.1
 websockets==16.0
 
 # 2026-10-14 组件化：自研逻辑换成公开组件（全部零/低依赖，不动 numpy/transformers/torch 版本）
@@ -140,7 +155,6 @@ pyahocorasick==2.3.1
 # 两包版本联动锁（ir_measures 升级会换 measure 字符串形态，适配层按 Measure 对象取值）。
 ir_measures==0.4.3
 pytrec-eval-terrier==0.5.11
-
 
 # 生成侧精确分词：主路径 = artifacts/gen_tokenizer/tokenizer.json（模型自带、带 sha 与
 # MODEL 匹配两重校验）；GGUF 走 Ollama 背后 llama.cpp 只是兜底路径。

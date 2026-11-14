@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import atexit
 import contextlib
 import copy
@@ -827,6 +828,16 @@ def _timed(label: str, threshold_s: float = 2.0):
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 API_URL = f"{OLLAMA_BASE_URL}/api/chat"
 MODEL = os.getenv("MODEL", "qwen3.5:2b-q4_K_M")
+# serve 的端口单点（2026-11-11 审计 A2 的根因修复）：此前 serve 在 5 处硬编码 8501，
+# 而 start.sh 的健康检查读 RAG_LOCAL_PORT —— 覆盖端口后 start.sh 等 8599 的新 Door、
+# serve 却把服务钉在 8501 上，90s 超时假死。现在两边读**同一个键**：
+#   · serve 子进程：env_int_any 依次读 RAG_LOCAL_PORT → RAG_APP_PORT（别名兼容将来
+#     换名），缺省 8501 = .streamlit/config.toml 裸 run 的缺省端口（两者必须一致，
+#     否则"裸 streamlit run chatbot.py"与 ./start.sh serve 是两个端口）；
+#   · start.sh：APP_PORT="${RAG_LOCAL_PORT:-8501}" + _load_dotenv 后重算（.env 里
+#     写的也生效）；容器 all 不受影响 —— 它读 RAG_HTTP_PORT（平台健康探测固定 7860，
+#     是另一个部署面），端口分叉只在"本地 serve"这一面成立。
+APP_PORT = env_int_any(8501, "RAG_LOCAL_PORT", "RAG_APP_PORT")
 # 思维链唯一开关：模型/页面/API/会话共用（默认关）；开启时只展示（历史与正文同栏）、永不进入生成上下文。
 THINK = env_bool("RAG_THINK", False)
 # num_ctx 与思维链开关解耦：**不再是配置项**（2026-10-31 定）。窗口是模型属性，
@@ -6363,23 +6374,25 @@ def cmd_serve(args=None):
     coll, count = _qdrant_gate()
     log(f"向量数据库: {coll} {count} 条记录")
     log(f"Qdrant服务: {QDRANT_HOST}:{QDRANT_PORT}")
-    if _port_in_use(8501):
+    # 端口唯一来源 = APP_PORT（模块级 env_int_any；硬编码时代见该定义处的注释）。
+    if _port_in_use(APP_PORT):
         pids = _streamlit_pids()
         if not pids:
-            log("错误: 端口 8501 已被其它进程占用，但没找到本项目启动的 Streamlit。")
-            log("  请先确认占用者: lsof -nP -iTCP:8501 -sTCP:LISTEN")
+            log(f"错误: 端口 {APP_PORT} 已被其它进程占用，但没找到本项目启动的 Streamlit。")
+            log(f"  请先确认占用者: lsof -nP -iTCP:{APP_PORT} -sTCP:LISTEN")
             sys.exit(1)
-        log("Streamlit 服务已在运行: http://localhost:8501")
+        log(f"Streamlit 服务已在运行: http://localhost:{APP_PORT}")
         log("改过代码务必重启：进程里跑的是启动时导入的旧模块。")
         log(r"  重启: pkill -f 'streamlit run .*chatbot\.py' && python chatbot.py serve")
         log(f"  当前 PID: {', '.join(map(str, pids))}")
         sys.exit(0)
     log("启动 Streamlit 服务...")
-    log("服务地址: http://localhost:8501  （按 Ctrl+C 停止）")
+    log(f"服务地址: http://localhost:{APP_PORT}  （按 Ctrl+C 停止）")
     log("")
     # 必须与 .streamlit/config.toml 的 address = "127.0.0.1" 一致。CLI 优先级高于该文件，
     # 传 "::" 会把只监听回环的配置静默改写成监听全部网卡（含公网 v6），与配置文件意图相反。
-    os.execv(sys.executable, [ sys.executable, "-m", "streamlit", "run", __file__, "--server.address", "127.0.0.1", "--server.port", "8501", "--server.headless", "true", ])
+    # 端口显式传 APP_PORT：CLI 优先级高于 config.toml，覆盖 RAG_LOCAL_PORT 时两者同步。
+    os.execv(sys.executable, [ sys.executable, "-m", "streamlit", "run", __file__, "--server.address", "127.0.0.1", "--server.port", str(APP_PORT), "--server.headless", "true", ])
 
 
 def _http_ready(url, timeout=1.0):
@@ -6433,8 +6446,9 @@ def _wait_infinity_ready(port, embed_model, rerank_model, budget):
     请求级超时 = max(30, min(150, 剩余))，加载期服务端挂起不误杀（batch 8：终端 2vCPU 冷启动
     预算远小于 .env 的 1200）。日志只打跃迁，轮询不留痕。
     """
-    import requests
     import time
+
+    import requests
     base = f"http://127.0.0.1:{port}"
     session = requests.Session()
     session.trust_env = False   # 127.0.0.1 不吃任何系统代理
@@ -6751,7 +6765,7 @@ def _infinity_spec(root, env=None):
         return None, "http 后端需要 .env 配置 RAG_EMBED_MODEL_PATH / RAG_RERANK_MODEL_PATH"
     emb_bin = shutil.which("infinity_emb")
     if not emb_bin:
-        return None, "http 后端需要 infinity_emb：镜像应用层 pip install infinity-emb[torch,server]（见 Dockerfile）"
+        return None, "http 后端需要 infinity_emb：本地 pip install infinity-emb（GPU 机器装 CUDA 版 torch）；容器由 Dockerfile 应用层 pip 装 infinity-emb[torch,server]"
     emb_dir = os.path.abspath(os.path.join(root, emb))
     rer_dir = os.path.abspath(os.path.join(root, rer))
     if not os.path.isdir(emb_dir):
@@ -6773,6 +6787,95 @@ def _infinity_spec(root, env=None):
         "--model-id", rer, "--served-model-name", scope.get("RAG_RERANK_MODEL_NAME") or RERANK_MODEL_NAME,
     ]
     return argv, None
+
+
+# infinity 就绪预算（秒）的唯一缺省定义（2026-11-11 审计 A3 收敛）：此前 cmd_all 的
+# 等待线程兜底 "900"、预热线程兜底 900 再 cap 300、start.sh 兜底 300 —— 同一个"没配"
+# 有三种答案。normative 缺省 = 300s 只在这里定义一次；.env 显式设 1200（容器 2vCPU
+# 冷启动实测预算，见 .env 检索侧段）。start.sh 在 .env 没写该键时才问这里（见 start.sh）。
+RAG_INFINITY_WAIT = env_int_min("RAG_INFINITY_WAIT", 300, 1)
+
+
+# ── run-infinity / run-app：编排子命令（shell 编排的参数单点）──────────────────
+# 为什么有这两个命令：infinity 的启动参数（--model-id/--served-model-name 成对、--dtype
+# 推导、--no-model-warmup…）此前散在三处——start.sh _ensure_infinity 的 shell 拼装、
+# supervisord.conf 的百字长载荷、容器 _infinity_spec——改一处漏两处（audit A3 的
+# 部署断点原型）。现在 argv 唯一真相 = _infinity_spec；run-infinity 只做"看门狗(可选)
+# + exec"。app 同理：真服务单源 = cmd_serve（端口/地址/复用三态都在它里面）。
+#
+# --watch 的语义（看门狗，supervisord 专用）：端口已有健康实例（通常是 start.sh 或
+# 手起的外部服务）→ 不再重复 bind（必撞端口退出、FATAL 化），转成监听哨兵；实例消失
+# 退出 71 → supervisord 判 unexpected 重拉 → 重探端口 → 空闲则 exec 真服务接管。
+# 退出码约定（supervisord exitcodes=0 之外的都算 unexpected → 触发重启）：
+#   71 = 复用的外部实例消失（重拉后接管端口）；70 = 有健康服务但归属不明（fail-closed，
+#        retries 耗尽停在 FATAL 等人工——同 start.sh _die 的处置哲学）。
+
+def _endpoint_healthy(url, timeout=2.0):
+    """curl -fsS 同款严格健康判定：2xx/3xx 才算健康（urllib 对 4xx/5xx 抛 HTTPError）。
+
+    为什么不复用 _http_ready（4xx 也算就绪）：那是"依赖就绪门"的宽松口径（有应答即
+    算活着，宽容 5xx 重试）；看门狗的复用判定必须严格——对端配了鉴权/返回 404 的
+    "半成品服务"若被当成健康实例复用，真服务的接管就永远等不到。"""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 400
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+_INFINITY_HEALTH_PATHS = ("/health", "/v1/health")
+
+
+def _infinity_port_healthy(port):
+    """infinity 就绪健康（与 start.sh _infinity_ok 同一端点集）：/health 或 /v1/health 任一命中。"""
+    return any(_endpoint_healthy(f"http://127.0.0.1:{port}{path}") for path in _INFINITY_HEALTH_PATHS)
+
+
+def cmd_run_infinity(args):
+    """exec infinity_emb（参数单点 _infinity_spec）。--watch = 看门狗（见区块头注释）。
+
+    exec 而非 Popen：本进程身份直接变成 infinity_emb——supervisord 的信号直达真服务
+    （不隔一层 python 代理，stopasgroup 无孤儿面），start.sh pid 文件记录的也是真服务
+    的 pid（exec 不换 pid，存活判断照旧成立）。"""
+    port = (os.environ.get("RAG_INFINITY_PORT") or "8001").strip()
+    if args.watch and _infinity_port_healthy(port):
+        log(f"infinity 已在端口 {port} 健康运行：复用外部实例（本程序转为看门狗；"
+            "外部实例消失将退出并由 supervisord 重拉接管）")
+        while _infinity_port_healthy(port):
+            time.sleep(3)
+        log("复用的 infinity 不再健康，退出（退出码 71，交由 supervisord 重拉）")
+        return 71
+    root = os.path.dirname(os.path.abspath(__file__))
+    spec, err = _infinity_spec(root)
+    if err:
+        log(f"❌ run-infinity: {err}")
+        return 1
+    log(f"启动 infinity: {' '.join(spec)}")
+    os.execv(spec[0], spec)
+
+
+def cmd_run_app(args):
+    """exec 应用（真服务单源 = cmd_serve）。--watch = 三态看门狗（复用/归属不明/空闲）。
+
+    归属判定用 _streamlit_pids（按本文件绝对路径逐 pid 核对，比 conf 旧载荷里的裸
+    pgrep -f 严——同名 chatbot.py 的其他项目实例不会被误判"ours"）。空闲分支 exec
+    cmd_serve：端口占用/复用提示/占用归属三态逻辑不复制第二份。"""
+    aurl = f"http://127.0.0.1:{APP_PORT}/_stcore/health"
+    if args.watch and _endpoint_healthy(aurl):
+        if _streamlit_pids():
+            log(f"端口 {APP_PORT} 已有本项目 streamlit：复用（本程序转为看门狗；"
+                "实例消失将退出并由 supervisord 重拉接管）")
+            while _endpoint_healthy(aurl):
+                time.sleep(5)
+            log("复用的应用实例不再健康，退出（退出码 71，交由 supervisord 重拉）")
+            return 71
+        log(f"端口 {APP_PORT} 有健康服务但命令行证明不了是本项目 streamlit（start.sh 同款 fail-closed）："
+            "退出（退出码 70，startretries 耗尽后由人工处置）")
+        return 70
+    log(f"启动 Streamlit 应用（serve 单源，端口 {APP_PORT}）；infinity/qdrant 就绪由运行期闸门 fail-closed 兜底")
+    return cmd_serve(None)   # cmd_serve 末尾 execv 替换本进程；到不了 return
 
 
 # ── 启动期指纹自检（cmd_all 专用，只读）──────────────────────────────────────
@@ -7074,11 +7177,10 @@ def cmd_all(args=None):
         import threading
         _inf = specs["infinity"]
         _inf_port = _inf[_inf.index("--port") + 1]
-        _inf_wait = (env.get("RAG_INFINITY_WAIT") or "900").strip()
-        try:
-            _inf_budget = float(_inf_wait)
-        except ValueError:
-            _inf_budget = 300.0
+        # 预算单点 = RAG_INFINITY_WAIT 常量（env_int_min 定义，缺省 300、下限 1）。
+        # 旧三处兜底（此处 "900"、预热线 900-cap300、start.sh 300）收敛为同一答案——
+        # "没配"必须有唯一缺省，否则三个编排面在同一台机器上有三种等待预算。
+        _inf_budget = float(RAG_INFINITY_WAIT)
         _embed_name = env.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME
         _rerank_name = env.get("RAG_RERANK_MODEL_NAME") or RERANK_MODEL_NAME
 
@@ -7601,10 +7703,10 @@ def _warm_engine(engine):
                 if not port:
                     m = re.search(r":(\d+)", EMBED_URL)
                     port = m.group(1) if m else "8001"
-                try:
-                    wait_budget = min(300.0, float(os.environ.get("RAG_INFINITY_WAIT") or 900))
-                except ValueError:
-                    wait_budget = 300.0
+                # 预热线预算 = min(300, RAG_INFINITY_WAIT 常量)。cap 300 是刻意的：
+                # 预热是**增收益位**（失败只 warn，冷加载兜底），不许它把生成预热
+                # 拖住 20 分钟（.env 设 1200 是给 cmd_all 的"宁可久等"语义）。
+                wait_budget = min(300.0, float(RAG_INFINITY_WAIT))
                 _ok, _el, _detail = _wait_infinity_ready(
                     port,
                     (os.environ.get("RAG_EMBED_MODEL_NAME") or EMBED_MODEL_NAME),
@@ -9151,8 +9253,359 @@ def cmd_evaluate(args=None):
     return 1 if failed else 0
 
 
+# ── 配置审计（config-audit）：.env 键唯一存在过的静态闸门 ─────────────────────
+# 为什么必须有这个命令：.env 是"只写不读"的文件——它声明 60+ 个键，却没有任何机器
+# 可执行的契约保证每个键真的有人读。历史上攒出 5 个死键（代码不读、写了等于没写）
+# 而一切表现正常：重启不报错、日志不提示，只有人肉翻代码才会发现（A1 审计
+# 2026-11-11）。死配置是"静默失效"的原型；根治不是加一次性的清理 PR，而是把
+# "谁消费哪些键"机读化，让每次对账都成为闸门——新死键一出现就红，而不是等下次审计。
+#
+# 消费真相（consumed）三个来源取并集——**宁多勿漏**：误放活键是审计事故（闸门
+# 破坏信任），误收死键只是白名单宽松，方向必须偏向后者。
+#   来源 1 · chatbot.py 的 AST：遍历所有字符串常量，键名形状（全大写下划线）即算
+#      消费候选。为什么不用正则扫 chatbot.py 源码：注释/文档里的键名（如 env_bool
+#      文档提到 RAG_EMBED_CACHE=flase）不是消费，正则分不清注释与表达式；AST 只见
+#      语法树——env_* 帮助函数调用、os.getenv/os.environ.get/.setdefault/下标
+#      读写、f-string 里的动态键片段，全部天然是字符串常量节点，一个遍历全覆盖，
+#      注释则天然被剔除（parser 时不进 AST）。
+#   来源 2 · start.sh / supervisord.conf 的正则字面量（剔除注释行后）：shell/INI
+#      侧没有 AST；这两个文件是编排真相——把哪些键导出给谁、以什么 environment=
+#      传给子进程。键名出现即算消费。刻意不扫 .env 自己：.env 的自我提及（"XX
+#      已退场"的说明文字）会把死键洗白，对账就失去意义。
+#   来源 3 · EXTERNAL_ENV_KEYS：被**外部服务**从进程环境读取的键。Ollama serve 读
+#      OLLAMA_*、PyTorch 读 PYTORCH_MPS_*——本仓库源码零字面量（键值由 _load_dotenv
+#      整体导出，键名从不出现在代码里），不登记就会被误判死键。HF_ENDPOINT 同为
+#      外部消费，但 start.sh 白名单行已含其字面量（来源 2 覆盖），不重复登记。
+#
+# 三向对账（任一失败 exit 1；闸门语义 = 让"写了没读"在写入时暴露，而非在排障时）：
+#   A. .env 生效键 ⊆ consumed ∪ RETIRED_ENV_KEYS —— 否则死键（写了没人读）
+#   B. RETIRED_ENV_KEYS ∩ .env 生效键 = ∅ —— 退役键残留；单独名单的目的不是查出
+#      它（死键检查也能查到）而是**把退役原因带进报错**，不用翻 git log 找去向
+#   C. README §4 配置表的键 ⊆ consumed —— 文档承诺了不存在的键 = 假闸门，比死键
+#      更毒：读者照文档配了、静默无效，还会反过来怀疑代码
+# ⚠️ 改动 _env_* 帮助函数签名时同步 _ENV_HELPER_KEYS；新增 shell 消费键时确认它
+#    在 start.sh 里的字面量形态能被 _ENV_KEY_RE 捕获（全大写下划线 ≥3 字符）。
+
+# 键名形状：首字符大写字母，之后大写/数字/下划线 ≥2 位。不收单双字符（无此短键）；
+# 结尾必须落在字母数字上——白名单前缀样式（OLLAMA_*、PYTORCH_MPS_*）里的裸下划线
+# 不是键，收进来只是噪音。
+_ENV_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*[A-Z0-9]")
+
+# 外部消费键：键值由外部服务进程自己读（见块首注释来源 3）。附带值域说明是为了
+# 审计报告里能提示"这些键改了会影响什么"，不用去翻服务文档。
+EXTERNAL_ENV_KEYS = {
+    # Ollama 服务端：KV 缓存量化（q8_0 把 KV 体积减半，65536 窗口下 8G 内存是唯一活路）
+    "OLLAMA_KV_CACHE_TYPE": "Ollama serve 读进程环境（f16/q8_0/q4_0）",
+    # Ollama 服务端：FlashAttention 开关（KV 量化依赖它，写 1）
+    "OLLAMA_FLASH_ATTENTION": "Ollama serve 读进程环境（1=开）",
+    # torch MPS 分配闸门：HIGH 默认 1.7 会在 8G 统一内存上换页冻结（压到 1.0 后越界抛
+    # 异常而不是拖死整机）；LOW 必须一起设——默认 1.4 > HIGH 1.0 会直接 RuntimeError
+    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "torch 初始化时读（≤1.0）",
+    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "torch 初始化时读（≤HIGH）",
+}
+
+# 退役键 → 退役原因（一句话讲清能力去了哪）。键名以字面量集中在此（不经 env_*），
+# 审计的 B 项据此对 .env 残留报错。**这些键永远不会回到代码**：对应能力已整体删除，
+# 不是"默认关闭"——别试图靠设值复活。
+RETIRED_ENV_KEYS = {
+    # 模型来源不再可配：构建期烘焙已移除（镜像不带权重），短名由 [all] 的
+    # ollama create 补建、权重文件由 base 镜像/fetch-models 供给——只剩 MODEL 短名一个口
+    "RAG_GEN_MODEL_MODELSCOPE": "模型烘焙已移除：来源固定 ModelScope（start.sh fetch-models），选模型只改 MODEL",
+    # 多连接下载并入 start.sh 后连接数硬编码（aria2 --split=16），键无处可读
+    "RAG_OLLAMA_DL_CONNS": "fetch-models 并入 start.sh：下载连接数已硬编码（aria2 --split=16）",
+    "RAG_MODEL_DL_CONNS": "同上：检索模型下载连接数不再可配",
+    # index_preflight 已收敛为"合同三证 + Qdrant 可达"（2026-11-10 嵌入服务化），精度
+    # 由 runtime_infinity_dtype 单一事实源推导，全链 fp32 单一定档——覆写开关无对象
+    "RAG_ALLOW_PRECISION_OVERRIDE": "精度预检闸门已删（全链 fp32 单一定档，无覆写可言）",
+    "RAG_INDEX_PRECISION": "同上：目标精度跟随内存预算档推导，不再可指定",
+    "RAG_INDEX_ALLOW_BATTERY": "电源/内存闸门已删（构建不再因电池/低电量拒绝，只 _resource_note 提示）",
+    "RAG_INDEX_ALLOW_LOW_POWER": "同上",
+    # 断点分片已删（chatbot.py index：中断不提供续算，重跑即全量）
+    "RAG_EMBED_CHECKPOINT_CHUNKS": "断点续算已删：index 中断即重跑（无分片可续）",
+    # npz 向量缓存随 2026-11-10 嵌入服务化整体退役：稠密向量存 Qdrant 集合本体，
+    # 不再有磁盘缓存机器（EMBED_CACHE_DIR/EMBED_CACHE_ENABLED 常量同批删除）
+    "RAG_EMBED_CACHE": "向量缓存已退役（嵌入服务化）：稠密向量存 Qdrant 本体，无磁盘缓存",
+    # 分句走 semantic-text-splitter（无语言码概念）；sentencex 已从 requirements 移除
+    "RAG_SENTENCE_LANG": "分句换 semantic-text-splitter：无语言码概念，sentencex 已移除",
+}
+
+
+def _audit_literal_keys(path, strip_comments=True):
+    """从非 Python 源文件提取环境键字面量（来源 2）。
+
+    逐行剔除注释（# / ; 开头及其行内尾巴）后跑 _ENV_KEY_RE——注释里的键是文档，
+    不是消费；不剔除会把 .env 说明文字里的键名洗白（本函数绝不用于 .env，原因同）。
+    行内尾巴只剪 " #"/" ；" 起的注释，避免误伤值里的 #（URL fragment 罕见于这两个
+    文件，宁可少剪）。
+    """
+    keys = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw
+                if strip_comments:
+                    for _mark in ("#", ";"):
+                        pos = line.find(f" {_mark}")
+                        if pos >= 0:
+                            line = line[:pos]
+                        if line.lstrip().startswith(_mark):
+                            line = ""
+                for hit in _ENV_KEY_RE.findall(line):
+                    keys.add(hit)
+    except FileNotFoundError:
+        pass  # 审计对象缺文件不崩：supervisord.conf 是可选编排，缺失=无消费贡献
+    return keys
+
+
+def _audit_ast_keys(path):
+    """从 Python 源文件 AST 提取环境键消费点（来源 1，含注释剔除）。
+
+    ast.walk 全树遍历 ast.Constant(str)：字符串常量是键名的唯一载体（env_* 调用、
+    os.getenv、os.environ.get/setdefault/下标、f-string 静态段全在此）。f-string 的
+    静态前缀（如 os.getenv(f"RAG_{name}") 里的 "RAG_"）会以裸前缀形态出现——带尾
+    下划线的命中被 _ENV_KEY_RE 的形状约束自然丢弃，不误当键。
+    """
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    keys = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for hit in _ENV_KEY_RE.findall(node.value):
+                keys.add(hit)
+    return keys
+
+
+def _audit_env_live_keys(path):
+    """解析 .env 的生效赋值（非注释 KEY=...）→ {键: 行号}。
+
+    规则与 start.sh/_load_dotenv 同源：空行/注释跳过、export 前缀剥离、键名形状
+    校验（不符合键形的"赋值"不是环境键，静默跳过——审计只对账键名，不读值）。
+    """
+    live = {}
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            key, _sep, _val = line.partition("=")
+            key = key.strip()
+            if _sep and _ENV_KEY_RE.fullmatch(key):
+                live[key] = lineno
+    return live
+
+
+def _audit_readme_s4_keys(path):
+    """README §4（配置章）反引号包裹的键形 token = 文档承诺可配的键（来源：对账 C）。
+
+    章节边界锚标题行（## 4. 配置 → 下一个 ## ），不锚行号（README 会持续演化）。
+    反引号内容必须整段匹配键形：`RAG_QUERY_CACHE_*` 这类通配、`§10.2-D2` 这类
+    引用、`streamlit` 这类小写自然排除——通配键族由其成员键逐个对账（.env 写了
+    具体键就查具体键，文档里的通配不构成对账对象）。
+    """
+    keys = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            in_s4 = False
+            for raw in f:
+                line = raw.rstrip("\n")
+                if re.match(r"^## 4\.", line):
+                    in_s4 = True
+                    continue
+                if in_s4 and re.match(r"^## ", line):
+                    break  # 下一个二级标题 = §4 结束
+                if in_s4:
+                    for token in re.findall(r"`([^`]+)`", line):
+                        if _ENV_KEY_RE.fullmatch(token):
+                            keys.add(token)
+    except FileNotFoundError:
+        pass  # README 缺失不崩：只损失对账 C（正常部署里 README 与代码同仓）
+    return keys
+
+
+def cmd_config_audit(_args):
+    """三向对账并打印报告；任何问题 exit 1（返回值经 main 转 exit code）。
+
+    输出设计：每向一行 ✅/❌ + 明细缩进——失败者要看得出"删哪行/补哪键"，而不是
+    只有总数。外部消费键中已进 .env 的会单独列出：它们是"仓库代码不读但生效"的
+    唯一合法形态，列出来防止后人把 EXTERNAL_ENV_KEYS 误改成死键处理。
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    py_path = os.path.join(root, "chatbot.py")
+    sh_path = os.path.join(root, "start.sh")
+    sv_path = os.path.join(root, "supervisord.conf")
+    env_path = os.path.join(root, ".env")
+    readme_path = os.path.join(root, "README.md")
+
+    consumed = set(_audit_ast_keys(py_path))
+    py_n = len(consumed)
+    consumed |= _audit_literal_keys(sh_path)
+    consumed |= _audit_literal_keys(sv_path)
+    consumed |= set(EXTERNAL_ENV_KEYS)  # 外部消费 = 本仓库不可见的真消费（来源 3）
+
+    live = _audit_env_live_keys(env_path)
+    s4 = _audit_readme_s4_keys(readme_path)
+
+    log(f"配置审计：chatbot.py AST {py_n} 键 ∪ "
+        f"start.sh/supervisord.conf 字面量 ∪ 外部 {len(EXTERNAL_ENV_KEYS)} 键 = 消费面 {len(consumed)}；"
+        f".env 生效键 {len(live)}；README §4 键 {len(s4)}")
+
+    problems = 0
+
+    # A. .env 生效键 ⊆ consumed ∪ RETIRED（退役键由 B 单独报告，这里不重复计数）
+    retired_live = sorted(k for k in live if k in RETIRED_ENV_KEYS)
+    dead = sorted(k for k in live if k not in consumed and k not in RETIRED_ENV_KEYS)
+    if dead:
+        problems += len(dead)
+        log(f"❌ A 死键 {len(dead)} 个（.env 声明但三个消费来源都不读——写了等于没写）:")
+        for key in dead:
+            log(f"      {key} (行 {live[key]})")
+    else:
+        log("✅ A .env 生效键全部有消费点（无死键）")
+
+    # B. 退役键残留：报错附原因（RETIRED_ENV_KEYS 的存在意义，见块首）
+    if retired_live:
+        problems += len(retired_live)
+        log(f"❌ B 退役键残留 {len(retired_live)} 个:")
+        for key in retired_live:
+            log(f"      {key} (行 {live[key]}) —— {RETIRED_ENV_KEYS[key]}")
+    else:
+        log("✅ B 退役键零残留")
+
+    # 外部消费键信息位：在 .env 里的是合法配置（外部服务读进程环境）
+    external_live = sorted(k for k in live if k in EXTERNAL_ENV_KEYS)
+    log(f"   ℹ️ 外部消费键 {len(EXTERNAL_ENV_KEYS)} 个（仓库代码不读，外部服务从进程环境读）；"
+        f"其中 .env 已配置 {len(external_live)}: {' '.join(external_live) if external_live else '—'}")
+
+    # C. README §4 承诺的键 ⊆ consumed：文档不假闸门
+    phantom = sorted(k for k in s4 if k not in consumed)
+    if phantom:
+        problems += len(phantom)
+        log(f"❌ C README §4 幻影键 {len(phantom)} 个（文档承诺但无消费点——先修文档或恢复消费）:")
+        for key in phantom:
+            log(f"      {key}")
+    else:
+        log("✅ C README §4 配置表全部可兑现（无幻影键）")
+
+    if problems:
+        log(f"❌ 配置审计失败：{problems} 个问题（死键/退役残留/幻影键，见上）")
+        return 1
+    log("✅ 配置审计通过：.env 与文档承诺零死键")
+    return 0
+
+
+# ── deps-check：依赖 pin 对账（2026-11-12 audit A4）────────────────────────────
+# 为什么要有它：requirements.txt 自称"本地现役环境的精确快照"，但快照会漂——审计
+# 实测 9 个 pin 与本机现役版本不一致（transformers 4.53.2 vs 现役 4.44.2 等），
+# "唯一真相文件"悄悄变成第二真相。这个命令把"清单 == 环境"变成可机检的不变量：
+#   · 缺省（全量）：requirements.txt 每一条 == importlib.metadata 实装版本；
+#     任一不符 exit 1。本地跑 = 校准闸门（改依赖后先跑它再提交）。
+#   · --app-layer：只对账 Dockerfile 应用层两行 RUN ["pip","install"] 装的 pin，
+#     清单**从 Dockerfile 现场解析**（Dockerfile 是唯一真相，这里不复制第二份）——
+#     容器构建期跑（应用文件 COPY 之后、数据层之前），版本 ≠ Dockerfile 钉的值 =
+#     镜像源/解析漂移当场构建失败，不等运行期。base 层钉的版本是镜像快照、不归
+#     应用层管（换 base 才重对齐，见 Dockerfile 文件头分层定案），故有这个子模式。
+def _deps_canonical(name):
+    # PEP 503 名字归一：importlib.metadata 对大小写/下划线-连字符不做归一化查找，
+    # `typing-extensions` vs `typing_extensions` 这类写法差异要显式拉平。
+    return re.sub(r"[-_.]+", "-", name).lower().strip()
+
+
+def _deps_read_pins_from_dockerfile():
+    """Dockerfile 应用层 RUN ["pip","install",…] → [(name, pinned, lineno)]。
+
+    exec-form JSON 数组整行解析（魔搭 parser 要求单行，见 Dockerfile 内注）；元素里
+    含 "==" 的即 pin spec（选项 -i/--no-cache-dir 与 URL 值都不含），extras 标记
+    `[torch,server]` 去掉后对账——extras 只影响装什么，不影响 dist 名。
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(root, "Dockerfile")
+    pins = []
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            stripped = line.strip()
+            if not stripped.startswith("RUN"):
+                continue
+            bracket = stripped[len("RUN"):].strip()
+            if not (bracket.startswith("[") and bracket.endswith("]")):
+                continue
+            try:
+                elems = json.loads(bracket)
+            except ValueError:
+                continue   # 非 exec-form 的普通 RUN（rm/python -c 那两行），跳过
+            if not elems or elems[0] != "pip" or "install" not in elems[:2]:
+                continue
+            for spec in elems[1:]:
+                if "==" not in spec or spec.startswith("-"):
+                    continue   # 选项/URL/裸名（pip 本身），不参与对账
+                name, _, ver = spec.partition("==")
+                name = name.split("[", 1)[0]
+                pins.append((name, ver.strip(), lineno))
+    return pins
+
+
+def cmd_deps_check(args):
+    """pin 对账（全量 requirements.txt 或 --app-layer 的 Dockerfile 应用层子集）。"""
+    if args.app_layer:
+        pins = _deps_read_pins_from_dockerfile()
+        if not pins:
+            log("❌ deps-check --app-layer：Dockerfile 应用层没解析出任何 pin（RUN 行形态变了？）")
+            return 1
+        source = f"Dockerfile 应用层（{len(pins)} 个 pin）"
+    else:
+        root = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(root, "requirements.txt")
+        pins = []
+        with open(path, encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, 1):
+                s = line.strip()
+                if not s or s.startswith("#") or "==" not in s:
+                    continue
+                name, _, ver = s.partition("==")
+                pins.append((name.split("[", 1)[0], ver.strip().split("#", 1)[0].strip(), lineno))
+        if not pins:
+            log("❌ deps-check：requirements.txt 没解析出任何 pin")
+            return 1
+        source = f"requirements.txt（{len(pins)} 个 pin）"
+
+    import importlib.metadata as md
+    problems = 0
+    seen = set()
+    for name, want, lineno in pins:
+        canon = _deps_canonical(name)
+        if canon in seen:
+            log(f"⚠️  {name} 在清单里出现两次（行 {lineno}），以首条为准")
+            continue
+        seen.add(canon)
+        try:
+            got = md.version(name)
+        except md.PackageNotFoundError:
+            problems += 1
+            log(f"❌ {name}=={want}（行 {lineno}）：环境未安装")
+            continue
+        if got != want:
+            problems += 1
+            if args.app_layer:
+                log(f"❌ {name}（Dockerfile 行 {lineno}）：钉 {want}，环境实装 {got}"
+                    "—— 容器里这行 pip 装的就是钉值，此错 = 镜像源/解析漂移，构建应失败"
+                    "（本地跑 --app-layer 时，容器专属钉如 click==8.1.8 不符属预期，不用管）")
+            else:
+                log(f"❌ {name}（行 {lineno}）：清单钉 {want}，环境实装 {got} —— 以环境为准改清单"
+                    "（升级流程见 requirements.txt 头注），或 pip 安装对齐清单")
+    if problems:
+        log(f"❌ deps-check 失败：{source} 有 {problems} 处不符（见上）")
+        return 1
+    log(f"✅ deps-check 通过：{source} 与环境实装逐条一致")
+    return 0
+
+
 # ── 命令分发 ──
-COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "all": cmd_all, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "embedpairs": cmd_embedpairs, "stages": cmd_stages, "verify-build": cmd_verify_build, "evaluate": cmd_evaluate, }
+# run-infinity/run-app（2026-11-11 audit A3）：shell/supervisord 编排的参数单点——
+# infinity 的 argv 唯一真相 = _infinity_spec，app 的真服务单源 = cmd_serve；两个
+# run-* 只包"看门狗(可选)+exec"。start.sh 与 supervisord.conf 都改为调它们，
+# 参数改动从此只发生在 Python 一处。
+COMMANDS = { "process": cmd_process, "index": cmd_index, "serve": cmd_serve, "all": cmd_all, "sparse": cmd_sparse, "compare-chunks": cmd_compare_chunks, "lexicon": cmd_verify_lexicon, "embedpairs": cmd_embedpairs, "stages": cmd_stages, "verify-build": cmd_verify_build, "evaluate": cmd_evaluate, "config-audit": cmd_config_audit, "run-infinity": cmd_run_infinity, "run-app": cmd_run_app, "deps-check": cmd_deps_check, }
 
 
 def _build_parser():
@@ -9165,13 +9618,19 @@ def _build_parser():
     """
     parser = argparse.ArgumentParser(prog="chatbot.py", add_help=False)
     subs = parser.add_subparsers(dest="command")
-    descriptions = {"compare-chunks": "分块结果 A/B 比较", "evaluate": "离线检索评估（不依赖 Ollama）", "embedpairs": "嵌入对拍探针：本地 torch vs http 服务（cos≥0.999 准入）", "verify-build": "构建期/发布前离线自检：index_manifest 与当前切分/词表/模型指纹（不连 Qdrant）"}
+    descriptions = {"compare-chunks": "分块结果 A/B 比较", "evaluate": "离线检索评估（不依赖 Ollama）", "embedpairs": "嵌入对拍探针：本地 torch vs http 服务（cos≥0.999 准入）", "verify-build": "构建期/发布前离线自检：index_manifest 与当前切分/词表/模型指纹（不连 Qdrant）", "config-audit": "配置审计：.env 死键 / 退役键残留 / README §4 幻影键三向对账（全离线）", "run-infinity": "exec infinity_emb（argv 单点 _infinity_spec）；--watch=看门狗（复用已健康实例，实例消失退出 71）", "run-app": "exec 应用（真服务单源 cmd_serve）；--watch=看门狗（复用/归属不明 70/空闲接管）", "deps-check": "依赖 pin 对账：requirements.txt（缺省）或 Dockerfile 应用层（--app-layer）逐条 == 环境实装版本"}
     for name in COMMANDS:
         sub = subs.add_parser(name, add_help=True, description=descriptions.get(name))
         if name == "compare-chunks":
             sub.add_argument("a", help="基线文件（改动前存档的分块产物）")
             sub.add_argument("b", nargs="?", default=DEFAULT_B, help=f"对照文件（默认 {DEFAULT_B}）")
             sub.add_argument("--allow", action="append", default=[], help="允许不同的字段名，可重复指定，例如 --allow contextual_text")
+        elif name in ("run-infinity", "run-app"):
+            # --watch 只服务于 supervisord 编排（看门狗语义见两命令 docstring/区块头注释）：
+            # start.sh 直接 exec 不带 --watch（脚本自身已经在做就绪闸+复用判定）。
+            sub.add_argument("--watch", action="store_true", help="看门狗：端口已有健康实例则复用监听（实例消失退出 71 交 supervisord 重拉）；不带则直接 exec 真服务")
+        elif name == "deps-check":
+            sub.add_argument("--app-layer", action="store_true", help="只对账 Dockerfile 应用层 RUN pip 装的 pin（容器构建期用；缺省对账全量 requirements.txt）")
         elif name == "lexicon":
             sub.add_argument("-q", "--quiet", action="store_true", help="只报告问题，不打印正常明细")
             sub.add_argument("alias_path", nargs="?", default=None, help=f"别名表路径（默认 {ALIAS_PATH}）")

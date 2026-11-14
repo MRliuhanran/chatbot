@@ -1,0 +1,32 @@
+{
+  "generated": "2026-11-12T15:26:07+00:00",
+  "ruff": "0.16.7",
+  "command": "ruff check . --no-cache --output-format=concise",
+  "counts": {
+    "chatbot.py": {
+      "UP035": 1,
+      "BLE001": 121,
+      "S110": 20,
+      "S112": 2,
+      "PLW1510": 8,
+      "RUF023": 1,
+      "DTZ005": 5,
+      "UP031": 48,
+      "TRY004": 4,
+      "F401": 5,
+      "PERF101": 1,
+      "UP037": 4,
+      "W605": 1,
+      "B008": 2,
+      "SIM102": 1
+    },
+    "tools/build_stats.py": {
+      "SIM401": 1,
+      "F841": 1
+    },
+    "tools/canary_check.py": {
+      "DTZ011": 1,
+      "DTZ005": 1
+    }
+  }
+}

@@ -2,11 +2,34 @@
   "manifest_version": 1,
   "chunk_fingerprint": "3502968fe6f7039e",
   "lexicon_fingerprint": "d491515c19757aac",
-  "collection": "rag_documents_v1__1b2ed215",
-  "build_id": "1b2ed215eecf4b7f9dba26afcb752152",
+  "collection": "rag_documents_v1__783292ca",
+  "build_id": "783292ca4bf843b482a5f725c6f8e017",
   "points": 21255,
   "embed_model_content": "7a66ee5161b0",
   "embed_precision": "fp32",
+  "embed_identity": {
+    "engine": "infinity-http",
+    "model": "bge-m3",
+    "version": "0.0.76",
+    "dtype": "float32",
+    "content_key": "5b1de3c8b2f1",
+    "code_key": "acecba7f3ca6"
+  },
+  "migration": {
+    "mode": "shard-snapshot-clone",
+    "from_collection": "rag_documents_v1__b883ae18",
+    "prev_identity": {
+      "engine": "infinity-http",
+      "model": "bge-m3",
+      "version": "0.0.76",
+      "dtype": "float32",
+      "content_key": "5b1de3c8b2f1",
+      "code_key": "acecba7f3ca6"
+    },
+    "credit": "v2-manifest",
+    "min_cos": null,
+    "at": 1794317052
+  },
   "qdrant_server": "1.19.1",
-  "built_at": "2026-11-03T23:49:05"
+  "built_at": "2026-11-10T21:24:12"
 }
