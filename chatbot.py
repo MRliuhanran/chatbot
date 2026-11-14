@@ -9584,7 +9584,13 @@ def cmd_deps_check(args):
             problems += 1
             log(f"❌ {name}=={want}（行 {lineno}）：环境未安装")
             continue
-        if got != want:
+        # PEP 440 精确匹配语义：钉值是纯公共版本时，候选的本地版本段（+cpu 等）应忽略
+        # —— pip 判 "already satisfied" 就是这个规则（容器/base 里 torch 实装 2.7.1+cpu、
+        # 钉 2.7.1 合法满足；首例 2026-11-14 远程构建 [10/21] deps-check 误报实证）。
+        # 真漂移照拦：公共版本不等（2.7.2+cpu vs 2.7.1）依旧报错构建失败。
+        got_pub = got.split("+", 1)[0]
+        want_pub = want.split("+", 1)[0]
+        if got_pub != want_pub:
             problems += 1
             if args.app_layer:
                 log(f"❌ {name}（Dockerfile 行 {lineno}）：钉 {want}，环境实装 {got}"
