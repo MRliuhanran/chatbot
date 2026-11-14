@@ -38,11 +38,13 @@ ENV RAG_INFINITY_DTYPE=float32
 #      防 pip 现解漂移。版本 = 本地实测组合 0.0.76。
 # ⚠️ 这一行是单行 exec-form JSON 数组，**不能跨行续写**：魔搭 dockerfile parser 会把续行当成
 #    独立指令（2026-10-31 23:27 场 parse error line 20 实证）。以下所有 RUN 同此约束。
-#    2026-11-14 远程实证：香港 runner 拉 aliyun 镜像会抖，pip 默认 timeout=15s/retries=5
-#    一抖全报废（第 3 轮 33s 处 ReadTimeoutError → BuildFailed）→ --retries 10 --timeout 120
-#    加固；裸值 "10"/"120" 不含 == 不进 deps-check 对账。构建机无跨构建缓存（两轮 0 CACHED），
-#    每轮都真跑这行，扛抖性价比高。
-RUN ["pip", "install", "--no-cache-dir", "--retries", "10", "--timeout", "120", "-i", "https://mirrors.aliyun.com/pypi/simple/", "infinity-emb[torch,server]==0.0.76", "psutil==7.0.0", "torch==2.7.1", "optimum==1.22.0", "click==8.1.8"]
+#    2026-11-14 远程实证：香港 runner 拉 aliyun 镜像会抖（三轮证据：12min 慢速下载→
+#    33s ReadTimeout→127s 流中读停滞，--retries 救不了流中卡死——pip 只重试连接建立
+#    不重试流中读）→ ①--retries 10 --timeout 120 扛一次性抖动 ②索引换 pypi.org
+#    （Fastly CDN 对香港直连；钉值全是公共包、torch 已 satisfied 不下载 → 产物与
+#    aliyun 完全等价，只换链路质量）。裸值 "10"/"120" 不含 == 不进 deps-check 对账。
+#    构建机无跨构建缓存（多轮 0 CACHED），每轮都真跑这行。
+RUN ["pip", "install", "--no-cache-dir", "--retries", "10", "--timeout", "120", "-i", "https://pypi.org/simple", "infinity-emb[torch,server]==0.0.76", "psutil==7.0.0", "torch==2.7.1", "optimum==1.22.0", "click==8.1.8"]
 
 # ── 应用文件层（必须在 pip RUN 之后）：改 .env / chatbot.py / start.sh 不该让上面这条
 #    16min 级的依赖层缓存失效。2026-10-31 复核：旧顺序把 COPY .env/start.sh/chatbot.py
@@ -69,7 +71,7 @@ COPY models/bge-m3/1_Pooling/config.json /app/models/bge-m3/1_Pooling/config.jso
 # 缺装时代码各自软降级（缓存退场/观测退场；evaluate 容器内跑会 ImportError），
 # 装齐 = 容器与本地功能对等，不等的话容器悄悄少能力还难发现。
 # ⚠️ 单行 exec-form JSON 数组不能跨行续写（魔搭 parser 把续行当独立指令，见上）。
-RUN ["pip", "install", "--no-cache-dir", "--retries", "10", "--timeout", "120", "-i", "https://mirrors.aliyun.com/pypi/simple/", "cachetools==7.1.4", "pydantic-settings==2.14.1", "opentelemetry-api==1.42.1", "opentelemetry-sdk==1.42.1", "opentelemetry-exporter-otlp-proto-http==1.42.1", "ir_measures==0.4.3", "pytrec-eval-terrier==0.5.11", "scipy==1.15.3"]
+RUN ["pip", "install", "--no-cache-dir", "--retries", "10", "--timeout", "120", "-i", "https://pypi.org/simple", "cachetools==7.1.4", "pydantic-settings==2.14.1", "opentelemetry-api==1.42.1", "opentelemetry-sdk==1.42.1", "opentelemetry-exporter-otlp-proto-http==1.42.1", "ir_measures==0.4.3", "pytrec-eval-terrier==0.5.11", "scipy==1.15.3"]
 
 # ── 应用层依赖自检（2026-11-12 audit A4）：两行 pip 装完立刻对账，任何一行钉的版本
 #    ≠ 实装版本（镜像源劫持/解析漂移/单行笔误）当场构建失败，不等运行期炸在启动日志里。
