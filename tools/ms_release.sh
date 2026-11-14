@@ -20,6 +20,9 @@
 #      没有清单就无法证明镜像里的索引与语料同源，验收也没有比对基准。
 #   ④）git 追踪完整性：chunk 清单必须已跟踪；storage/ 在 .gitignore 里，**新索引文件不在
 #      git 索引里就不会随 push 进构建上下文**（镜像仍是旧 storage = 923/350 事故重演）。
+#      2026-11-14 起另含分片闸：魔搭收紧「非 LFS 单文件 >10MiB 拒收」（pre-receive
+#      tree_limits_v1 实证）→ storage 大文件出树、由 storage_pack/ 9MiB 分片携带
+#      （Dockerfile 重组+sha256 校验）；preflight 校验 pack 与磁盘大文件同代，过期即拦。
 #   ⑤）离线三闸 config-audit / deps-check / lint（2026-11-14 接线）：代码/配置面兜底——
 #      开发者漏跑 ./start.sh check 时，配置死键/依赖漂移/lint 新发现仍会在发布前拦下。
 #      全离线不依赖服务状态；stages/canary 要连 Qdrant，归 check（服务在线态）管。
@@ -206,16 +209,56 @@ _preflight() {
     echo "   发布前：./start.sh stop → 重新 process/index（或 sparse）→ 提交数据改动再发。"
     exit 1
   fi
+  # ④-d 大文件分片一致性（2026-11-14 实证事故：魔搭收紧「非 LFS 单文件 >10MiB 拒收」，
+  #    pre-receive tree_limits_v1 REJECTED——两天前的 18400f9 还能带 39MiB matrix.dat 过闸，
+  #    且 hook 的 offending 名单只列前 4 个，本代 >10MiB 入仓文件实为 10 个）。大文件出树、
+  #    由 storage_pack/ 9MiB 分片携带（tools/pack_big_storage.sh 生成，Dockerfile 重组+
+  #    sha256 校验），因此 pack 必须与磁盘大文件同代：路径集合与 sha256 任一不符 = pack
+  #    过期 → 镜像重组出旧/错数据。find 收集口径与 pack_big_storage.sh 逐字节一致（comm 依赖）。
+  local pack_manifest="storage_pack/manifest.txt"
+  local big_on_disk
+  big_on_disk="$(find storage -type f -size +10485760c ! -path '*/wal/*' ! -path 'storage/.deleted*' ! -name '*.removed*' ! -name '*.tmp*' | LC_ALL=C sort)"
+  if [ -n "${big_on_disk}" ]; then
+    if [ ! -f "${pack_manifest}" ]; then
+      echo "❌ preflight④: storage 有 >10MiB 大文件，但 storage_pack/manifest.txt 不存在"
+      echo "   魔搭已收紧：非 LFS 单文件 >10MiB 拒收（2026-11-14 pre-receive 实证）。"
+      echo "   修复：bash tools/pack_big_storage.sh → git rm -r --cached <大文件> → git add -A storage_pack → 提交"
+      exit 1
+    fi
+    local pack_setdiff
+    pack_setdiff="$(comm -3 <(printf '%s\n' "${big_on_disk}") <(sed 's/^[0-9a-f]\{64\}  //' "${pack_manifest}"))"
+    if [ -n "${pack_setdiff}" ]; then
+      echo "❌ preflight④: 磁盘大文件集合 ≠ storage_pack/manifest.txt（pack 过期）"
+      printf '%s\n' "${pack_setdiff}" | sed 's/^/   /'
+      echo "   修复：bash tools/pack_big_storage.sh（重新生成分片）→ git add -A storage_pack → 提交"
+      exit 1
+    fi
+    if ! shasum -a 256 -c "${pack_manifest}" >/dev/null 2>&1; then
+      echo "❌ preflight④: 大文件 sha256 与 storage_pack/manifest.txt 不符（磁盘已更新，pack 旧）"
+      echo "   修复：bash tools/pack_big_storage.sh → git add -A storage_pack → 提交"
+      exit 1
+    fi
+  elif [ -f "${pack_manifest}" ] && [ -s "${pack_manifest}" ]; then
+    echo "❌ preflight④: 磁盘已无 >10MiB 大文件，但 storage_pack/manifest.txt 仍非空（pack 过期）"
+    echo "   修复：bash tools/pack_big_storage.sh（重新生成为空 pack）→ git add -A storage_pack → 提交"
+    exit 1
+  fi
   local untracked_data
-  untracked_data="$(git ls-files --others --ignored --exclude-standard -- storage corpus lexicon qdrant_config models/bge-m3/1_Pooling 2>/dev/null | grep -vE '^storage/[.]deleted/|/wal/' | head -n 5 || true)"
+  untracked_data="$(git ls-files --others --ignored --exclude-standard -- storage corpus lexicon qdrant_config models/bge-m3/1_Pooling 2>/dev/null | grep -vE '^storage/[.]deleted/|/wal/' || true)"
+  if [ -s "${pack_manifest}" ]; then
+    # pack 已覆盖的大文件是"设计性不入仓"（出树由分片携带，Dockerfile 重组），从名单豁免
+    untracked_data="$(printf '%s\n' "${untracked_data}" | grep -vxF -f <(sed 's/^[0-9a-f]\{64\}  //' "${pack_manifest}") || true)"
+  fi
+  untracked_data="$(printf '%s\n' "${untracked_data}" | head -n 5)"
   if [ -n "${untracked_data}" ]; then
     echo "❌ preflight④: 可变数据里有未入 git 的新文件（被 .gitignore 忽略，普通 git add 收集不到）"
     printf '%s\n' "${untracked_data}" | sed 's/^/   /'
     echo "   这些文件不会随 git push 进构建上下文 → 镜像里的数据仍是旧快照（923/350 事故重演）。"
     echo "   发布前：git add -f storage corpus（先 ./start.sh stop，别把运行中 churn 一起提交）。"
+    echo "   （>10MiB 大文件属设计性不入仓：走 storage_pack 分片，bash tools/pack_big_storage.sh）"
     exit 1
   fi
-  echo "   ✅ preflight④: 清单/同代 meta 已跟踪、数据无未提交改动、无遗漏新文件"
+  echo "   ✅ preflight④: 清单/同代 meta 已跟踪、数据无未提交改动、无遗漏新文件、大文件 pack 同代"
 
   # ⑤ 离线三闸（2026-11-14 接线，见文件头）：代码/配置面兜底，防漏跑 ./start.sh check。
   #    全离线、不依赖服务状态；stages/canary 要连 Qdrant（preflight 处于 Qdrant 已停态），

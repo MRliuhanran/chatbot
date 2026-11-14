@@ -83,6 +83,18 @@ RUN ["python", "chatbot.py", "deps-check", "--app-layer"]
 # 于是容器内现算的语料/分块指纹与 manifest 永远对不上——正是 923/350 事故的形态。
 RUN ["rm", "-rf", "/app/storage", "/app/corpus", "/app/lexicon"]
 COPY storage /app/storage
+# ── 大文件分片重组（2026-11-14）：魔搭收紧「非 LFS 单文件 >10MiB 拒收」（pre-receive
+#    tree_limits_v1；2026-11-01 的 18400f9 还能带 39MiB matrix.dat 过闸，两周内收紧，
+#    且 hook 的 offending 名单只列前 4 个——本代 >10MiB 入仓文件实为 10 个）。storage 下
+#    大文件（dense matrix 83MB + 9 个 qdrant 预分配的 32MiB mmap 页，合计 ~371MiB）不再
+#    直接入树，改由 storage_pack/ 分片携带（9MiB×42 普通对象，零 LFS 依赖——不赌构建机
+#    是否装 git-lfs）：cat 分片重组 tar 流 → sha256 对 manifest 逐文件校验 → 删 pack。
+#    分片由 tools/pack_big_storage.sh 生成并做本地 round-trip 自测；ms_release.sh
+#    preflight④ 校验 pack 与磁盘同代。已知代价：pack COPY 层 ~371MB 在 rm 后仍占一层
+#    （docker 分层语义），镜像比整 COPY 方案重 ~371MB。
+# ⚠️ 单行 exec-form JSON 数组不能跨行续写（魔搭 parser 把续行当独立指令，见上）。
+COPY storage_pack /app/storage_pack
+RUN ["sh", "-c", "if ls /app/storage_pack/blob-* >/dev/null 2>&1; then cat /app/storage_pack/blob-* | tar -x -f - -C /app && sha256sum -c --quiet storage_pack/manifest.txt; fi; rm -rf /app/storage_pack"]
 # 补空 wal/ 目录：**Qdrant 1.19.1 启动必需**。git 不跟踪空目录，且 .dockerignore 排除了
 # wal 大文件（closed-*/open-*）→ 不补的话镜像里的 collection shard 没有 wal/ 目录，Qdrant
 # 启动直接 panic 退出 rc=101："Can't init WAL: NotFound ... /wal"（2026-10-31 远程
