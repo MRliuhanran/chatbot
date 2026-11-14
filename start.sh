@@ -17,6 +17,7 @@
 #   ./start.sh config-audit      配置审计（.env 死键 / 退役键残留 / README §4 幻影键）
 #   ./start.sh deps-check        依赖 pin 对账（requirements.txt 逐条 == 环境实装；--app-layer 查 Dockerfile 应用层）
 #   ./start.sh lint              lint 基线闸门（ruff 新发现失败/减少放行，基线 tools/ruff-baseline.json）
+#   ./start.sh check             发布前统一闸门：config-audit+deps-check+lint+stages+canary 任一红即停；--offline 只跑离线三闸
 #   ./start.sh lexicon           词表自检
 #   ./start.sh embedpairs        嵌入对拍探针（本地 torch vs http，cos≥0.999 准入）
 #   ./start.sh compare-chunks A [B]
@@ -588,6 +589,36 @@ case "${1:-start}" in
         # 的层级倒挂；chatbot.py 的子命令集保持"应用功能"语义。
         shift   # 去掉 case 关键字本身，余参透传（--regen 等）
         exec "${PY}" tools/lint_gate.py "$@"
+        ;;
+    check)
+        # 发布前统一闸门（聚合）：离线三闸 + 四阶段新鲜度 + 金丝雀逐位对拍，顺序执行
+        # 任一红即停（set -e）。分工——本命令管"代码/配置/行为"面，要求服务在线
+        # （stages/canary 要连 Qdrant 与嵌入服务）；"数据快照"面（verify-build /
+        # EXPECTED_FP / git 追踪完整性）归 tools/ms_release.sh preflight——它要求
+        # Qdrant 已停，两态互斥故不合并，preflight 里另跑离线三闸兜底防漏 check。
+        # 发布流程：./start.sh check（服务在线）→ ./start.sh stop → bash tools/ms_release.sh。
+        shift   # 去掉 check 关键字本身
+        _check_offline=0
+        if [ "${1:-}" = "--offline" ]; then _check_offline=1; shift; fi
+        [ "${1:-}" = "" ] || { _usage; exit 2; }
+        _log "check[1/5] config-audit"
+        "${PY}" chatbot.py config-audit
+        _log "check[2/5] deps-check"
+        "${PY}" chatbot.py deps-check
+        _log "check[3/5] lint"
+        "${PY}" tools/lint_gate.py
+        if [ "${_check_offline}" = "1" ]; then
+            _log "✅ check（离线三闸）全绿"
+            exit 0
+        fi
+        if ! _http_ok "${QDRANT_URL}/healthz"; then
+            _die "check[4/5]: Qdrant 未运行（${QDRANT_URL}/healthz 不通）——stages/canary 需要服务在线；先 ./start.sh start，或只需离线三闸时用 ./start.sh check --offline"
+        fi
+        _log "check[4/5] stages"
+        "${PY}" chatbot.py stages
+        _log "check[5/5] canary"
+        "${PY}" tools/canary_check.py
+        _log "✅ check 全绿：config-audit / deps-check / lint / stages / canary"
         ;;
     process|index|verify-build|sparse|stages|lexicon|embedpairs|compare-chunks|evaluate|config-audit|deps-check)
         _cmd="${1}"; shift

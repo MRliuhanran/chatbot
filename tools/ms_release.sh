@@ -20,6 +20,9 @@
 #      没有清单就无法证明镜像里的索引与语料同源，验收也没有比对基准。
 #   ④）git 追踪完整性：chunk 清单必须已跟踪；storage/ 在 .gitignore 里，**新索引文件不在
 #      git 索引里就不会随 push 进构建上下文**（镜像仍是旧 storage = 923/350 事故重演）。
+#   ⑤）离线三闸 config-audit / deps-check / lint（2026-11-14 接线）：代码/配置面兜底——
+#      开发者漏跑 ./start.sh check 时，配置死键/依赖漂移/lint 新发现仍会在发布前拦下。
+#      全离线不依赖服务状态；stages/canary 要连 Qdrant，归 check（服务在线态）管。
 #
 # 验收判据（新契约，2026-10-31 起；与部署事故复盘同源）:
 #   1) 启动期必须有 🔧 分块指纹: 索引=… / 当前=…（cmd_all 启动即打）。**到点未见 = FAIL**，
@@ -146,7 +149,7 @@ _try_expected_fp() {  # --skip-preflight 时仍尽量取基准；取不到只警
 }
 
 _preflight() {
-  echo "── preflight：发布前防呆（① Qdrant 已停 ② verify-build ③ EXPECTED_FP ④ git 追踪完整性）──"
+  echo "── preflight：发布前防呆（① Qdrant 已停 ② verify-build ③ EXPECTED_FP ④ git 追踪完整性 ⑤ 离线三闸）──"
 
   # ① Qdrant 必须已停：先查再跑 verify-build——别一边被写一边被读。
   local pids
@@ -213,6 +216,15 @@ _preflight() {
     exit 1
   fi
   echo "   ✅ preflight④: 清单/同代 meta 已跟踪、数据无未提交改动、无遗漏新文件"
+
+  # ⑤ 离线三闸（2026-11-14 接线，见文件头）：代码/配置面兜底，防漏跑 ./start.sh check。
+  #    全离线、不依赖服务状态；stages/canary 要连 Qdrant（preflight 处于 Qdrant 已停态），
+  #    只能由服务在线态的 ./start.sh check 覆盖。set -euo pipefail 下任一失败即中止。
+  echo "── preflight⑤: 离线三闸 config-audit / deps-check / lint ──"
+  "${PY_BIN}" chatbot.py config-audit
+  "${PY_BIN}" chatbot.py deps-check
+  "${PY_BIN}" tools/lint_gate.py
+  echo "   ✅ preflight⑤: 三闸全绿"
 }
 
 if [ "${VERIFY_ONLY}" != "1" ]; then
